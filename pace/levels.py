@@ -36,7 +36,7 @@ LEVEL_LABELS: Dict[str, Dict[str, str]] = {
 TOPICS: List[Dict[str, object]] = [
     {
         "id": "decides",
-        "title": "What this page decides",
+        "title": "What the engine decides",
         "levels": {
             "plain":
                 "A hotel has 150 rooms, and tonight it will end with some of "
@@ -44,9 +44,9 @@ TOPICS: List[Dict[str, object]] = [
                 "sell last Tuesday. So the only question that matters is what "
                 "to charge, and the answer changes every day, because the "
                 "guests coming next Friday are not the guests coming next "
-                "Tuesday. This page is that decision, taken ninety times, once "
-                "for each of the next ninety nights, with the reasoning left "
-                "attached to it.",
+                "Tuesday. The engine takes that decision ninety times over, "
+                "once for each of the next ninety nights, and leaves the "
+                "reasoning attached to every one of them.",
             "working":
                 "Forecasting is the easy half of revenue management and it "
                 "decides nothing. The hard half is the control layer: turning "
