@@ -10,6 +10,8 @@ import json
 import os
 from typing import Any, Dict
 
+from .levels import as_payload as level_payload
+
 TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -18,6 +20,7 @@ TEMPLATE = """<!doctype html>
 </head><body>
 <div id="app"></div>
 <script id="payload" type="application/json">__DATA__</script>
+<script id="levels" type="application/json">__LEVELS__</script>
 <script>__JS__</script>
 </body></html>
 """
@@ -109,6 +112,22 @@ ul.drivers{margin:10px 0 0;padding-left:17px} ul.drivers li{margin:5px 0;font-si
 #app{position:relative}
 svg{display:block;width:100%;height:auto}
 .axis{font:10.5px var(--mono);fill:var(--muted)}
+
+/* depth control: the same account of the system, pitched four ways */
+.seg{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 4px}
+.seg button{font:inherit;font-size:12.5px;color:var(--muted);background:var(--bg);
+  border:1px solid var(--line);border-radius:99px;padding:6px 14px;cursor:pointer;
+  transition:color .12s,border-color .12s,background .12s}
+.seg button:hover{color:var(--ink);border-color:var(--muted)}
+.seg button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.seg button[aria-pressed=true]{background:var(--accent-soft);border-color:var(--accent);
+  color:var(--accent);font-weight:640}
+.seg-note{font-size:12.5px;color:var(--muted);margin:2px 0 16px;min-height:1.3em}
+.topic{padding:14px 0;border-top:1px solid var(--line)}
+.topic:first-of-type{border-top:0;padding-top:4px}
+.topic h3{margin:0 0 6px;font-size:14.5px;font-weight:640;letter-spacing:-.005em}
+.topic p{margin:0;font-size:14px;line-height:1.62;max-width:66ch;color:var(--ink)}
+@media(prefers-reduced-motion:reduce){.seg button{transition:none}}
 """
 
 JS = r"""
@@ -122,9 +141,40 @@ const el = (t,a,...k)=>{const n=document.createElement(t);
 const S=(t,a)=>{const n=document.createElementNS('http://www.w3.org/2000/svg',t);
   for(const q in (a||{}))n.setAttribute(q,a[q]);return n;};
 
+const L = JSON.parse(document.getElementById('levels').textContent);
+
 const recs = D.recommendations;
 let picked = recs.findIndex(r=>r.bid_price>0);
 if(picked<0) picked = 0;
+let depth = L.order[1];        /* opens at the working level, not the shallowest */
+
+/* ------------------------------------------------------- the depth control */
+function levels(app){
+  app.append(el('h2',{},'What this is, at four depths'));
+  const p = el('div',{class:'panel'});
+  const seg = el('div',{class:'seg',role:'group','aria-label':'Level of explanation'});
+  const note = el('p',{class:'seg-note'});
+  const body = el('div',{});
+
+  function paint(){
+    seg.replaceChildren();
+    L.order.forEach(key=>{
+      const b = el('button',{type:'button','aria-pressed':String(key===depth)},
+                   L.labels[key].name);
+      b.onclick = ()=>{ depth = key; paint(); };
+      seg.append(b);
+    });
+    note.replaceChildren(document.createTextNode(L.labels[depth].for));
+    body.replaceChildren();
+    L.topics.forEach(t=>{
+      body.append(el('div',{class:'topic '+depth},
+        el('h3',{}, t.title), el('p',{}, t.levels[depth])));
+    });
+  }
+  paint();
+  p.append(seg, note, body);
+  app.append(p);
+}
 
 /* ---------------------------------------------------------------- charts */
 function chart(host, series, opt){
@@ -221,6 +271,8 @@ function render(){
         'measured on a settled '+D.backtest.first+' to '+D.backtest.last)
   );
   app.append(k);
+
+  levels(app);
 
   /* calendar */
   app.append(el('h2',{},'The next '+recs.length+' nights'));
@@ -444,6 +496,8 @@ def build_artifact(root: str, payload: Dict[str, Any]) -> str:
         + "<div id=\"app\"></div>\n"
         + "<script id=\"payload\" type=\"application/json\">"
         + json.dumps(payload, default=str) + "</script>\n"
+        + "<script id=\"levels\" type=\"application/json\">"
+        + json.dumps(level_payload()) + "</script>\n"
         + "<script>" + JS + "</script>\n"
     )
     path = os.path.join(out, "dashboard-artifact.html")
@@ -459,7 +513,8 @@ def build(root: str, payload: Dict[str, Any]) -> str:
             .replace("__TITLE__", "%s revenue controls" % payload["hotel"]["name"])
             .replace("__CSS__", CSS)
             .replace("__JS__", JS)
-            .replace("__DATA__", json.dumps(payload, default=str)))
+            .replace("__DATA__", json.dumps(payload, default=str))
+            .replace("__LEVELS__", json.dumps(level_payload())))
     path = os.path.join(out, "dashboard.html")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(html)
