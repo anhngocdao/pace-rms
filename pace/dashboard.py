@@ -97,6 +97,26 @@ tr.on td{background:var(--accent-soft)}
 .tag.hot{border-color:var(--warn);color:var(--warn)}
 .tag.ok{border-color:var(--good);color:var(--good)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:10px}
+/* A ninety night window crosses four months. Without a month label a reader
+   has to count weekday columns to work out where they are, so each month gets
+   its own grid and its own name. */
+.monthlab{font:600 12px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);margin:20px 0 7px}
+.monthlab:first-child{margin-top:0}
+.key{display:grid;gap:6px;margin-top:12px;font-size:12px;color:var(--muted)}
+.key b{color:var(--ink);font-weight:600;font-family:var(--mono);font-size:11.5px}
+.blurb{color:var(--muted);font-size:13px;margin:-6px 0 12px;max-width:76ch;line-height:1.55}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:860px){.pair{grid-template-columns:1fr}}
+.panel h3{margin:0 0 10px;font-size:11.5px;text-transform:uppercase;letter-spacing:.07em;
+  color:var(--muted);font-weight:640}
+.mini{font-size:12.5px}
+.mini td,.mini th{padding:5px 7px}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--ink)}
+th.sortable:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+th[aria-sort]{color:var(--accent)}
+th .caret{font-size:9px;margin-left:3px;opacity:.8}
 .swatch{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
 ul.drivers{margin:10px 0 0;padding-left:17px} ul.drivers li{margin:5px 0;font-size:13.5px}
 .headline{font-size:16.5px;font-weight:620;margin:2px 0 6px;letter-spacing:-.01em}
@@ -143,14 +163,25 @@ const S=(t,a)=>{const n=document.createElementNS('http://www.w3.org/2000/svg',t)
 
 const L = JSON.parse(document.getElementById('levels').textContent);
 
+/* Every block says what question it answers before it answers it. A heading
+   like "Every night, every decision" tells a reader what they are looking at
+   and nothing about why they should. */
+function section(app, title, blurb, attrs){
+  app.append(el('h2', attrs||{}, title));
+  if(blurb) app.append(el('p',{class:'blurb'}, blurb));
+}
+
 const recs = D.recommendations;
 let picked = recs.findIndex(r=>r.bid_price>0);
 if(picked<0) picked = 0;
 let depth = L.order[1];        /* opens at the working level, not the shallowest */
+let sortKey = 'date', sortDir = 1;
 
 /* ------------------------------------------------------- the depth control */
 function levels(app){
-  app.append(el('h2',{},'What this is, at four depths'));
+  section(app, 'What this is, at four depths',
+    'The same five ideas, written out four times. Pick the one pitched at you: '+
+    'nobody should have to read a level below their own to follow the one they are on.');
   const p = el('div',{class:'panel'});
   const seg = el('div',{class:'seg',role:'group','aria-label':'Level of explanation'});
   const note = el('p',{class:'seg-note'});
@@ -274,15 +305,28 @@ function render(){
 
   levels(app);
 
-  /* calendar */
-  app.append(el('h2',{},'The next '+recs.length+' nights'));
+  /* calendar, one grid per month: a ninety night window crosses four of them */
+  section(app, 'The next '+recs.length+' nights',
+    'One button per night, in calendar order. Click any night to see the reasoning '+
+    'that produced its rate. Nights that need a human to look at them are marked, '+
+    'so the window can be scanned rather than read.');
   const pan = el('div',{class:'panel'});
-  const cal = el('div',{class:'cal'});
-  ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].forEach(d=>cal.append(el('div',{class:'h'},d)));
-  const first = new Date(recs[0].date+'T00:00:00');
-  let pad = (first.getDay()+6)%7;
-  for(let i=0;i<pad;i++) cal.append(el('div',{}));
+  const MONTHS=['January','February','March','April','May','June',
+                'July','August','September','October','November','December'];
+  const newGrid=()=>{const g=el('div',{class:'cal'});
+    ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].forEach(d=>g.append(el('div',{class:'h'},d)));
+    return g;};
+  let cursor=null, cal=null;
   recs.forEach((r,i)=>{
+    const dt = new Date(r.date+'T00:00:00');
+    const key = dt.getFullYear()+'-'+dt.getMonth();
+    if(key!==cursor){
+      if(cal) pan.append(cal);
+      pan.append(el('div',{class:'monthlab'}, MONTHS[dt.getMonth()]+' '+dt.getFullYear()));
+      cal = newGrid();
+      for(let q=0;q<(dt.getDay()+6)%7;q++) cal.append(el('div',{}));
+      cursor = key;
+    }
     const restricted = r.cta || r.mlos>1 || r.closed.length;
     const chips = el('div',{class:'f'});
     chips.append(el('span',{}, r.sellout?'full':pct(r.forecast_occ)));
@@ -292,7 +336,7 @@ function render(){
     const cls = 'cell' + (i===picked?' on':'') + (r.sellout?' flag full':(restricted?' flag':''));
     const c = el('button',{class:cls,type:'button',style:'background:'+heat(r.rate),
       title:r.date+' '+r.dow+', '+r.headline},
-      el('div',{class:'d'}, r.date.slice(5)+' '+r.dow),
+      el('div',{class:'d'}, dt.getDate()+' '+r.dow),
       el('div',{class:'r'}, Math.round(r.rate)),
       chips);
     c.onclick=()=>{picked=i;render();
@@ -300,17 +344,35 @@ function render(){
       const t=document.querySelector('.cell.on'); if(t) t.focus({preventScroll:true});};
     cal.append(c);
   });
-  pan.append(cal);
-  pan.append(el('div',{class:'legend'},
-    el('span',{},el('span',{class:'swatch',style:'background:'+heat(rlo)}),'lowest rate '+money(rlo)),
-    el('span',{},el('span',{class:'swatch',style:'background:'+heat(rhi)}),'highest rate '+money(rhi)),
-    el('span',{},'a stripe marks a night that needs a decision: dark for forecast full, '+
-      'rust for a restriction in force. MLOS = minimum nights, CTA = closed to arrival, '+
-      '−n = n rate categories closed')));
+  if(cal) pan.append(cal);
+
+  /* What the marks mean. Two numbers sit in every cell and neither was
+     labelled, which meant the densest thing on the page was the least
+     explained thing on it. */
+  pan.append(el('div',{class:'key'},
+    el('div',{}, el('b',{},String(Math.round(recs[picked].rate))),
+      ' the rate the engine would publish that night, in '+cur),
+    el('div',{}, el('b',{}, recs[picked].sellout?'full':pct(recs[picked].forecast_occ)),
+      ' occupancy it expects at that rate, or "full" when it forecasts a sellout'),
+    el('div',{}, el('b',{},'MLOS 3'),' shortest stay accepted · ',
+      el('b',{},'CTA'),' closed to arrival · ',
+      el('b',{},'−2'),' two rate categories closed'),
+    el('div',{class:'legend',style:'margin-top:2px'},
+      el('span',{},el('span',{class:'swatch',style:'background:'+heat(rlo)}),
+        'lowest rate in the window, '+money(rlo)),
+      el('span',{},el('span',{class:'swatch',style:'background:'+heat(rhi)}),
+        'highest, '+money(rhi)),
+      el('span',{},el('span',{class:'swatch',style:'background:var(--ink)'}),
+        'stripe: forecast full'),
+      el('span',{},el('span',{class:'swatch',style:'background:var(--warn)'}),
+        'stripe: a restriction is in force'))));
   app.append(pan);
 
   /* rate vs bid */
-  app.append(el('h2',{},'Rate against the value of the room'));
+  section(app, 'Rate against the value of the room',
+    'The published rate and the bid price, night by night. The gap between the two '+
+    'lines is the margin the engine is holding: where they close, the rate is being '+
+    'held up by the value of the room rather than by what demand will pay.');
   const c1 = el('div',{class:'panel'});
   const ticks=[]; recs.forEach((r,i)=>{ if(i%10===0) ticks.push([i,r.date.slice(5)]); });
   const host1=el('div',{}); c1.append(host1);
@@ -327,7 +389,10 @@ function render(){
 
   /* detail + pace */
   const r = recs[picked];
-  app.append(el('h2',{id:'detail'},'Why this night is priced this way'));
+  section(app, 'Why this night is priced this way',
+    'The night selected in the calendar above, unpacked. Every recommendation carries '+
+    'its own reasoning, because a revenue system that cannot say why it moved the rate '+
+    'gets overridden until somebody switches it off.', {id:'detail'});
   const two = el('div',{class:'two'});
   const dp = el('div',{class:'panel'});
   dp.append(el('div',{class:'sub'}, r.date+' · '+r.dow+' · '+r.lead+' days out · confidence '+r.confidence));
@@ -371,7 +436,9 @@ function render(){
   app.append(two);
 
   /* backtest */
-  app.append(el('h2',{},'Backtest · '+D.backtest.first+' to '+D.backtest.last));
+  section(app, 'Backtest · '+D.backtest.first+' to '+D.backtest.last,
+    'Whether any of this works. Three pricing policies replayed against one identical '+
+    'stream of booking requests, on settled nights where the outcome is already known.');
   const bp=el('div',{class:'panel'});
   const tb=el('table');
   tb.append(el('thead',{},el('tr',{},el('th',{},'Policy'),el('th',{class:'num'},'Occupancy'),
@@ -411,7 +478,9 @@ function render(){
   app.append(bp);
 
   /* model */
-  app.append(el('h2',{},'What the engine learned'));
+  section(app, 'What the engine learned',
+    'The parameters the engine fitted from history rather than being given. If these '+
+    'look wrong, everything above them is wrong too, which is why they are on the page.');
   const mp=el('div',{class:'panel'});
   const mt=el('table');
   mt.append(el('thead',{},el('tr',{},el('th',{},'Segment'),el('th',{class:'num'},'Rooms sold'),
@@ -439,22 +508,106 @@ function render(){
       ' · rules: '+(D.plugins.rules.join(', ')||'none')));
   app.append(mp);
 
-  /* table */
-  app.append(el('h2',{},'Every night, every decision'));
+  /* summaries. Ninety rows is a record, not an answer: nobody reads a
+     forward window one night at a time. A revenue team reads it two ways,
+     down the months and across the week, so both are on the page. */
+  section(app, 'How the window breaks down',
+    'The same ninety nights, aggregated the two ways a revenue team actually reads '+
+    'them. Down the months for the seasonal shape, across the weekday for the shape '+
+    'that repeats every seven days and drives most of the restrictions.');
+  const summarise = rows => {
+    const n = rows.length, capacity = n*D.hotel.rooms;
+    const rooms = rows.reduce((a,x)=>a+x.forecast_rooms,0);
+    const revenue = rows.reduce((a,x)=>a+x.forecast_revpar,0)*D.hotel.rooms;
+    return {n:n, rate:rows.reduce((a,x)=>a+x.rate,0)/n,
+            occ:rooms/capacity, adr:rooms?revenue/rooms:0, revpar:revenue/capacity,
+            bid:rows.reduce((a,x)=>a+x.bid_price,0)/n,
+            tight:rows.filter(x=>x.sellout||x.forecast_occ>=.95).length,
+            restricted:rows.filter(x=>x.mlos>1||x.cta||x.closed.length).length};
+  };
+  const summaryTable = (title, groups, firstHead) => {
+    const box = el('div',{class:'panel'});
+    box.append(el('h3',{}, title));
+    const t = el('table',{class:'mini'});
+    t.append(el('thead',{},el('tr',{},el('th',{},firstHead),el('th',{class:'num'},'Nights'),
+      el('th',{class:'num'},'Rate'),el('th',{class:'num'},'Occ'),el('th',{class:'num'},'RevPAR'),
+      el('th',{class:'num'},'Bid'),el('th',{class:'num'},'Tight'))));
+    const body = el('tbody');
+    groups.forEach(([label, rows])=>{
+      const a = summarise(rows);
+      body.append(el('tr',{}, el('td',{},label), el('td',{class:'num'},a.n),
+        el('td',{class:'num'},Math.round(a.rate)), el('td',{class:'num'},pct(a.occ)),
+        el('td',{class:'num'},Math.round(a.revpar)), el('td',{class:'num'},Math.round(a.bid)),
+        el('td',{class:'num'}, a.tight+(a.restricted?(' / '+a.restricted):''))));
+    });
+    t.append(body); box.append(el('div',{class:'scroll'},t));
+    return box;
+  };
+  const byMonth = new Map();
+  recs.forEach(x=>{ const d=new Date(x.date+'T00:00:00');
+    const key = MONTHS[d.getMonth()]+' '+d.getFullYear();
+    if(!byMonth.has(key)) byMonth.set(key,[]); byMonth.get(key).push(x); });
+  const DOW=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  const byDow = DOW.map(d=>[d, recs.filter(x=>x.dow===d)]).filter(g=>g[1].length);
+  const pair = el('div',{class:'pair'});
+  pair.append(summaryTable('Down the months', [...byMonth.entries()], 'Month'));
+  pair.append(summaryTable('Across the week', byDow, 'Day'));
+  app.append(pair);
+  app.append(el('p',{class:'sub',style:'margin-top:10px'},
+    'Tight counts nights forecast at 95% or above. Where such a night also carries a '+
+    'restriction the count appears after a slash, and ' +
+    (restricted ? (restricted+' nights in this window do.')
+                : 'no night in this window does: the engine is pricing its way '+
+                  'through without needing to close anything.') +
+    ' Bid is the average value of the last available room, which is the number the '+
+    'rate has to clear.'));
+
+  /* the record itself, sortable, because the useful question is rarely
+     "what happens on the fourteenth" but "which nights are worth the most" */
+  section(app, 'Every night, every decision',
+    'The full record, one row per night. Sort by any column: the bid price column '+
+    'ranks the window by what a room is actually worth, which is the order a revenue '+
+    'manager would work through it in. Click a row to open its reasoning above.');
+  const COLS=[
+    {k:'date',   h:'Date',  get:x=>x.date,  cell:x=>x.date},
+    {k:'dow',    h:'Day',   get:x=>DOW.indexOf(x.dow), cell:x=>x.dow},
+    {k:'lead',   h:'Lead',  num:1, get:x=>x.lead, cell:x=>x.lead},
+    {k:'otb',    h:'OTB',   num:1, get:x=>x.otb,  cell:x=>x.otb},
+    {k:'rate',   h:'Rate',  num:1, get:x=>x.rate, cell:x=>Math.round(x.rate)},
+    {k:'bid',    h:'Bid',   num:1, get:x=>x.bid_price,
+     cell:x=>x.bid_price>0?Math.round(x.bid_price):'·'},
+    {k:'occ',    h:'Forecast occ', num:1, get:x=>x.sellout?1.001:x.forecast_occ,
+     cell:x=>x.sellout?'full':pct(x.forecast_occ)},
+    {k:'restr',  h:'Restrictions',
+     get:x=>(x.cta?4:0)+(x.mlos>1?2:0)+x.closed.length,
+     cell:x=>(x.cta?'CTA ':'')+(x.mlos>1?('MLOS '+x.mlos+' '):'')+(x.closed.join(' ')||'')||'·'},
+    {k:'bound',  h:'Binding constraint', get:x=>x.bound_by, cell:x=>x.bound_by},
+  ];
+  const order = recs.map((_,i)=>i);
+  const col = COLS.find(c=>c.k===sortKey) || COLS[0];
+  order.sort((a,b)=>{
+    const va=col.get(recs[a]), vb=col.get(recs[b]);
+    if(va<vb) return -sortDir; if(va>vb) return sortDir; return a-b;
+  });
   const tp=el('div',{class:'panel scroll'});
   const t2=el('table');
-  t2.append(el('thead',{},el('tr',{},el('th',{},'Date'),el('th',{},'Day'),el('th',{class:'num'},'Lead'),
-    el('th',{class:'num'},'OTB'),el('th',{class:'num'},'Rate'),el('th',{class:'num'},'Bid'),
-    el('th',{class:'num'},'Forecast occ'),el('th',{},'Restrictions'),el('th',{},'Binding constraint'))));
+  const hr=el('tr',{});
+  COLS.forEach(c=>{
+    const active = c.k===sortKey;
+    const th=el('th',{class:'sortable'+(c.num?' num':''),tabindex:'0',role:'button'},
+      c.h, active?el('span',{class:'caret'}, sortDir>0?'\u25b2':'\u25bc'):'');
+    if(active) th.setAttribute('aria-sort', sortDir>0?'ascending':'descending');
+    const flip=()=>{ if(sortKey===c.k) sortDir=-sortDir; else {sortKey=c.k; sortDir=1;} render(); };
+    th.onclick=flip;
+    th.onkeydown=e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();flip();} };
+    hr.append(th);
+  });
+  t2.append(el('thead',{},hr));
   const b2=el('tbody');
-  recs.forEach((x,i)=>{
-    const tr=el('tr',{class:'click'+(i===picked?' on':''),tabindex:'0'},
-      el('td',{},x.date),el('td',{},x.dow),el('td',{class:'num'},x.lead),
-      el('td',{class:'num'},x.otb),el('td',{class:'num'},Math.round(x.rate)),
-      el('td',{class:'num'},x.bid_price>0?Math.round(x.bid_price):'—'),
-      el('td',{class:'num'},x.sellout?'full':pct(x.forecast_occ)),
-      el('td',{}, (x.cta?'CTA ':'')+(x.mlos>1?('MLOS '+x.mlos+' '):'')+(x.closed.join(' ')||'')||'—'),
-      el('td',{},x.bound_by));
+  order.forEach(i=>{
+    const x=recs[i];
+    const tr=el('tr',{class:'click'+(i===picked?' on':''),tabindex:'0'});
+    COLS.forEach(c=>tr.append(el('td',{class:c.num?'num':''}, c.cell(x))));
     const go=()=>{picked=i;render();
       document.getElementById('detail').scrollIntoView({behavior:'smooth',block:'start'})};
     tr.onclick=go;
