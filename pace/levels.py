@@ -233,6 +233,58 @@ TOPICS: List[Dict[str, object]] = [
 ]
 
 
+# Orientation, kept shut by default.  A reader who already knows what a bid
+# price is should not have to scroll past a paragraph explaining it, and a
+# reader who does not should not have to guess which of the numbers on screen
+# is the one that matters.  Five entries, because a guide long enough to need
+# its own guide has failed.
+GUIDE_TITLE = "How to read this sheet"
+
+GUIDE: List[Dict[str, str]] = [
+    {
+        "term": "Where to look first",
+        "text": "The calendar. Every night the engine wants a human to look at "
+                "carries a bar down its left edge, dark where it forecasts a "
+                "sellout and oxide where a restriction is in force. Nights "
+                "without a bar are running themselves and can be skipped.",
+    },
+    {
+        "term": "Bid price",
+        "text": "What the last available room is worth if it is held for later "
+                "demand instead of sold now. Every other control is derived "
+                "from it: the published rate has to clear it, a rate category "
+                "whose net value falls below it gets closed, and a one night "
+                "stay that cannot clear it may be refused on a night where a "
+                "three night stay is accepted.",
+    },
+    {
+        "term": "The marks in a cell",
+        "text": "The large figure is the rate the engine would publish, the "
+                "small one the occupancy it expects at that rate. MLOS 3 means "
+                "the shortest stay accepted is three nights. CTA means closed "
+                "to arrival: the night can be stayed through but not started. "
+                "A figure like -2 means two rate categories are closed.",
+    },
+    {
+        "term": "Pace",
+        "text": "How far ahead of or behind its own history a night is booking. "
+                "A night 60% sold at forty days out means nothing on its own. "
+                "It means something once you know that this kind of night is "
+                "normally 45% sold at that point, which is what the pace curve "
+                "underneath every recommendation is for.",
+    },
+    {
+        "term": "What is real here",
+        "text": "The property and the market are invented. The decision logic, "
+                "the fitted parameters and the backtest are not: they are "
+                "computed from scratch every time this page is built, and the "
+                "page reads its numbers from that run rather than from a "
+                "spreadsheet somebody typed.",
+    },
+]
+
+
 def as_payload() -> dict:
     """The structure the dashboard and the case page both read."""
-    return {"order": list(LEVEL_ORDER), "labels": LEVEL_LABELS, "topics": TOPICS}
+    return {"order": list(LEVEL_ORDER), "labels": LEVEL_LABELS, "topics": TOPICS,
+            "guide": {"title": GUIDE_TITLE, "items": GUIDE}}

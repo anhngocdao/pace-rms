@@ -83,10 +83,43 @@ h1{font-size:clamp(26px,3.4vw,38px);margin:0 0 6px;letter-spacing:-.025em;
 .sub{color:var(--muted);font-size:14px;margin:0}
 .masthead{border-bottom:1.5px solid var(--rule);padding-bottom:22px;margin-bottom:0}
 
-/* section heads: a rule, a mono label, then the statement of purpose */
-h2{font:600 11px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;
-  color:var(--ink);margin:44px 0 0;padding-top:14px;border-top:1px solid var(--rule)}
-.blurb{color:var(--muted);font-size:13.5px;margin:9px 0 18px;max-width:74ch;line-height:1.6}
+/* Four steps of hierarchy, and they have to be tellable apart at a glance:
+   part, section, the sentence that carries the point, then the qualification.
+   Every heading set in small mono capitals made all eight sections look like
+   the same rank, which is what made the page read as a wall. */
+.part{margin:60px 0 0;padding-top:18px;border-top:2px solid var(--rule);
+  display:flex;align-items:baseline;gap:14px}
+.part:first-of-type{margin-top:44px}
+.part .n{font:600 11px/1 var(--mono);letter-spacing:.14em;color:var(--accent);
+  flex-shrink:0}
+.part h2{font-size:21px;font-weight:700;letter-spacing:-.025em;margin:0;
+  text-transform:none;border:0;padding:0;color:var(--ink);line-height:1.2}
+.part .of{margin-left:auto;font:500 10.5px/1 var(--mono);letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted);flex-shrink:0}
+h3.head{font-size:16px;font-weight:650;letter-spacing:-.015em;color:var(--ink);
+  margin:34px 0 0;line-height:1.3}
+.blurb{margin:7px 0 18px;max-width:74ch;line-height:1.6;font-size:13.5px;
+  color:var(--muted)}
+/* The first sentence is the claim; the rest qualifies it. Reading them at the
+   same weight makes the reader find the claim themselves, every time. */
+.blurb .lead{color:var(--ink);font-size:14px;font-weight:500}
+
+/* the reading guide, shut until wanted */
+.guide{border:1px solid var(--hair);border-radius:3px;margin:0 0 6px;
+  background:var(--sand)}
+.guide > summary{list-style:none;cursor:pointer;padding:13px 16px;display:flex;
+  align-items:center;gap:10px;font:600 11px/1 var(--mono);letter-spacing:.12em;
+  text-transform:uppercase;color:var(--ink)}
+.guide > summary::-webkit-details-marker{display:none}
+.guide > summary::after{content:'+';margin-left:auto;font:400 14px/1 var(--mono);
+  color:var(--muted)}
+.guide[open] > summary::after{content:'\2212'}
+.guide > summary:hover{color:var(--accent)}
+.guide > summary:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+.guide dl{margin:0;padding:2px 16px 16px}
+.guide dt{font-weight:650;font-size:13.5px;color:var(--ink);margin-top:14px}
+.guide dd{margin:3px 0 0;font-size:13.5px;line-height:1.6;color:var(--muted);
+  max-width:72ch}
 
 /* no cards. sections sit on the paper, separated by rules */
 .panel{background:transparent;border:0;border-radius:0;padding:0}
@@ -259,9 +292,31 @@ const L = JSON.parse(document.getElementById('levels').textContent);
 /* Every block says what question it answers before it answers it. A heading
    like "Every night, every decision" tells a reader what they are looking at
    and nothing about why they should. */
-function section(app, title, blurb, attrs){
-  app.append(el('h2', attrs||{}, title));
-  if(blurb) app.append(el('p',{class:'blurb'}, blurb));
+function part(app, index, title, of){
+  app.append(el('div',{class:'part'},
+    el('span',{class:'n'}, index),
+    el('h2',{}, title),
+    of?el('span',{class:'of'}, of):''));
+}
+
+/* lead is the claim, rest is the qualification, and they are separate
+   arguments rather than one string so nothing has to guess where a sentence
+   ends in order to know what to emphasise. */
+function section(app, title, lead, rest, attrs){
+  app.append(el('h3', Object.assign({class:'head'}, attrs||{}), title));
+  if(lead||rest) app.append(el('p',{class:'blurb'},
+    lead?el('span',{class:'lead'}, lead+' '):'', rest||''));
+}
+
+function guide(app){
+  const g = L.guide;
+  if(!g) return;
+  const d = el('details',{class:'guide'});
+  d.append(el('summary',{}, g.title));
+  const dl = el('dl',{});
+  g.items.forEach(it=>{ dl.append(el('dt',{}, it.term), el('dd',{}, it.text)); });
+  d.append(dl);
+  app.append(d);
 }
 
 const recs = D.recommendations;
@@ -274,8 +329,9 @@ let openTopic = 0;             /* one idea open at a time, not five walls of tex
 /* ------------------------------------------------------- the depth control */
 function levels(app){
   section(app, 'What this is, at four depths',
-    'The same five ideas, written out four times. Pick the one pitched at you: '+
-    'nobody should have to read a level below their own to follow the one they are on.');
+    'The same five ideas, written out four times.',
+    'Pick the one pitched at you: nobody should have to read a level below their '+
+    'own to follow the one they are on.');
   const p = el('div',{class:'panel'});
   const seg = el('div',{class:'seg',role:'group','aria-label':'Level of explanation'});
   const note = el('p',{class:'seg-note'});
@@ -417,13 +473,16 @@ function render(){
   );
   app.append(k);
 
+  part(app, '01', 'What this is', 'orientation');
+  guide(app);
   levels(app);
 
+  part(app, '02', 'The decisions on the table', 'next ' + recs.length + ' nights');
   /* calendar, one grid per month: a ninety night window crosses four of them */
   section(app, 'The next '+recs.length+' nights',
-    'One button per night, in calendar order. Click any night to see the reasoning '+
-    'that produced its rate. Nights that need a human to look at them are marked, '+
-    'so the window can be scanned rather than read.');
+    'Every night the engine is pricing, in calendar order.',
+    'Click any night to see the reasoning that produced its rate. Nights that need '+
+    'a human to look at them are marked, so the window can be scanned rather than read.');
   const pan = el('div',{class:'panel'});
   const MONTHS=['January','February','March','April','May','June',
                 'July','August','September','October','November','December'];
@@ -485,31 +544,13 @@ function render(){
         'stripe: a restriction is in force'))));
   app.append(pan);
 
-  /* rate vs bid */
-  section(app, 'Rate against the value of the room',
-    'The published rate and the bid price, night by night. The gap between the two '+
-    'lines is the margin the engine is holding: where they close, the rate is being '+
-    'held up by the value of the room rather than by what demand will pay.');
-  const c1 = el('div',{class:'panel'});
-  const ticks=[]; recs.forEach((r,i)=>{ if(i%10===0) ticks.push([i,r.date.slice(5)]); });
-  const host1=el('div',{}); c1.append(host1);
-  c1.append(el('p',{class:'sub',style:'margin-top:8px'},
-    'The bid price is what the last available room is worth if it is kept for later demand. '+
-    'Where it rises above the rate line, price alone has run out of room and the restrictions take over.'));
-  app.append(c1);
-  chart(host1,[
-    {name:'Recommended rate', v:recs.map(r=>r.rate), color:'var(--accent)', w:2},
-    {name:'Bid price', v:recs.map(r=>r.bid_price), color:'var(--series)', type:'area', w:1.4},
-    {name:'Forecast occupancy', v:recs.map(r=>r.forecast_occ), color:'var(--muted)', axis:'r', w:1.2, dash:'4 3'}
-  ],{xticks:ticks,right:true,mark:picked,legend:true,h:250,
-     lfmt:v=>Math.round(v),rfmt:v=>Math.round(v*100)+'%'});
-
   /* detail + pace */
   const r = recs[picked];
   section(app, 'Why this night is priced this way',
-    'The night selected in the calendar above, unpacked. Every recommendation carries '+
-    'its own reasoning, because a revenue system that cannot say why it moved the rate '+
-    'gets overridden until somebody switches it off.', {id:'detail'});
+    'The night selected above, unpacked.',
+    'Every recommendation carries its own reasoning, because a revenue system that '+
+    'cannot say why it moved the rate gets overridden until somebody switches it off.',
+    {id:'detail'});
   const two = el('div',{class:'two'});
   const dp = el('div',{class:'panel'});
   dp.append(el('div',{class:'sub'}, r.date+' · '+r.dow+' · '+r.lead+' days out · confidence '+r.confidence));
@@ -552,86 +593,33 @@ function render(){
   two.append(pp);
   app.append(two);
 
-  /* backtest */
-  section(app, 'Backtest · '+D.backtest.first+' to '+D.backtest.last,
-    'Whether any of this works. Three pricing policies replayed against one identical '+
-    'stream of booking requests, on settled nights where the outcome is already known.');
-  const bp=el('div',{class:'panel'});
-  const tb=el('table');
-  tb.append(el('thead',{},el('tr',{},el('th',{},'Policy'),el('th',{class:'num'},'Occupancy'),
-    el('th',{class:'num'},'ADR'),el('th',{class:'num'},'RevPAR'),el('th',{class:'num'},'GOPPAR'),
-    el('th',{class:'num'},'Walks'),el('th',{class:'num'},'RevPAR vs incumbent'))));
-  const tbody=el('tbody');
-  const names={static:'Static BAR, one rate all year',ladder:'Seasonal ladder (the incumbent)',engine:'Pace engine'};
-  ['static','ladder','engine'].forEach(key=>{
-    const x=s[key]; if(!x) return;
-    tbody.append(el('tr',{},el('td',{},names[key]),el('td',{class:'num'},pct(x.occupancy,1)),
-      el('td',{class:'num'},money(x.adr)),el('td',{class:'num'},money(x.revpar)),
-      el('td',{class:'num'},money(x.goppar)),el('td',{class:'num'},x.walked),
-      el('td',{class:'num'},key==='ladder'?'baseline':((x.revpar_lift_vs_ladder>=0?'+':'')+pct(x.revpar_lift_vs_ladder,1)))));
-  });
-  tb.append(tbody); bp.append(el('div',{class:'scroll'},tb));
-  const dm = D.backtest.denials_by_reason||{};
-  const labels = {price:'walked away on price (never visible to a real hotel)',
-    capacity:'refused, no room left', mlos:'refused, below the minimum stay',
-    cta:'refused, closed to arrival', segment_closed:'refused, that rate was closed'};
-  const dl = el('div',{style:'margin-top:16px'});
-  dl.append(el('div',{class:'label',style:'font-size:11.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:8px'},
-    'Room nights the engine turned away, and why'));
-  const dmax = Math.max(1,...Object.values(dm));
-  Object.entries(dm).sort((a,b)=>b[1]-a[1]).forEach(([k,v])=>{
-    const row = el('div',{style:'display:grid;grid-template-columns:64px 1fr;gap:10px;align-items:center;margin:5px 0'},
-      el('div',{style:'font-family:var(--mono);font-size:12.5px;text-align:right'}, v.toLocaleString()),
-      el('div',{},
-        el('div',{class:'bar'}, el('i',{style:'width:'+(v/dmax*100)+'%'})),
-        el('div',{style:'font-size:12px;color:var(--muted);margin-top:3px'}, labels[k]||k)));
-    dl.append(row);
-  });
-  bp.append(dl);
-  bp.append(el('p',{class:'sub',style:'margin-top:12px'},
-    'All three policies were run against the identical stream of booking requests, each carrying its own '+
-    'willingness to pay, so a request refused by one policy is genuinely available to another. '+
-    'The market is synthetic: this measures whether the decision logic is sound, not what any real hotel would earn.'));
-  app.append(bp);
+  /* rate vs bid */
+  section(app, 'Rate against the value of the room',
+    'The gap between these two lines is the margin the engine is holding.',
+    'Where they close, the rate is being held up by what the room is worth rather '+
+    'than by what demand will pay, and price has run out of room to work with.');
+  const c1 = el('div',{class:'panel'});
+  const ticks=[]; recs.forEach((r,i)=>{ if(i%10===0) ticks.push([i,r.date.slice(5)]); });
+  const host1=el('div',{}); c1.append(host1);
+  c1.append(el('p',{class:'sub',style:'margin-top:8px'},
+    'The bid price is what the last available room is worth if it is kept for later demand. '+
+    'Where it rises above the rate line, price alone has run out of room and the restrictions take over.'));
+  app.append(c1);
+  chart(host1,[
+    {name:'Recommended rate', v:recs.map(r=>r.rate), color:'var(--accent)', w:2},
+    {name:'Bid price', v:recs.map(r=>r.bid_price), color:'var(--series)', type:'area', w:1.4},
+    {name:'Forecast occupancy', v:recs.map(r=>r.forecast_occ), color:'var(--muted)', axis:'r', w:1.2, dash:'4 3'}
+  ],{xticks:ticks,right:true,mark:picked,legend:true,h:250,
+     lfmt:v=>Math.round(v),rfmt:v=>Math.round(v*100)+'%'});
 
-  /* model */
-  section(app, 'What the engine learned',
-    'The parameters the engine fitted from history rather than being given. If these '+
-    'look wrong, everything above them is wrong too, which is why they are on the page.');
-  const mp=el('div',{class:'panel'});
-  const mt=el('table');
-  mt.append(el('thead',{},el('tr',{},el('th',{},'Segment'),el('th',{class:'num'},'Rooms sold'),
-    el('th',{class:'num'},'ADR'),el('th',{class:'num'},'Fitted elasticity'),el('th',{class:'num'},'Prior'),
-    el('th',{class:'num'},'Nights used'))));
-  const mb=el('tbody');
-  Object.entries(D.segments).forEach(([code,v])=>{
-    mb.append(el('tr',{},el('td',{},v.name),el('td',{class:'num'},v.rooms.toLocaleString()),
-      el('td',{class:'num'},money(v.adr)),
-      el('td',{class:'num'}, v.elasticity_at_reference? v.elasticity_at_reference.toFixed(2):'contracted'),
-      el('td',{class:'num'}, v.elasticity_prior.toFixed(2)),
-      el('td',{class:'num'}, v.elasticity_observations)));
-  });
-  mt.append(mb); mp.append(el('div',{class:'scroll'},mt));
-  const last = D.fit_log[D.fit_log.length-1]||{};
-  mp.append(el('p',{class:'sub',style:'margin-top:12px'},
-    'Refitted every 28 nights, most recently on '+(last.asof||'n/a')+' from '+(last.nights_of_history||0)+
-    ' settled nights. Unconstrained demand runs '+
-    (((last.censoring_uplift_house||1)-1)*100).toFixed(1)+'% above booked demand house-wide: that is the '+
-    'business the booked history never recorded because the night was already full. '+
-    'Contracted segments have no fitted elasticity because the engine does not set their rate.'));
-  if(D.plugins && D.plugins.loaded.length)
-    mp.append(el('p',{class:'sub'},'Extensions loaded: '+D.plugins.loaded.join(', ')+
-      ' · signals: '+(D.plugins.signals.join(', ')||'none')+
-      ' · rules: '+(D.plugins.rules.join(', ')||'none')));
-  app.append(mp);
-
+  part(app, '03', 'The window in aggregate', 'the same nights, summed');
   /* summaries. Ninety rows is a record, not an answer: nobody reads a
      forward window one night at a time. A revenue team reads it two ways,
      down the months and across the week, so both are on the page. */
   section(app, 'How the window breaks down',
-    'The same ninety nights, aggregated the two ways a revenue team actually reads '+
-    'them. Down the months for the seasonal shape, across the weekday for the shape '+
-    'that repeats every seven days and drives most of the restrictions.');
+    'The same ninety nights, aggregated the two ways a revenue team reads them.',
+    'Down the months for the seasonal shape, across the weekday for the shape that '+
+    'repeats every seven days and drives most of the restrictions.');
   const summarise = rows => {
     const n = rows.length, capacity = n*D.hotel.rooms;
     const rooms = rows.reduce((a,x)=>a+x.forecast_rooms,0);
@@ -682,9 +670,10 @@ function render(){
   /* the record itself, sortable, because the useful question is rarely
      "what happens on the fourteenth" but "which nights are worth the most" */
   section(app, 'Every night, every decision',
-    'The full record, one row per night. Sort by any column: the bid price column '+
-    'ranks the window by what a room is actually worth, which is the order a revenue '+
-    'manager would work through it in. Click a row to open its reasoning above.');
+    'The full record, one row per night, sortable by any column.',
+    'Sorting by bid price ranks the window by what a room is actually worth, which is '+
+    'the order a revenue manager would work through it in. Click a row to open its '+
+    'reasoning above.');
   const COLS=[
     {k:'date',   h:'Date',  get:x=>x.date,  cell:x=>x.date},
     {k:'dow',    h:'Day',   get:x=>DOW.indexOf(x.dow), cell:x=>x.dow},
@@ -732,6 +721,89 @@ function render(){
     b2.append(tr);
   });
   t2.append(b2); tp.append(t2); app.append(tp);
+
+  part(app, '04', 'Whether it works', 'settled nights, and the model behind them');
+  /* backtest */
+  section(app, 'Backtest · '+D.backtest.first+' to '+D.backtest.last,
+    'Whether any of this works.',
+    'Three pricing policies replayed against one identical stream of booking requests, '+
+    'on settled nights where the outcome is already known.');
+  const bp=el('div',{class:'panel'});
+  const tb=el('table');
+  tb.append(el('thead',{},el('tr',{},el('th',{},'Policy'),el('th',{class:'num'},'Occupancy'),
+    el('th',{class:'num'},'ADR'),el('th',{class:'num'},'RevPAR'),el('th',{class:'num'},'GOPPAR'),
+    el('th',{class:'num'},'Walks'),el('th',{class:'num'},'RevPAR vs incumbent'))));
+  const tbody=el('tbody');
+  const names={static:'Static BAR, one rate all year',ladder:'Seasonal ladder (the incumbent)',engine:'Pace engine'};
+  ['static','ladder','engine'].forEach(key=>{
+    const x=s[key]; if(!x) return;
+    tbody.append(el('tr',{},el('td',{},names[key]),el('td',{class:'num'},pct(x.occupancy,1)),
+      el('td',{class:'num'},money(x.adr)),el('td',{class:'num'},money(x.revpar)),
+      el('td',{class:'num'},money(x.goppar)),el('td',{class:'num'},x.walked),
+      el('td',{class:'num'},key==='ladder'?'baseline':((x.revpar_lift_vs_ladder>=0?'+':'')+pct(x.revpar_lift_vs_ladder,1)))));
+  });
+  tb.append(tbody); bp.append(el('div',{class:'scroll'},tb));
+  const dm = D.backtest.denials_by_reason||{};
+  const labels = {price:'walked away on price (never visible to a real hotel)',
+    capacity:'refused, no room left', mlos:'refused, below the minimum stay',
+    cta:'refused, closed to arrival', segment_closed:'refused, that rate was closed'};
+  const dl = el('div',{style:'margin-top:16px'});
+  dl.append(el('div',{class:'label',style:'font-size:11.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:8px'},
+    'Room nights the engine turned away, and why'));
+  const dmax = Math.max(1,...Object.values(dm));
+  Object.entries(dm).sort((a,b)=>b[1]-a[1]).forEach(([k,v])=>{
+    const row = el('div',{style:'display:grid;grid-template-columns:64px 1fr;gap:10px;align-items:center;margin:5px 0'},
+      el('div',{style:'font-family:var(--mono);font-size:12.5px;text-align:right'}, v.toLocaleString()),
+      el('div',{},
+        el('div',{class:'bar'}, el('i',{style:'width:'+(v/dmax*100)+'%'})),
+        el('div',{style:'font-size:12px;color:var(--muted);margin-top:3px'}, labels[k]||k)));
+    dl.append(row);
+  });
+  bp.append(dl);
+  bp.append(el('p',{class:'sub',style:'margin-top:12px'},
+    'All three policies were run against the identical stream of booking requests, each carrying its own '+
+    'willingness to pay, so a request refused by one policy is genuinely available to another. '+
+    'The market is synthetic: this measures whether the decision logic is sound, not what any real hotel would earn.'));
+  app.append(bp);
+
+  /* model */
+  section(app, 'What the engine learned',
+    'The parameters fitted from history rather than handed over.',
+    'If these look wrong then everything above them is wrong too, which is the only '+
+    'reason to put a table of model coefficients on a page anyone else has to read.');
+  const mp=el('div',{class:'panel'});
+  const mt=el('table');
+  mt.append(el('thead',{},el('tr',{},el('th',{},'Segment'),el('th',{class:'num'},'Rooms sold'),
+    el('th',{class:'num'},'ADR'),el('th',{class:'num'},'Fitted elasticity'),el('th',{class:'num'},'Prior'),
+    el('th',{class:'num'},'Nights used'))));
+  const mb=el('tbody');
+  Object.entries(D.segments).forEach(([code,v])=>{
+    mb.append(el('tr',{},el('td',{},v.name),el('td',{class:'num'},v.rooms.toLocaleString()),
+      el('td',{class:'num'},money(v.adr)),
+      el('td',{class:'num'}, v.elasticity_at_reference? v.elasticity_at_reference.toFixed(2):'contracted'),
+      el('td',{class:'num'}, v.elasticity_prior.toFixed(2)),
+      el('td',{class:'num'}, v.elasticity_observations)));
+  });
+  mt.append(mb); mp.append(el('div',{class:'scroll'},mt));
+  const last = D.fit_log[D.fit_log.length-1]||{};
+  mp.append(el('p',{class:'sub',style:'margin-top:12px'},
+    'Refitted every 28 nights, most recently on '+(last.asof||'n/a')+' from '+(last.nights_of_history||0)+
+    ' settled nights. Unconstrained demand runs '+
+    (((last.censoring_uplift_house||1)-1)*100).toFixed(1)+'% above booked demand house-wide: that is the '+
+    'business the booked history never recorded because the night was already full. '+
+    'Contracted segments have no fitted elasticity because the engine does not set their rate.'));
+  if(D.plugins && D.plugins.loaded.length)
+    mp.append(el('p',{class:'sub'},'Extensions loaded: '+D.plugins.loaded.join(', ')+
+      ' · signals: '+(D.plugins.signals.join(', ')||'none')+
+      ' · rules: '+(D.plugins.rules.join(', ')||'none')));
+  app.append(mp);
+
+
+
+
+
+
+
 
   app.append(el('div',{class:'foot'},
     'Pace · generated in '+D.runtime_seconds+'s from '+D.demand_total_requests.toLocaleString()+
