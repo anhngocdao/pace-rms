@@ -349,17 +349,140 @@ that is roughly 176 properties, in pure Python with no vectorisation and no
 parallelism. Properties are independent, so the obvious parallelism is
 available and unused.
 
-**Where it actually stops scaling is the model, not the machine.** This prices
-one room type. A real hotel has five to fifteen, with guests substituting
-between them, and that is a network problem rather than a single resource one.
-The bid price generalises, but through the dual prices of a deterministic
-linear program, not through the formula in section 7. Length of stay is
-handled here by summing nightly bid prices, which is the standard
-approximation and is exactly where a network formulation would earn its keep.
-A thirty room property has too few nights per demand class to estimate
-anything, and would need statistics pooled across properties. And every real
-integration meets a property management system whose historical snapshots do
-not exist and whose segment codes are a mess.
+**Where it actually stops scaling is the model, not the machine.** Sections 1
+to 12 price one room type. A real hotel has five to fifteen, with guests
+substituting between them, and that is a network problem rather than a single
+resource one. The bid price generalises, but through the dual prices of a
+deterministic linear program, not through the formula in section 7. Length of
+stay is handled there by summing nightly bid prices, which is the standard
+approximation. A thirty room property has too few nights per demand class to
+estimate anything, and would need statistics pooled across properties. And
+every real integration meets a property management system whose historical
+snapshots do not exist and whose segment codes are a mess.
+
+Section 14 builds the network model this paragraph asks for, and finds that
+one sentence of this paragraph was wrong.
+
+## 14. The network model, and the sentence it disproved
+
+`python3 run.py network`
+
+This section originally ended with a prediction: that summing nightly bid
+prices was "exactly where a network formulation would earn its keep". The
+network model is now built, and length of stay is not where it earns its keep.
+
+### What was built
+
+Products are stays, resources are (room type, night) cells, and a stay
+consumes one unit of every cell it touches:
+
+    max  sum_j v_j x_j    subject to   sum_j a_rj x_j <= c_r,  0 <= x_j <= d_j
+
+The dual price of each capacity constraint is that cell's bid price, and a
+stay is worth taking when its total value clears the sum of the duals of the
+cells it consumes. `dual_prices` solves this by exact coordinate descent on
+the dual, which has a closed form per coordinate: sort the requests that use a
+cell by what they can pay it after paying for their other cells, take demand
+until the cell fills, and the price is the threshold of the request that
+filled it. Forty two cells and four hundred products settle in eight passes
+and eight milliseconds. Every solve also builds a feasible primal plan and
+reports the duality gap, measured at 0.46% on that instance, and that figure
+is an upper bound on the dual's own suboptimality because the primal is greedy
+and therefore loose in its own right.
+
+`decomposed_bid_prices` puts the demand uncertainty back. The duals say where
+the scarcity is, the stay value is prorated onto its nights in that
+proportion, and each night is then solved with the closed form of section 7.
+
+Proration and not displacement adjustment, which is the one modelling decision
+here worth defending. Subtracting the other cells' duals inside each cell is
+what virtual nesting does, and it is right when the decision is taken one
+resource at a time. A hotel decides on the whole stay against the sum of its
+nights, so if every night has already subtracted its neighbours, a five night
+stay pays for its neighbours four times over and is refused for arithmetic
+reasons. Proration keeps the parts summing to the whole exactly, which means
+the sum of the nightly prices stays a statement about the stay rather than
+about its length.
+
+Guests substitute. `pace/choice.py` is a nested logit: a purchase decision
+across the nest, an allocation across room types inside it, with the inside
+sensitivity larger because guests change room far more readily than they
+change hotel. Two reductions are tested rather than asserted. With one room
+type it is the acceptance curve of section 5 to twelve decimal places. With
+four types priced in step it is still that curve, so adding rooms to a
+property cannot quietly move its demand curve. Substitution appears only when
+relative prices move, which is the honest statement of what a room type model
+buys: a hotel pricing its types on a fixed multiplier ladder has four room
+types and one decision.
+
+### What it earns
+
+Same guests, same order, same rates, differences paired trial by trial so the
+comparison is not buried under which weekend drew a large group. Twelve trials
+over a twenty one night window, against the nightly bid price of section 7:
+
+| Demand | Occupancy | Share of ceiling | Deterministic dual | Prorated stochastic |
+|---|---|---|---|---|
+| 0.75 | 90.8% | 81.3% | **+1.47%** (12/12) | +1.14% (12/12) |
+| 0.90 | 96.1% | 85.5% | **+1.81%** (12/12) | +1.01% (12/12) |
+| 1.00 | 97.2% | 87.5% | +0.61% (8/12) | +0.57% (9/12) |
+| 1.20 | 98.1% | 90.5% | +0.34% (11/12) | +0.48% (12/12) |
+
+Real, consistent, and small. It decays as the house jams up, which is what it
+should do: a control with no choices left cannot make better ones. The ceiling
+column is the share of an optimistic hindsight bound, which sees the whole
+realised stream, may put any guest in any room and assumes they accept it. No
+online control can reach it.
+
+### Which dimension it actually needed
+
+Turning each dimension off in turn, at demand 0.90:
+
+| Room types | Stays | Deterministic dual | Prorated stochastic |
+|---|---|---|---|
+| four | real | **+1.81%** (12/12) | **+1.01%** (12/12) |
+| four | all one night | −1.06% (0/12) | −0.07% (4/12) |
+| one | real | +0.10% (7/12) | +0.32% (9/12) |
+| one | all one night | −0.84% (0/12) | −0.54% (1/12) |
+
+Length of stay on its own earns nothing: one room type with real stays wins
+seven trials out of twelve, which is a coin. Room types on their own earn
+nothing either. The whole gain is an interaction, and the mechanism is legible
+once the table is in front of you. A group block needs the same room type on
+every night of its stay. That is two constraints binding at once, and exactly
+one more than an additive nightly price can express. Neither dimension alone
+produces a booking that can bind twice.
+
+The bottom half of the table is the part worth keeping. **Where the problem is
+not genuinely a network, the network machinery is worse than the arithmetic it
+replaces**, by a percent or more. Modelling a hotel as a network is not free
+sophistication. It is a bet on the hotel having a particular shape, and a
+property with one room type, or with no multi night demand, should decline it.
+
+One more result sits inside that table and is worth naming, because it runs
+against the obvious ordering. The deterministic dual beats the prorated
+stochastic form in the case that matters, +1.81% against +1.01%, despite
+throwing demand uncertainty away. It is not better calibrated. It is wrong in
+a direction that happens to cancel. Prorating rebuilds an additive price, and
+an additive price understates what a booking costs when it needs several cells
+at once; the deterministic dual charges full opportunity cost the moment
+expected demand passes capacity, which overstates the same thing. Two errors,
+opposite signs, and the cruder model lands closer. That is not a reason to
+prefer it in general. The honest reading is that neither form is right: what a
+stay spanning several scarce cells is worth is a question about the joint
+distribution of those cells running out, and neither of these prices it.
+
+### What this changes about the engine
+
+Nothing yet, deliberately. `PaceEngine` still runs the section 7 closed form,
+the backtest in section 8 is unchanged and reproducible, and the network layer
+is a separate module with its own command. A one to two percent contribution
+gain measured on a synthetic market with a correct forecast is not enough to
+justify replacing a control that has been measured end to end against forecast
+error, censoring and an incumbent baseline. The next honest step is to run the
+network control inside the full backtest, with the engine's own forecast rather
+than the true one, and see how much of the gain survives contact with forecast
+error. That number is not in this document because it has not been measured.
 
 ## References
 
@@ -368,3 +491,10 @@ the single resource dynamic program and bid price control. Belobaba, on EMSR
 and nested protection levels. Weatherford and Bodily, on unconstraining
 censored demand. Littlewood, for the two class rule the closed form
 generalises.
+
+For section 14: Simpson, and Williamson, for the deterministic linear program
+whose duals are network bid prices. Talluri and van Ryzin again, for
+displacement adjusted virtual nesting and for why an additive approximation
+over legs is the usual practical compromise. Ben-Akiva and Lerman, for the
+nested logit and the dissimilarity parameter that makes the room choice
+stickier than the hotel choice.
