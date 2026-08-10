@@ -87,9 +87,14 @@ h1{font-size:clamp(26px,3.4vw,38px);margin:0 0 6px;letter-spacing:-.025em;
    part, section, the sentence that carries the point, then the qualification.
    Every heading set in small mono capitals made all eight sections look like
    the same rank, which is what made the page read as a wall. */
-.part{margin:60px 0 0;padding-top:18px;border-top:2px solid var(--rule);
-  display:flex;align-items:baseline;gap:14px}
-.part:first-of-type{margin-top:44px}
+.part{margin:64px 0 0;padding-top:18px;border-top:2px solid var(--rule);
+  display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.part:first-of-type{margin-top:46px}
+/* Whatever follows a part needs air, or the part title and the first thing
+   under it read as one cramped two line block instead of as a heading and
+   its contents. */
+.part + *{margin-top:26px}
+.part + h3.head{margin-top:26px}
 .part .n{font:600 11px/1 var(--mono);letter-spacing:.14em;color:var(--accent);
   flex-shrink:0}
 .part h2{font-size:21px;font-weight:700;letter-spacing:-.025em;margin:0;
@@ -120,6 +125,9 @@ h3.head{font-size:16px;font-weight:650;letter-spacing:-.015em;color:var(--ink);
 .guide dt{font-weight:650;font-size:13.5px;color:var(--ink);margin-top:14px}
 .guide dd{margin:3px 0 0;font-size:13.5px;line-height:1.6;color:var(--muted);
   max-width:72ch}
+/* Declared after .guide on purpose: .part + * ties with .guide on specificity
+   and loses to it on order, which left the part title sitting on the guide. */
+.part + .guide{margin-top:26px}
 
 /* no cards. sections sit on the paper, separated by rules */
 .panel{background:transparent;border:0;border-radius:0;padding:0}
@@ -447,7 +455,11 @@ function render(){
   const s = D.backtest.scores;
   const eng = s.engine||{}, lad = s.ladder||{}, sta = s.static||{};
 
-  app.append(el('button',{class:'toggle',id:'themebtn'},'theme'));
+  const nowTheme = document.documentElement.getAttribute('data-theme') ||
+    (matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light');
+  const nextTheme = nowTheme==='dark' ? 'light' : 'dark';
+  app.append(el('button',{class:'toggle',id:'themebtn',
+    'aria-label':'Switch to the '+nextTheme+' theme'}, nextTheme));
   app.append(el('div',{class:'masthead'},
     el('div',{class:'eyebrow'}, 'Forecast sheet · issued ' + D.generated),
     el('h1',{}, D.hotel.name),
@@ -811,10 +823,7 @@ function render(){
     'Python standard library only. Synthetic property and synthetic market throughout.'));
 
   document.getElementById('themebtn').onclick=()=>{
-    const r=document.documentElement;
-    const now=r.getAttribute('data-theme')||
-      (matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
-    r.setAttribute('data-theme', now==='dark'?'light':'dark');
+    document.documentElement.setAttribute('data-theme', nextTheme);
     render();
   };
 }
