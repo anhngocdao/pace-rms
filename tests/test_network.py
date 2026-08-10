@@ -312,5 +312,53 @@ class TestWhereTheAdditiveApproximationBreaks(unittest.TestCase):
             self.assertAlmostEqual(dec[cell], ind[cell], places=9)
 
 
+class TestEvaluation(unittest.TestCase):
+    """The harness that decides whether any of this was worth building."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pace import networkeval as ne
+        cls.ne = ne
+        cls.window = ne.default_window(DEFAULT_HOTEL, INV, nights=7,
+                                       demand_scale=0.9)
+        cls.stream = ne.draw_stream(cls.window, random.Random(5))
+
+    def _fresh(self):
+        return [self.ne.Arrival(a.rid, a.segment, a.first_night, a.los, a.rooms,
+                                a.lead, a.taste) for a in self.stream]
+
+    def test_no_control_sells_a_room_that_does_not_exist(self):
+        for control in self.ne.CONTROLS:
+            got = self.ne.run_control(self.window, self._fresh(), control, 4)
+            self.assertLessEqual(got["occupancy"], 1.0 + 1e-9, control)
+            self.assertGreater(got["rooms_sold"], 0, control)
+
+    def test_the_same_guests_get_the_same_answer_twice(self):
+        first = self.ne.run_control(self.window, self._fresh(), "dlp", 4)
+        again = self.ne.run_control(self.window, self._fresh(), "dlp", 4)
+        self.assertAlmostEqual(first["contribution"], again["contribution"], places=9)
+
+    def test_nothing_beats_hindsight(self):
+        top = self.ne.hindsight_ceiling(self.window, self.stream)
+        for control in self.ne.CONTROLS:
+            got = self.ne.run_control(self.window, self._fresh(), control, 4)
+            self.assertLess(got["contribution"], top["contribution"], control)
+
+    def test_guests_substitute_only_when_there_is_something_to_substitute_to(self):
+        got = self.ne.run_control(self.window, self._fresh(), "dlp", 4)
+        self.assertGreater(got["substituted"], 0)
+
+        solo = Inventory([RoomType("STD", "Only room", DEFAULT_HOTEL.rooms, 1.00, 0)])
+        window = self.ne.default_window(DEFAULT_HOTEL, solo, nights=7,
+                                        demand_scale=0.9)
+        stream = self.ne.draw_stream(window, random.Random(5))
+        alone = self.ne.run_control(window, stream, "dlp", 4)
+        self.assertEqual(alone["substituted"], 0)
+
+    def test_a_window_with_nothing_left_to_come_has_nothing_to_optimise(self):
+        inst = self.ne.remaining_instance(self.window, self.window.capacity(), 0.0)
+        self.assertEqual(inst.products, [])
+
+
 if __name__ == "__main__":
     unittest.main()

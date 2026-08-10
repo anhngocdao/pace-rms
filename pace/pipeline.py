@@ -218,6 +218,66 @@ def robustness(root: str = ".", seeds=(20250115, 4242, 991, 70707), verbose: boo
     return rows
 
 
+def network_report(root: str = ".", trials: int = 12, verbose: bool = True) -> dict:
+    """Score the network bid price against the nightly one the engine uses.
+
+    Two tables, and the second is the one that matters.  The first sweeps
+    demand and asks whether the network control earns anything.  The second
+    turns each of its two dimensions off in turn and asks which of them the
+    answer actually depended on, because a result that holds only in the
+    presence of both is a different claim from a result that holds in general.
+    """
+    from .networkeval import CONTROLS, compare, interaction
+    from .roomtypes import DEFAULT_INVENTORY
+
+    hotel = S.HOTEL
+    DEFAULT_INVENTORY.validate(hotel.rooms)
+
+    sweep = []
+    if verbose:
+        print("   contribution against the nightly bid price, same guests, %d trials"
+              % trials)
+        print("   %-6s %6s %9s   %s" % ("demand", "occ", "ceiling",
+                                        "   ".join("%-22s" % c for c in CONTROLS[1:])))
+    for scale in (0.75, 0.90, 1.00, 1.20):
+        res = compare(hotel, DEFAULT_INVENTORY, trials=trials, demand_scale=scale)
+        sweep.append(res)
+        if verbose:
+            cells = ["%+7.3f%% se %.3f %2d/%d" % (res["paired"][c]["mean"] * 100,
+                                                  res["paired"][c]["stderr"] * 100,
+                                                  res["paired"][c]["wins"], trials)
+                     for c in CONTROLS[1:]]
+            print("   %-6.2f %5.1f%% %8.1f%%   %s"
+                  % (scale, res["mean"]["independent"]["occupancy"] * 100,
+                     res["mean"]["independent"]["share_of_ceiling"] * 100,
+                     "   ".join(cells)), flush=True)
+
+    grid = interaction(hotel, DEFAULT_INVENTORY, trials=trials)
+    if verbose:
+        print()
+        print("   which dimension the gain depended on")
+        print("   %-11s %-8s   %s" % ("room types", "stays",
+                                      "   ".join("%-22s" % c for c in CONTROLS[1:])))
+        for row in grid:
+            cells = ["%+7.3f%% se %.3f %2d/%d" % (row[c]["mean"] * 100,
+                                                  row[c]["stderr"] * 100,
+                                                  row[c]["wins"], row["trials"])
+                     for c in CONTROLS[1:]]
+            print("   %-11s %-8s   %s" % (row["room_types"], row["length_of_stay"],
+                                          "   ".join(cells)))
+
+    payload = {"trials": trials, "sweep": [_thin(r) for r in sweep],
+               "interaction": grid}
+    with open(os.path.join(_out_dir(root), "network.json"), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=1)
+    return payload
+
+
+def _thin(result: dict) -> dict:
+    """The comparison without its per trial detail, which nothing downstream reads."""
+    return {k: v for k, v in result.items() if k != "per_trial"}
+
+
 def _out_dir(root: str) -> str:
     path = os.path.join(root, "out")
     os.makedirs(path, exist_ok=True)

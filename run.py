@@ -7,6 +7,7 @@
   python3 run.py show 2025-02-14  print the reasoning for one night
   python3 run.py robustness  re-run the comparison on four independent markets
   python3 run.py experiment  score the randomised rate experiment against the truth
+  python3 run.py network     score the network bid price against the nightly one
   python3 run.py bench       where the time goes, and how it scales
   python3 run.py test        run the checks
 """
@@ -43,6 +44,12 @@ def main(argv):
         from pace.pipeline import experiment_report
         print("scoring the rate experiment ...")
         experiment_report(root=HERE)
+        return 0
+
+    if cmd == "network":
+        from pace.pipeline import network_report
+        print("scoring the network bid price ...")
+        network_report(root=HERE, trials=4 if "--quick" in args else 12)
         return 0
 
     if cmd == "robustness":
