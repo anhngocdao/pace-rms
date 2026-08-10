@@ -155,6 +155,9 @@ const D = JSON.parse(document.getElementById('payload').textContent);
 const cur = D.hotel.currency;
 const money = v => cur + ' ' + Math.round(v).toLocaleString();
 const pct = (v,d=0) => (v*100).toFixed(d) + '%';
+/* The cell already sits in a weekday column, so printing the weekday inside it
+   says the same thing twice. An ordinal reads as a date on its own. */
+const ord = n => n + (['th','st','nd','rd'][(n%100-20)%10] || ['th','st','nd','rd'][n%100] || 'th');
 const el = (t,a,...k)=>{const n=document.createElement(t);
   for(const q in (a||{})) q==='html'?n.innerHTML=a[q]:n.setAttribute(q,a[q]);
   k.flat().forEach(c=>n.append(c&&c.nodeType?c:document.createTextNode(c==null?'':c)));return n;};
@@ -334,9 +337,12 @@ function render(){
     else if(r.mlos>1) chips.append(el('span',{class:'chip'},'MLOS '+r.mlos));
     if(r.closed.length) chips.append(el('span',{class:'chip'},'−'+r.closed.length));
     const cls = 'cell' + (i===picked?' on':'') + (r.sellout?' flag full':(restricted?' flag':''));
+    const spoken = r.date+' '+r.dow+', rate '+Math.round(r.rate)+', '+
+      (r.sellout?'forecast full':'forecast '+pct(r.forecast_occ))+
+      (restricted?', restricted':'');
     const c = el('button',{class:cls,type:'button',style:'background:'+heat(r.rate),
-      title:r.date+' '+r.dow+', '+r.headline},
-      el('div',{class:'d'}, dt.getDate()+' '+r.dow),
+      title:r.date+' '+r.dow+', '+r.headline,'aria-label':spoken},
+      el('div',{class:'d'}, ord(dt.getDate())),
       el('div',{class:'r'}, Math.round(r.rate)),
       chips);
     c.onclick=()=>{picked=i;render();
