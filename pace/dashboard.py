@@ -26,128 +26,218 @@ TEMPLATE = """<!doctype html>
 """
 
 CSS = r"""
+/* Forecast sheet.
+ *
+ * The palette is the portfolio's own, taken from its tokens rather than
+ * matched by eye: porcelain paper, near-black ink, and one electric blue that
+ * carries every accent on that site. Inter throughout, because the site sets
+ * even its headings in Inter.
+ *
+ * The layout is borrowed from the thing this replaces. A revenue manager's
+ * native document is a printed forecast sheet: ruled paper, dense columns of
+ * figures, terse heads, and a single mark against the nights that need a
+ * decision. So there are no cards. Sections are separated by rules, figures
+ * are monospace and tabular, and the only filled shapes on the page are the
+ * calendar cells, where the fill is the data.
+ *
+ * Colour is rationed deliberately. The accent is spent on the rate heat scale
+ * and on what is currently selected, nowhere else. Scarcity gets a separate
+ * oxide, because "this needs your attention" is a different statement from
+ * "this is the accent colour" and they must not be confused on a page whose
+ * whole job is flagging nights.
+ */
 :root{
-  --bg:#f5f7f8; --panel:#ffffff; --ink:#14181d; --muted:#67717d; --line:#e0e5e8;
-  --accent:#1f5f8b; --accent-soft:#e8f0f6; --series:#9a5b3d; --warn:#a8492e;
-  --good:#2f6b4f; --grid:#e9edef; --focus:#1f5f8b;
+  --paper:#F6F5F2; --ink:#191919; --muted:#6E6D66; --sand:#ECEBE6;
+  --hair:rgba(25,25,25,.12); --rule:rgba(25,25,25,.22); --grid:rgba(25,25,25,.07);
+  --accent:#2B4CFF; --accent-soft:rgba(43,76,255,.10);
+  --scarce:#9C4221; --good:#3B6E4F;
+  --focus:#2B4CFF;
+  --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
 }
 @media (prefers-color-scheme:dark){
-  :root{--bg:#0f1216;--panel:#171b21;--ink:#e7eaee;--muted:#98a1ad;--line:#272c34;
-        --accent:#6fb0dc;--accent-soft:#1b2c39;--series:#d09a7a;--warn:#e08a6c;
-        --good:#7cc4a1;--grid:#212630;--focus:#8cc4e6;}
+  :root{--paper:#141210;--ink:#ECE7DC;--muted:rgba(236,231,220,.58);--sand:#241F19;
+    --hair:rgba(236,231,220,.16);--rule:rgba(236,231,220,.28);--grid:rgba(236,231,220,.10);
+    --accent:#8DA2FF;--accent-soft:rgba(141,162,255,.15);
+    --scarce:#E09A6E;--good:#83C09A;--focus:#8DA2FF;}
 }
-:root[data-theme=light]{--bg:#f5f7f8;--panel:#fff;--ink:#14181d;--muted:#67717d;--line:#e0e5e8;
-  --accent:#1f5f8b;--accent-soft:#e8f0f6;--series:#9a5b3d;--warn:#a8492e;--good:#2f6b4f;
-  --grid:#e9edef;--focus:#1f5f8b;}
-:root[data-theme=dark]{--bg:#0f1216;--panel:#171b21;--ink:#e7eaee;--muted:#98a1ad;--line:#272c34;
-  --accent:#6fb0dc;--accent-soft:#1b2c39;--series:#d09a7a;--warn:#e08a6c;--good:#7cc4a1;
-  --grid:#212630;--focus:#8cc4e6;}
+:root[data-theme=light]{--paper:#F6F5F2;--ink:#191919;--muted:#6E6D66;--sand:#ECEBE6;
+  --hair:rgba(25,25,25,.12);--rule:rgba(25,25,25,.22);--grid:rgba(25,25,25,.07);
+  --accent:#2B4CFF;--accent-soft:rgba(43,76,255,.10);--scarce:#9C4221;--good:#3B6E4F;
+  --focus:#2B4CFF;}
+:root[data-theme=dark]{--paper:#141210;--ink:#ECE7DC;--muted:rgba(236,231,220,.58);--sand:#241F19;
+  --hair:rgba(236,231,220,.16);--rule:rgba(236,231,220,.28);--grid:rgba(236,231,220,.10);
+  --accent:#8DA2FF;--accent-soft:rgba(141,162,255,.15);--scarce:#E09A6E;--good:#83C09A;
+  --focus:#8DA2FF;}
+
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
-  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
-#app{max-width:1180px;margin:0 auto;padding:28px 20px 72px}
-h1{font-size:23px;margin:0 0 2px;letter-spacing:-.01em;font-weight:640}
-h2{font-size:13px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);
-   margin:34px 0 12px;font-weight:640}
-.sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px}
-.grid{display:grid;gap:14px}
-.kpis{grid-template-columns:repeat(auto-fit,minmax(158px,1fr))}
-.kpi .label{font-size:11.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
-.kpi .value{font:600 27px/1.15 var(--mono);margin-top:6px;letter-spacing:-.02em;
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);
+  font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}
+#app{max-width:1120px;margin:0 auto;padding:40px 24px 96px;position:relative}
+
+/* masthead: the header block of a printed report */
+.eyebrow{font:500 11px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:14px}
+h1{font-size:clamp(26px,3.4vw,38px);margin:0 0 6px;letter-spacing:-.025em;
+  font-weight:700;line-height:1.1}
+.sub{color:var(--muted);font-size:14px;margin:0}
+.masthead{border-bottom:1.5px solid var(--rule);padding-bottom:22px;margin-bottom:0}
+
+/* section heads: a rule, a mono label, then the statement of purpose */
+h2{font:600 11px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;
+  color:var(--ink);margin:44px 0 0;padding-top:14px;border-top:1px solid var(--rule)}
+.blurb{color:var(--muted);font-size:13.5px;margin:9px 0 18px;max-width:74ch;line-height:1.6}
+
+/* no cards. sections sit on the paper, separated by rules */
+.panel{background:transparent;border:0;border-radius:0;padding:0}
+.panel h3{margin:0 0 12px;font:600 10.5px/1 var(--mono);letter-spacing:.14em;
+  text-transform:uppercase;color:var(--muted)}
+.grid{display:grid;gap:0}
+
+/* the figures strip: labels above, monospace numbers, hairlines between */
+/* Five figures, and the divider between them has to survive wrapping. auto-fit
+   left an orphan on a second row still carrying a left rule, which reads as a
+   stray line rather than as a column edge. Explicit counts per breakpoint,
+   with the rule cleared on whichever cell starts a row. */
+.kpis{grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--hair)}
+.kpi{padding:20px 18px 22px;border-left:1px solid var(--hair)}
+.kpi:nth-child(5n+1){border-left:0;padding-left:0}
+.kpi .label{font:500 10.5px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted)}
+.kpi .value{font:600 28px/1.05 var(--mono);margin-top:10px;letter-spacing:-.03em;
   font-variant-numeric:tabular-nums}
-.kpi .note{font-size:12px;color:var(--muted);margin-top:4px}
+.kpi .note{font-size:11.5px;color:var(--muted);margin-top:7px;line-height:1.45}
+@media(max-width:1020px){
+  .kpis{grid-template-columns:repeat(3,1fr)}
+  .kpi{border-left:1px solid var(--hair);padding-left:18px}
+  .kpi:nth-child(5n+1){border-left:1px solid var(--hair);padding-left:18px}
+  .kpi:nth-child(3n+1){border-left:0;padding-left:0}
+  .kpi:nth-child(n+4){border-top:1px solid var(--hair)}
+}
+@media(max-width:620px){
+  .kpis{grid-template-columns:1fr}
+  .kpi,.kpi:nth-child(5n+1),.kpi:nth-child(3n+1){border-left:0;padding-left:0;
+    border-top:1px solid var(--hair)}
+  .kpi:first-child{border-top:0}
+}
+
+/* tables: ruled, not boxed */
 table{width:100%;border-collapse:collapse;font-size:13.5px}
-th{text-align:left;font-weight:600;color:var(--muted);font-size:11.5px;text-transform:uppercase;
-   letter-spacing:.06em;padding:7px 9px;border-bottom:1px solid var(--line)}
-td{padding:7px 9px;border-bottom:1px solid var(--grid);white-space:nowrap}
+th{text-align:left;font:600 10.5px/1.3 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted);padding:9px 10px 9px 0;border-bottom:1.5px solid var(--rule);
+  vertical-align:bottom}
+td{padding:8px 10px 8px 0;border-bottom:1px solid var(--grid);white-space:nowrap}
+td:last-child,th:last-child{padding-right:0}
 td:last-child{white-space:normal}
 td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+tbody tr:last-child td{border-bottom:0}
 tr.click{cursor:pointer} tr.click:hover td{background:var(--accent-soft)}
 tr.click:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
-tr.on td{background:var(--accent-soft)}
-.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
-.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
-.cal .h{font-size:10.5px;color:var(--muted);text-align:center;padding-bottom:2px;letter-spacing:.05em}
-.cell{border:1px solid transparent;border-radius:5px;padding:5px 4px 6px 8px;cursor:pointer;
-  min-height:58px;position:relative;transition:transform .08s;display:block;width:100%;
-  font:inherit;color:inherit;text-align:left}
-.cell:hover{transform:translateY(-1px);border-color:var(--ink)}
-.cell:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
-.cell.on{border-color:var(--ink);box-shadow:0 0 0 1px var(--ink) inset}
-/* Severity reads as form before it reads as text: a full night and a night
-   carrying a restriction each earn a stripe, so the calendar can be scanned
-   rather than parsed. */
-.cell.flag::before{content:'';position:absolute;left:2px;top:6px;bottom:6px;width:3px;
-  border-radius:2px;background:var(--warn)}
-.cell.full::before{background:var(--ink)}
-.cell .d{font-size:10.5px;opacity:.8}
-.cell .r{font:600 14px/1.25 var(--mono);margin-top:2px;font-variant-numeric:tabular-nums}
-.cell .f{font-size:9.5px;letter-spacing:.03em;margin-top:3px;opacity:.9;
-  display:flex;gap:3px;flex-wrap:wrap}
-.chip{border:1px solid currentColor;border-radius:3px;padding:0 3px;opacity:.85;
-  font-size:9px;line-height:1.5;white-space:nowrap}
-@media (prefers-reduced-motion:reduce){
-  *{transition:none!important;animation:none!important}
-  .cell:hover{transform:none}
-}
-.tag{display:inline-block;font-size:10px;padding:1px 5px;border-radius:99px;
-  border:1px solid var(--line);color:var(--muted);margin-right:4px;white-space:nowrap}
-.tag.hot{border-color:var(--warn);color:var(--warn)}
-.tag.ok{border-color:var(--good);color:var(--good)}
-.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:10px}
-/* A ninety night window crosses four months. Without a month label a reader
-   has to count weekday columns to work out where they are, so each month gets
-   its own grid and its own name. */
-.monthlab{font:600 12px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
-  color:var(--muted);margin:20px 0 7px}
-.monthlab:first-child{margin-top:0}
-.key{display:grid;gap:6px;margin-top:12px;font-size:12px;color:var(--muted)}
-.key b{color:var(--ink);font-weight:600;font-family:var(--mono);font-size:11.5px}
-.blurb{color:var(--muted);font-size:13px;margin:-6px 0 12px;max-width:76ch;line-height:1.55}
-.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:860px){.pair{grid-template-columns:1fr}}
-.panel h3{margin:0 0 10px;font-size:11.5px;text-transform:uppercase;letter-spacing:.07em;
-  color:var(--muted);font-weight:640}
-.mini{font-size:12.5px}
-.mini td,.mini th{padding:5px 7px}
+tr.on td{background:var(--accent-soft);box-shadow:inset 2px 0 0 var(--accent)}
 th.sortable{cursor:pointer;user-select:none}
 th.sortable:hover{color:var(--ink)}
 th.sortable:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
 th[aria-sort]{color:var(--accent)}
-th .caret{font-size:9px;margin-left:3px;opacity:.8}
-.swatch{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
-ul.drivers{margin:10px 0 0;padding-left:17px} ul.drivers li{margin:5px 0;font-size:13.5px}
-.headline{font-size:16.5px;font-weight:620;margin:2px 0 6px;letter-spacing:-.01em}
-.narr{color:var(--muted);font-size:13.5px;margin-top:10px;border-left:2px solid var(--line);padding-left:12px}
-.two{display:grid;grid-template-columns:1.35fr 1fr;gap:14px}
-@media(max-width:860px){.two{grid-template-columns:1fr}}
-.bar{height:9px;border-radius:99px;background:var(--grid);overflow:hidden}
-.bar i{display:block;height:100%;background:var(--accent)}
-.foot{color:var(--muted);font-size:12.5px;margin-top:30px;border-top:1px solid var(--line);padding-top:14px}
-.toggle{position:absolute;top:26px;right:20px;font-size:12px;color:var(--muted);
-  background:none;border:1px solid var(--line);border-radius:99px;padding:5px 11px;cursor:pointer}
-.toggle:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
-#app{position:relative}
-svg{display:block;width:100%;height:auto}
-.axis{font:10.5px var(--mono);fill:var(--muted)}
+th .caret{font-size:8px;margin-left:4px}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.mini td,.mini th{padding:6px 8px 6px 0}
 
-/* depth control: the same account of the system, pitched four ways */
-.seg{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 4px}
-.seg button{font:inherit;font-size:12.5px;color:var(--muted);background:var(--bg);
-  border:1px solid var(--line);border-radius:99px;padding:6px 14px;cursor:pointer;
-  transition:color .12s,border-color .12s,background .12s}
-.seg button:hover{color:var(--ink);border-color:var(--muted)}
-.seg button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
-.seg button[aria-pressed=true]{background:var(--accent-soft);border-color:var(--accent);
-  color:var(--accent);font-weight:640}
-.seg-note{font-size:12.5px;color:var(--muted);margin:2px 0 16px;min-height:1.3em}
-.topic{padding:14px 0;border-top:1px solid var(--line)}
-.topic:first-of-type{border-top:0;padding-top:4px}
-.topic h3{margin:0 0 6px;font-size:14.5px;font-weight:640;letter-spacing:-.005em}
-.topic p{margin:0;font-size:14px;line-height:1.62;max-width:66ch;color:var(--ink)}
-@media(prefers-reduced-motion:reduce){.seg button{transition:none}}
+/* the calendar: the only place on the page that gets filled shapes */
+.monthlab{font:600 10.5px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;
+  color:var(--muted);margin:26px 0 9px;display:flex;align-items:center;gap:12px}
+.monthlab::after{content:'';flex:1;height:1px;background:var(--hair)}
+.monthlab:first-child{margin-top:4px}
+.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.cal .h{font:500 9.5px/1 var(--mono);color:var(--muted);text-align:center;
+  padding-bottom:7px;letter-spacing:.12em;text-transform:uppercase}
+.cell{border:1px solid var(--grid);border-radius:2px;padding:7px 6px 7px 10px;cursor:pointer;
+  min-height:64px;position:relative;transition:box-shadow .1s;display:block;width:100%;
+  font:inherit;color:inherit;text-align:left}
+.cell:hover{box-shadow:inset 0 0 0 1px var(--ink)}
+.cell:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
+.cell.on{box-shadow:inset 0 0 0 2px var(--ink)}
+/* Severity reads as form before it reads as text, so a night that needs a
+   decision earns a bar down its edge and can be found without reading. */
+.cell.flag::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
+  background:var(--scarce)}
+.cell.full::before{background:var(--ink)}
+.cell .d{font:500 10px/1 var(--mono);color:var(--muted);letter-spacing:.04em}
+.cell .r{font:600 16px/1.2 var(--mono);margin-top:5px;font-variant-numeric:tabular-nums;
+  letter-spacing:-.02em}
+.cell .f{font:500 9px/1.5 var(--mono);letter-spacing:.05em;margin-top:4px;color:var(--muted);
+  display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.chip{border:1px solid currentColor;border-radius:2px;padding:0 3px;color:var(--scarce);
+  font-size:8.5px;white-space:nowrap}
+
+/* the key, written as a definition list rather than a paragraph */
+.key{display:grid;gap:7px;margin-top:18px;padding-top:14px;border-top:1px solid var(--hair);
+  font-size:12.5px;color:var(--muted)}
+.key b{color:var(--ink);font-weight:600;font-family:var(--mono);font-size:12px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:10px}
+.swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;
+  vertical-align:-1px;border:1px solid var(--hair)}
+
+/* the depth control: a tab strip on a rule, and topics that stay shut */
+.seg{display:flex;flex-wrap:wrap;gap:0;border-bottom:1px solid var(--hair);margin-bottom:10px}
+.seg button{font:600 11px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);background:none;border:0;border-bottom:2px solid transparent;
+  padding:10px 16px 9px;margin-bottom:-1px;cursor:pointer;transition:color .12s}
+.seg button:first-child{padding-left:0}
+.seg button:hover{color:var(--ink)}
+.seg button:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+.seg button[aria-pressed=true]{color:var(--accent);border-bottom-color:var(--accent)}
+.seg-note{font-size:12.5px;color:var(--muted);margin:0 0 4px}
+.topic{border-bottom:1px solid var(--hair)}
+.topic > summary{list-style:none;cursor:pointer;padding:13px 0;display:flex;
+  align-items:baseline;gap:12px;font-size:15px;font-weight:600;letter-spacing:-.01em}
+.topic > summary::-webkit-details-marker{display:none}
+.topic > summary::after{content:'+';margin-left:auto;font:400 15px/1 var(--mono);
+  color:var(--muted);transform:translateY(1px)}
+.topic[open] > summary::after{content:'\2212'}
+.topic > summary:hover{color:var(--accent)}
+.topic > summary:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.topic .body{padding:0 0 16px;font-size:14.5px;line-height:1.68;color:var(--muted);
+  max-width:70ch}
+.topic .body b{color:var(--ink)}
+
+/* detail block */
+.two{display:grid;grid-template-columns:1.3fr 1fr;gap:0}
+.two > *:last-child{border-left:1px solid var(--hair);padding-left:26px}
+@media(max-width:860px){.two{grid-template-columns:1fr}
+  .two > *:last-child{border-left:0;padding-left:0;border-top:1px solid var(--hair);
+    padding-top:20px;margin-top:20px}}
+.headline{font-size:19px;font-weight:700;margin:4px 0 10px;letter-spacing:-.02em;
+  line-height:1.25;max-width:26ch}
+.narr{color:var(--muted);font-size:13.5px;margin-top:14px;border-left:2px solid var(--hair);
+  padding-left:14px}
+ul.drivers{margin:14px 0 0;padding-left:0;list-style:none}
+ul.drivers li{margin:0;padding:7px 0 7px 16px;font-size:13.5px;position:relative;
+  border-top:1px solid var(--grid)}
+ul.drivers li::before{content:'';position:absolute;left:0;top:15px;width:6px;height:1px;
+  background:var(--muted)}
+.tag{display:inline-block;font:500 10px/1.6 var(--mono);padding:2px 7px;border-radius:2px;
+  border:1px solid var(--hair);color:var(--muted);margin:0 5px 5px 0;white-space:nowrap;
+  letter-spacing:.04em}
+.tag.hot{border-color:var(--scarce);color:var(--scarce)}
+.tag.ok{border-color:var(--good);color:var(--good)}
+.bar{height:6px;border-radius:0;background:var(--grid);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent)}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:0}
+.pair > *:last-child{border-left:1px solid var(--hair);padding-left:26px}
+@media(max-width:860px){.pair{grid-template-columns:1fr}
+  .pair > *:last-child{border-left:0;padding-left:0;padding-top:22px;margin-top:22px;
+    border-top:1px solid var(--hair)}}
+
+.foot{color:var(--muted);font-size:12px;margin-top:44px;border-top:1.5px solid var(--rule);
+  padding-top:16px;line-height:1.6}
+.toggle{position:absolute;top:40px;right:24px;font:500 10.5px/1 var(--mono);
+  letter-spacing:.12em;text-transform:uppercase;color:var(--muted);background:none;
+  border:1px solid var(--hair);border-radius:2px;padding:7px 12px;cursor:pointer}
+.toggle:hover{color:var(--ink);border-color:var(--rule)}
+.toggle:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+svg{display:block;width:100%;height:auto}
+.axis{font:10px var(--mono);fill:var(--muted)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 """
 
 JS = r"""
@@ -179,6 +269,7 @@ let picked = recs.findIndex(r=>r.bid_price>0);
 if(picked<0) picked = 0;
 let depth = L.order[1];        /* opens at the working level, not the shallowest */
 let sortKey = 'date', sortDir = 1;
+let openTopic = 0;             /* one idea open at a time, not five walls of text */
 
 /* ------------------------------------------------------- the depth control */
 function levels(app){
@@ -200,10 +291,25 @@ function levels(app){
     });
     note.replaceChildren(document.createTextNode(L.labels[depth].for));
     body.replaceChildren();
-    L.topics.forEach(t=>{
-      body.append(el('div',{class:'topic '+depth},
-        el('h3',{}, t.title), el('p',{}, t.levels[depth])));
+    /* Native details and summary, so a topic opens from the keyboard and the
+       browser's own in-page search can still find text inside a shut one.
+       The open state is driven from the click rather than from the toggle
+       event, because toggle fires asynchronously: reading it back to decide
+       which sibling to close is a race, and the race is what left every topic
+       shut on load. Setting all five explicitly cannot disagree with itself. */
+    const shut = () => body.querySelectorAll('details.topic')
+      .forEach((o,j)=>{ o.open = (j===openTopic); });
+    L.topics.forEach((t,i)=>{
+      const sum = el('summary',{}, t.title);
+      sum.addEventListener('click', ev=>{
+        ev.preventDefault();
+        openTopic = (openTopic===i) ? -1 : i;
+        shut();
+      });
+      body.append(el('details',{class:'topic'},
+        sum, el('div',{class:'body'}, t.levels[depth])));
     });
+    shut();
   }
   paint();
   p.append(seg, note, body);
@@ -270,9 +376,12 @@ function chart(host, series, opt){
 const rates = recs.map(r=>r.rate);
 const rlo = Math.min(...rates), rhi = Math.max(...rates);
 function heat(r){
+  /* The one place on the sheet where colour is spent. The ramp tops out well
+     short of the pure accent: a solid blue block would win the page away from
+     the figures printed on it, and the figures are the point. */
   const t = rhi>rlo ? (r-rlo)/(rhi-rlo) : .5;
   const a = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
-  return `color-mix(in srgb, ${a} ${(12+t*62).toFixed(0)}%, var(--panel))`;
+  return `color-mix(in srgb, ${a} ${(3+t*31).toFixed(0)}%, var(--paper))`;
 }
 
 /* ------------------------------------------------------------------- view */
@@ -283,9 +392,11 @@ function render(){
   const eng = s.engine||{}, lad = s.ladder||{}, sta = s.static||{};
 
   app.append(el('button',{class:'toggle',id:'themebtn'},'theme'));
-  app.append(el('h1',{}, D.hotel.name + ' · revenue controls'),
+  app.append(el('div',{class:'masthead'},
+    el('div',{class:'eyebrow'}, 'Forecast sheet · issued ' + D.generated),
+    el('h1',{}, D.hotel.name),
     el('p',{class:'sub'}, D.hotel.rooms + ' rooms, ' + D.hotel.city +
-      ' · decisions as of ' + D.generated + ' for ' + D.window.first + ' to ' + D.window.last));
+      ' · rate, inventory and restrictions for ' + D.window.first + ' to ' + D.window.last)));
 
   /* KPIs */
   const fr = recs.reduce((a,r)=>a+r.forecast_rooms,0);
@@ -457,7 +568,7 @@ function render(){
     tbody.append(el('tr',{},el('td',{},names[key]),el('td',{class:'num'},pct(x.occupancy,1)),
       el('td',{class:'num'},money(x.adr)),el('td',{class:'num'},money(x.revpar)),
       el('td',{class:'num'},money(x.goppar)),el('td',{class:'num'},x.walked),
-      el('td',{class:'num'},key==='ladder'?'—':((x.revpar_lift_vs_ladder>=0?'+':'')+pct(x.revpar_lift_vs_ladder,1)))));
+      el('td',{class:'num'},key==='ladder'?'baseline':((x.revpar_lift_vs_ladder>=0?'+':'')+pct(x.revpar_lift_vs_ladder,1)))));
   });
   tb.append(tbody); bp.append(el('div',{class:'scroll'},tb));
   const dm = D.backtest.denials_by_reason||{};
