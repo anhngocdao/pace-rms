@@ -67,6 +67,9 @@ class EventCalendar:
         self.events: List[Event] = list(events or [])
 
     def add(self, event: Event) -> None:
+        """Idempotent: a plugin file that runs twice must not double its event."""
+        if event in self.events:
+            return
         self.events.append(event)
 
     def active(self, d: dt.date) -> List[Event]:

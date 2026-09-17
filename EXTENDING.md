@@ -6,6 +6,11 @@ plugin nobody can reason about six months later.
 Anything dropped into `plugins/` is imported on the next run. There is no
 registry to update and no engine code to touch.
 
+A plugin file executes once per process, however many times the pipeline
+runs in it. Registering a signal or rule under a name that already exists
+replaces the earlier one, and adding an event the calendar already holds is
+a no-op, so a plugin can be loaded twice without applying twice.
+
 ## Signals
 
 A signal looks at a stay date and returns a demand multiplier plus a sentence
