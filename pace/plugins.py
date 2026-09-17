@@ -32,12 +32,17 @@ class Signal:
 
 _SIGNALS: List = []
 _RULES: List = []
+_LOADED: Dict[str, Any] = {}   # plugin file path -> module, executed once per process
 
 
 def signal(name: str):
-    """Register a demand signal.  The function receives (stay_date, ctx)."""
+    """Register a demand signal.  The function receives (stay_date, ctx).
+
+    Registering a name twice replaces the earlier function, so a plugin file
+    that is executed again does not apply its signal twice."""
 
     def deco(fn: Callable):
+        _SIGNALS[:] = [(n, f) for n, f in _SIGNALS if n != name]
         _SIGNALS.append((name, fn))
         return fn
 
@@ -45,9 +50,12 @@ def signal(name: str):
 
 
 def rule(name: str, priority: int = 100):
-    """Register a post-optimizer rule.  Lower priority numbers run first."""
+    """Register a post-optimizer rule.  Lower priority numbers run first.
+
+    Same-name registration replaces, for the same reason as signal()."""
 
     def deco(fn: Callable):
+        _RULES[:] = [item for item in _RULES if item[1] != name]
         _RULES.append((priority, name, fn))
         _RULES.sort(key=lambda item: item[0])
         return fn
@@ -96,25 +104,34 @@ def registered() -> Dict[str, List[str]]:
 
 
 def reset() -> None:
-    """Used by the tests so plugin state does not leak between cases."""
+    """Used by the tests so plugin state does not leak between cases.
+
+    Also forgets which files have run, so the next load() executes them again."""
     _SIGNALS.clear()
     _RULES.clear()
+    _LOADED.clear()
 
 
 def load(directory: str) -> List[str]:
-    """Import every .py file in a directory so its decorators run."""
+    """Import every .py file in a directory so its decorators run.
+
+    Each file executes once per process.  pipeline.run() calls this on every
+    invocation, and a second execution would register every signal and rule
+    again and re-add whatever the plugin put on the shared calendar."""
     loaded: List[str] = []
     if not os.path.isdir(directory):
         return loaded
     for fname in sorted(os.listdir(directory)):
         if not fname.endswith(".py") or fname.startswith("_"):
             continue
-        path = os.path.join(directory, fname)
-        mod_name = "pace_plugin_" + fname[:-3]
-        spec = importlib.util.spec_from_file_location(mod_name, path)
-        if spec is None or spec.loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        path = os.path.realpath(os.path.join(directory, fname))
+        if path not in _LOADED:
+            mod_name = "pace_plugin_" + fname[:-3]
+            spec = importlib.util.spec_from_file_location(mod_name, path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _LOADED[path] = module
         loaded.append(fname[:-3])
     return loaded
