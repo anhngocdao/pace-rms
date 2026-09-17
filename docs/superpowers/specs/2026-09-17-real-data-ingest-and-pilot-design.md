@@ -1,8 +1,10 @@
 # Real data in, honest report out: booking-log ingest and the public-data pilot
 
-Status: Draft for review, 2026-09-17. Plan phases 5a and 5b of
-`Pace-RMS-Hardening-Plan.md`. Reviewed line by line with a revenue manager;
-every rule below that reads like hotel practice came from that review.
+Status: Draft for review, revised 2026-09-17. Plan phases 5a and 5b of
+`Pace-RMS-Hardening-Plan.md`. Reviewed with Claude in a revenue-manager
+role, in two rounds; not yet checked by a practising revenue manager. Where
+a rule rests on a recollection about the data rather than a checked fact it
+is listed in section 8 for the audit to confirm.
 
 ## 1. Goal and non-goals
 
@@ -13,20 +15,20 @@ dataset, because no hotel has yet shared data.
 What the pilot can honestly measure on real history: forecast accuracy
 against the methods a revenue manager uses without an engine, how the
 engine's recommended rate compares with what was actually charged, and how
-well unconstraining recovers demand that was hidden by a capacity cap we
-impose ourselves. What it cannot measure: a RevPAR lift. History only records
-what sold at the rate that was charged. No counterfactual policy can be
-replayed on it, and the report says so in its first lines.
+well unconstraining recovers demand hidden by a capacity cap we impose
+ourselves. What it cannot measure: a RevPAR lift. History only records what
+sold at the rate that was charged; no counterfactual policy can be replayed
+on it, and the report says so in its first lines.
 
 Non-goals: changing the engine, adding a fifth demand segment to the engine,
-calibrating the simulator to real data (that is a different project and a
-different kind of claim, see ADR 0006), and any machine learning.
+calibrating the simulator to real data (a different project and a different
+kind of claim, see ADR 0006), and any machine learning.
 
 ## 2. Shape of the work
 
 Three units, each testable alone:
 
-1. `pace/ingest.py`: reads Pace's own booking-log CSV plus a `hotel.json`,
+1. `pace/ingest.py`: reads Pace's booking-log CSV plus a `hotel.json`,
    validates, and replays the log into the existing `Ledger`. The engine is
    untouched and reads the ledger exactly as it does today.
 2. `tools/convert_antonio.py`: turns the public dataset (Antonio, de Almeida
@@ -44,8 +46,7 @@ hand a hotel when asking for data.
 The schema stays "version 0" until one or two real PMS exports have been
 seen. Column names of Opera, ezCloud and Smile exports are not verified.
 
-One row per booking (one room; multi-room bookings are expanded to one row
-per room by the converter). Required columns:
+One row per room. Multi-room rows are expanded by the ingest. Required:
 
 | column | type | rule |
 |---|---|---|
@@ -56,20 +57,20 @@ per room by the converter). Required columns:
 | segment | string | hotel's own code, mapped via hotel.json |
 | status | booked / in_house / stayed / cancelled / no_show | in_house counts as stayed |
 
-Optional columns:
+Optional:
 
 | column | rule |
 |---|---|
 | departure | YYYY-MM-DD; nights = departure minus arrival when nights is absent |
 | rate | per room night, in the file's currency; exactly one of rate / total_revenue required |
-| total_revenue | room revenue for the whole stay; rate = total_revenue / nights (nights > 0) |
-| currency | ISO code; defaults to hotel.json currency; a file may mix currencies only if this column is present |
+| total_revenue | room revenue for the whole stay; rate = total_revenue / nights when nights > 0 |
+| currency | ISO code; defaults to hotel.json currency. More than one currency in a file is an error unless hotel.json carries an `fx` table to the hotel currency |
 | status_date | cancel date for cancelled; check-out date for stayed; ignored for no_show (equals arrival) |
-| rate_code | BAR, PROMO, CORP-xxx and so on; second key for mapping |
-| source | channel or agent name; third key for mapping |
+| rate_code | BAR, PROMO, CORP-xxx and so on; a mapping key |
+| source | channel or agent name; a mapping key |
 | room_type | kept and counted, not used by the engine yet |
 | company | company, travel agent or block code; used to recognise groups |
-| rooms | integer >= 1, default 1; rows with rooms > 1 are expanded |
+| rooms | integer >= 1, default 1; rows with rooms > 1 are expanded into one row per room |
 
 `hotel.json`:
 
@@ -77,30 +78,63 @@ Optional columns:
 {
   "name": "H1 Resort",
   "currency": "EUR",
+  "fx": {"USD": 0.92},
   "sellable_rooms": null,
   "rates_include_tax": "unknown",
   "group_threshold_rooms": 10,
   "rate_floor": 40, "rate_ceiling": 600,
+  "segment_map_order": ["segment", "rate_code", "source"],
   "segment_map": {
     "segment":   {"Direct": "RETAIL", "Online TA": "OTA"},
-    "rate_code": {"BAR": "RETAIL", "CORP-": "CORP"},
+    "rate_code": {"BAR": "RETAIL", "CORP-*": "CORP"},
     "source":    {"Booking.com": "OTA", "Walk-in": "RETAIL"}
   }
 }
 ```
 
-Mapping order per row: `segment`, then `rate_code`, then `source`. A prefix
-match is allowed for rate codes (`CORP-`). Targets are RETAIL, OTA, CORP,
-GROUP, and NONREV. NONREV rows (complimentary, house use, staff) occupy a
-room in `rooms_on` but carry no revenue and never enter a segment forecast.
-A test asserts that a NONREV booking changes `rooms_on` and leaves
-`seg_rooms`, `seg_revenue` and the segment mix for the four real segments
-unchanged.
+Mapping rules:
+
+- Keys are tried in `segment_map_order`. A row falls through to the next
+  key only when the value is empty or absent from that key's table. A
+  `segment` column full of a default such as "DEFAULT" therefore does not
+  win: "DEFAULT" is not in the table, so `rate_code` is consulted.
+- A trailing `*` marks a prefix match (`CORP-*`). Without it the match is
+  exact.
+- A row that matches no key is an error, collected with the others. There
+  is no default segment.
+- Targets are RETAIL, OTA, CORP, GROUP, and NONREV.
+
+Group recognition runs before the mapping table: rows with the same
+`company`, `arrival` and `nights` whose count reaches
+`group_threshold_rooms` become GROUP. `company` alone never makes a group;
+a corporate account with hundreds of single bookings a year stays CORP.
+Empty `company` never matches.
 
 Segment meaning, by price behaviour rather than channel name: RETAIL floats
 with BAR and books directly; OTA floats with BAR through a commissioned
 channel; CORP pays a negotiated rate that does not move with BAR; GROUP is
-many rooms in one decision, accepted or refused as a block.
+many rooms in one decision, accepted or refused as a block; NONREV is a room
+occupied without revenue (complimentary, house use, staff).
+
+### NONREV and the ledger
+
+`Ledger.rooms_on` reads its own `occ` counter, but `forecast.py` iterates
+every key of `segment_mix` and `adr_on` divides all revenue by all occupied
+rooms, so a NONREV segment inside the ledger would either raise on an
+unknown segment or dilute ADR. NONREV rows are therefore not booked into the
+ledger. The ingest keeps a separate per-night NONREV count and returns it
+beside the ledger. Consequences, all stated in the report:
+
+- Actuals used for scoring exclude NONREV rooms.
+- Capacity used to clamp forecasts is sellable rooms minus NONREV rooms held
+  that night. Baselines use the same definition.
+- NONREV rooms are never cut in the holdout.
+- The engine itself sees those rooms as available, so it slightly
+  overstates remaining capacity on nights with NONREV rooms. For the public
+  dataset Complementary is a small share (the audit prints it). A capacity
+  block that removes rooms from sale while keeping or dropping revenue,
+  which would also serve a standing airline-crew contract, is recorded as
+  an ADR with status Proposed and is not built here.
 
 ### Validation rules
 
@@ -109,44 +143,51 @@ many rooms in one decision, accepted or refused as a block.
 - Warnings never stop the run and are counted in the report: rate outside
   floor or ceiling (comp rooms, staff rates, long stays), rate <= 0,
   cancelled without status_date, status_date clamped, occupancy above
-  sellable rooms on any night.
-- `cancelled` with no `status_date`: kept for the cancellation rate, excluded
-  from snapshots, and the share of such rows is printed. Assuming cancel on
-  booking day understates every snapshot; assuming cancel on arrival
-  overstates them; neither is honest.
+  sellable rooms on any night (duplicate rows or overbooking).
 - `status_date` after `arrival` for a cancellation is clamped to `arrival`
   (late cancellation). `status_date` before `booked_on` is clamped to
   `booked_on`. Both counts are reported.
 - `stayed` needs no `status_date`; `nights` is nights actually stayed.
+
+### Cancelled rows without a cancel date
+
+Dropping such a row from snapshots gives the same numbers as assuming it
+cancelled on its booking day, so "exclude" is not a neutral choice. Rule:
+impute the cancel date by drawing from the distribution of days between
+booking and cancellation among rows of the same mapped segment that do have
+a date (seeded, so the run is reproducible). The report prints the share of
+imputed rows and two bounds for every affected snapshot statistic: all such
+rows cancelled on booking day (low) and all cancelled on arrival (high). If a
+segment has no dated cancellations to learn from, the low bound is used and
+the report says so. The public dataset is unaffected: every cancellation
+carries a date.
 
 ### Sellable rooms
 
 `sellable_rooms` is asked for first and is the normal path. It means rooms
 that can be sold, not physical rooms. When it is null the ingest infers it as
 the maximum concurrent occupancy counting `stayed` and `in_house` rows only
-(never `no_show`), and then checks how many nights sit within 2 percent of
-that maximum. Fourteen nights at 178 to 180 make 180 believable; a second
-highest night at 150 makes 180 a one-off and the warning is loud. The
-inferred number is biased low by construction, so the report's first line
-says the count is inferred and how many nights touch the ceiling.
+(never `no_show`, never day use), then checks how many nights sit within 2
+percent of that maximum. Fourteen nights at 178 to 180 make 180 believable;
+a second highest night at 150 makes 180 a one-off and the warning is loud.
+The inferred number is biased low by construction, so the report's first
+line says the count is inferred and how many nights touch the ceiling.
 
 ### Replay into the ledger
 
 `replay(records, hotel, first_stay, last_stay)` walks one calendar day at a
-time from the earliest `booked_on`: books every row entered that day, cancels
-every row whose clamped cancel date is that day, calls `Ledger.snapshot`,
-and settles nights that have passed. Groups recognised via `company` or the
-Transient-party clustering (section 4) are booked as GROUP rows. Observable
-denials are zero, as EXTENDING.md already promises for systems that do not
-log them.
+time from the earliest `booked_on`: books every row entered that day,
+cancels every row whose (clamped or imputed) cancel date is that day, calls
+`Ledger.snapshot`, and settles nights that have passed. Observable denials
+are zero, as EXTENDING.md already promises for systems that do not log them.
 
-Known limit, stated in the report: an export holds the final state of each
+Known limits, stated in the report: an export holds the final state of each
 booking, so a guest who moved dates is replayed onto the new dates from the
-original booking day. Pickup therefore reflects final state, not the state
-on the day of booking. Group `booked_on` is often the rooming-list entry date
-rather than the contract date, and unpicked blocks are absent, so GROUP
-snapshots at long leads are low and nothing about group pickup should be
-concluded from this source.
+original booking day; pickup reflects final state, not the state on the day
+of booking. Group `booked_on` is often the rooming-list entry date rather
+than the contract date, and unpicked blocks are absent, so GROUP snapshots at
+long leads are low and nothing about group pickup should be concluded from
+this source.
 
 ## 4. Converter for the public dataset
 
@@ -157,8 +198,10 @@ Algarve, 79,330 H2 city in Lisbon). Output: `data/antonio/h1-bookings.csv`,
 Row mapping:
 
 - `booking_id` = hotel code plus row number (`H1-000123`). Duplicated rows
-  are kept on purpose: the data is anonymised and most duplicates are rooms
-  of one group. The converter says so in its header comment and in the audit.
+  are kept: the data is anonymised, so identical rows cannot be told apart
+  from distinct rooms, and dropping them would lower the busiest night, the
+  very number the room count is inferred from. The converter says so in its
+  header comment and in the audit.
 - `booked_on` = arrival minus `lead_time`. `nights` = weekend nights plus
   week nights, zero kept as day use. `rooms` = 1.
 - Status from `reservation_status`, never from `is_canceled` (no-shows also
@@ -166,76 +209,94 @@ Row mapping:
   to cancelled with `status_date` = `reservation_status_date`.
 - `rate` = `adr`, currency EUR. `room_type` = `reserved_room_type`,
   `source` = `distribution_channel`, `company` = company else agent.
-- `first_stay` is pulled forward from 1 July 2015 by the 99th percentile of
-  `nights`, because guests who arrived before the window and were still in
-  house are missing. `last_stay` never exceeds 31 August 2017.
+- The `segment` column keeps the origin, written as
+  `market_segment|customer_type` (for example `Offline TA/TO|Contract`), and
+  the mapping table in `hotel.json` carries those composite keys. The pilot's
+  "close cheap first" rule needs the origin, not only the target.
+- `first_stay` = 1 July 2015 plus the 99th percentile of `nights`, that is,
+  later than the first arrival, because guests who arrived before the window
+  and were still in house are missing. `last_stay` never exceeds 31 August
+  2017.
 
-Segment mapping, by `market_segment` and `customer_type`:
+Segment rules, applied in this order:
+
+1. `market_segment` Complementary: NONREV.
+2. Group clustering: Transient-party rows are clustered on hotel,
+   `market_segment`, `arrival`, `nights`, `lead_time`, `agent` and `company`;
+   an empty `agent` or `company` never matches another empty one. A cluster
+   at or above `group_threshold_rooms` becomes GROUP. `market_segment`
+   Groups and Offline TA/TO with customer_type Group are GROUP directly.
+3. `adr` = 0 with `nights` > 0 and mapped target not GROUP: NONREV. Group
+   members billed on a master folio keep their segment.
+4. The rest of the table:
 
 | in the data | Pace |
 |---|---|
 | Direct | RETAIL |
 | Online TA | OTA |
 | Corporate | CORP |
-| Aviation | CORP (a few hundred rows, under one room a night, not a block) |
-| Groups | GROUP |
-| Offline TA/TO, customer_type Group | GROUP |
+| Aviation | CORP, provided the audit confirms it is not a standing block |
 | Offline TA/TO, customer_type Contract | CORP |
-| Offline TA/TO, customer_type Transient | CORP by default; see the BAR test below |
-| Complementary | NONREV |
-| adr = 0, nights > 0, market_segment not Groups | NONREV (group members on a master folio keep their segment) |
-| Undefined | by distribution_channel: Direct to RETAIL, Corporate or GDS to CORP, TA/TO to OTA; channel also Undefined then RETAIL with a warning |
+| Offline TA/TO, customer_type Transient | CORP by default; the BAR test below may move it to OTA |
+| Undefined | the majority target of the same `distribution_channel` in the same hotel, read from the audit's market_segment by channel cross-table; if the channel is also Undefined, RETAIL with a warning |
 
-Transient-party rows are clustered on hotel, arrival, nights, lead_time,
-agent and company. A cluster at or above `group_threshold_rooms` becomes
-GROUP; below it each row is treated as Transient of its own market segment.
+Rule carried to real hotels: if Undefined exceeds 1 percent of room nights,
+the converter stops and asks rather than assigning a default.
 
-BAR test for Offline TA/TO Transient, run per hotel: take mean `adr` by
-arrival week and room type for that cell and for Direct plus Online TA. High
-correlation across weeks means the cell floats with BAR and maps to OTA; a
-flat seasonal profile means contracted and maps to CORP. The threshold and
-the correlation are printed; when inconclusive the default is CORP.
+BAR test for Offline TA/TO Transient, per hotel: weekly mean `adr` by room
+type for that cell and for Direct plus Online TA, each with its monthly mean
+removed, so that a stepped seasonal contract does not correlate with BAR
+merely because both follow the season. BAR moves within a month; a contract
+rate does not. Correlation of the residuals above 0.6 (fixed before the run)
+maps the cell to OTA; otherwise CORP. The correlation, the threshold and the
+number of weeks with enough rows are printed.
 
 Audit printed before writing anything, and copied into the pilot report:
 
-- rows per mapping branch, including how many adr = 0 rows went where;
-- Aviation: number of nights with at least one Aviation room, to confirm it
-  is not a standing block;
+- rows per rule and branch above, including how many `adr` = 0 rows went
+  where and how many rows each Transient-party cluster rule caught;
+- the market_segment by distribution_channel cross-table per hotel;
+- Aviation: rows, and the number of nights with at least one Aviation room;
+- duplicate rows: count, and how many share `agent` or `company` with
+  another row on the same arrival, as a check on the group explanation;
 - meal check: `adr` of HB against BB for the same room type and arrival
   week; a steady, large gap means `adr` includes meals;
-- cancellation rate with and without `deposit_type` = Non Refund, because
-  that cohort cancels almost entirely and looks like agent allotments being
-  released rather than guest behaviour;
-- clamped cancel dates, negative or extreme `adr`, both counted;
+- cancellation rate with and without `deposit_type` = Non Refund;
+- clamped cancel dates, `adr` <= 0 and extreme `adr`, all counted;
 - `lead_time` distribution per hotel, to justify the lead marks in section 5.
 
 `sellable_rooms` is null for both hotels. `rates_include_tax` is "unknown".
+The dataset has no rate codes, so any rule that mentions promotional rate
+codes does not apply to it and the report says so.
 
 ## 5. The pilot command and report
 
 `run.py pilot <bookings.csv> <hotel.json> [--out out/]`. Ingest, then a
-forward walk: the engine's first forecast day comes after six settled months
-of history; from then on every forecast for a night uses only snapshots up to
-that day. Six months of warm-up beginning in early 2016 means the first
-summer's pickup is learned from winter months, and the report says so.
+forward walk. Warm-up is the first six settled months, roughly July to
+December 2015; forecasting starts about January 2016, and from then on every
+forecast for a night uses only snapshots up to that day. Baselines built on
+a trailing window learn the first summer's pickup from winter weeks; the
+report says so where it applies.
 
 Every table compares only nights on which every method produced a forecast,
 and prints that count.
 
 ### Table 1, forecast accuracy
 
-Lead marks 120 (H1 only, if the data supports it), 90, 60, 30, 14 and 7.
-Lead 1 is a separate line labelled as measuring late cancellations and
-no-shows, an overbooking question, not a demand question.
+Lead marks 120 (H1 only, if the audit's lead-time distribution supports
+it), 90, 60, 30, 14 and 7. Lead 1 is a separate line labelled as measuring
+late cancellations and no-shows, an overbooking question, not a demand
+question.
 
 For each mark and method: rooms forecast for the night versus rooms actually
-stayed. Forecasts are clamped to sellable rooms before scoring, because on a
-full night an unconstrained forecast above capacity is not wrong. Reported:
-mean absolute error in rooms and as a share of capacity, and signed error
-(bias), since a forecast that is always high keeps rates too high and one
-that is always low sells full nights cheap.
+stayed, NONREV excluded. Forecasts are clamped to capacity (sellable rooms
+minus NONREV held) before scoring, because on a full night an unconstrained
+forecast above capacity is not wrong. Reported per method: mean absolute
+error in rooms and as a share of capacity, signed error (bias), and the
+share of forecasts that hit the clamp, so a method that explodes upward and
+is rescued by the clamp is visible.
 
-Cuts: three seasons per hotel from the tercile of monthly occupancy (high,
+Cuts: three seasons per hotel from terciles of monthly occupancy (high,
 shoulder, low), with Easter, Christmas and New Year flagged separately; and
 full nights, labelled as full against the inferred room count.
 
@@ -243,17 +304,28 @@ Methods:
 
 - Engine (`Forecaster` as it runs today).
 - Additive pickup, the primary baseline: rooms on the books now plus the
-  mean rooms still to come from this lead, taken over the last 8 to 12 weeks
-  of the same weekday.
+  mean rooms still to come from this lead, over the trailing 10 weeks of the
+  same weekday (fixed before the run, not tuned afterwards).
 - Multiplicative pickup: rooms on the books divided by the mean share sold
-  at this lead, same window. Reported because it is common, and expected to
-  blow up at long leads when few rooms are on the books.
-- Same time last year, pace-adjusted: last year's final rooms, aligned by
-  weekday (364 days back), times rooms on the books today over rooms on the
-  books at the same lead last year. Available only from July 2016.
-- Average of additive pickup and pace-adjusted last year. This is the
-  engine's real opponent: the forecast a good revenue manager builds in
-  Excel. If the engine does not beat it, that is the pilot's headline.
+  at this lead, same window. Expected to explode at long leads; kept because
+  it is common.
+- Same time last year, additive: last year's final rooms aligned by weekday
+  (364 days back), plus (rooms on the books today minus rooms on the books at
+  the same lead last year). The ratio form was rejected because its
+  denominator is tiny at long leads. Available only from July 2016.
+- Average of additive pickup and additive last year: the forecast a good
+  revenue manager builds in Excel, and the engine's real opponent.
+
+Headline rules:
+
+- The headline is engine against the average, and it rests on about 14
+  months (July 2016 to August 2017), one high season per hotel. The report
+  says so next to the number.
+- A secondary comparison, engine against additive pickup over the whole
+  forecast period, is printed so the first half of the data is not lost.
+- At any lead mark where a single baseline beats the average, that baseline
+  is printed beside it. The headline never compares against the average
+  alone.
 
 ### Table 2, recommended rate against realised rate
 
@@ -269,28 +341,33 @@ TA `adr` is a net rate the OTA gap is biased by a constant.
 
 ### Table 3, unconstraining checked by holdout
 
-Clean nights: occupancy below the threshold, and no night at or above the
-threshold within a window around it (window = 90th percentile of `nights`),
-because a stay spanning a full night is refused for all its nights. Run at
-thresholds 80, 85 and 90 percent and report all three; if the answer moves a
-lot between them the threshold is deciding the result.
+Clean nights: occupancy below the clean threshold, and no night at or above
+it within a window around it (window = 90th percentile of `nights`), because
+a stay spanning a full night is refused for all its nights.
 
-Simulated cap, applied to the whole history the unconstrainer learns from,
-not only to scored nights, so it cannot peek at uncut neighbours. Two
-cutting rules:
+Combinations run and reported, each with its count of cut nights: clean
+threshold 80, 85 and 90 percent, crossed with simulated cap 60, 70 and 80
+percent of capacity, keeping only pairs where the cap is below the
+threshold. If the answer moves a lot between combinations, the settings are
+deciding the result.
+
+The cap is applied to the whole history the unconstrainer learns from, not
+only to scored nights, so it cannot peek at uncut neighbours. Two cutting
+rules:
 
 - Sell until full: a booking is refused if any night it covers has reached
   the cap, and loses all its nights. Cancellations return rooms on their
   cancel date and later bookings may fill them. Groups are refused whole.
-- Close cheap first: OTA and promotional rate codes close at 90 percent of
-  the cap, CORP and RETAIL stay open until the cap. This is how a revenue
-  manager actually sells the last rooms; an unconstrainer that is right only
-  under the first rule will be wrong by segment on real data.
+- Close cheap first: at 90 percent of the cap, close OTA and every CORP row
+  whose origin is Offline TA/TO (tour-operator contract rates are the lowest
+  net rates and the first to be stop-sold); Corporate, Aviation and RETAIL
+  stay open to the cap. Promotional rate codes would close with OTA where a
+  dataset has them; this one does not.
 
 Scored only on nights that were actually cut, grouped by how much was cut
-(under 5 percent, 5 to 15, over 15). Reported: estimated versus known demand,
-overall and by segment. Stated limit: refused guests are assumed to vanish,
-while some would move to another night of the same hotel.
+(under 5 percent, 5 to 15, over 15). Reported: estimated versus known
+demand, overall and by segment. Stated limit: refused guests are assumed to
+vanish, while some would move to another night of the same hotel.
 
 ### Report
 
@@ -298,10 +375,9 @@ while some would move to another night of the same hotel.
 with the count of nights touching the ceiling; rates are of unknown tax and
 meal treatment, with the meal-check result; there is no booking change
 history, so pickup reflects final state. Then the audit, then tables 1 to 3
-for H1 and H2 side by side. `out/pilot-<hotel>.json` holds the same numbers
-for the dashboard or a later notebook. No number in the report is rounded in
-the engine's favour; wins and losses against each baseline are printed as
-they fall.
+for H1 and H2 side by side. `out/pilot-<hotel>.json` holds the same numbers.
+No number is rounded in the engine's favour; wins and losses against each
+baseline are printed as they fall.
 
 If the engine shows a weakness on real data, it is recorded as an ADR with
 status Proposed. Nothing in the engine changes inside this project.
@@ -309,18 +385,24 @@ status Proposed. Nothing in the engine changes inside this project.
 ## 6. Testing
 
 - `tests/test_ingest.py`: a hand-built 30-row log covering every status,
-  day use, a multi-room row, a cancelled row without date, a clamped cancel
-  date, a NONREV row, mixed currency with and without the column, and 60
-  deliberate errors to prove collection stops at 50. Asserts nightly
-  `rooms_on`, snapshots at leads 0, 7 and 30, `seg_revenue` per segment,
-  sellable-room inference and its ceiling check, and the NONREV invariant.
+  day use, a multi-room row, a cancelled row without date (imputation and
+  both bounds), a clamped cancel date, a NONREV row, a "DEFAULT" segment
+  that falls through to rate_code, a prefix rate code, a company with many
+  single bookings that must not become a group, mixed currency with and
+  without an fx table, and 60 deliberate errors to prove collection stops at
+  50. Asserts nightly `rooms_on`, snapshots at leads 0, 7 and 30,
+  `seg_revenue` per segment, the separate NONREV count, and sellable-room
+  inference with its ceiling check.
 - `tests/test_convert_antonio.py`: a 40-row fixture in the public dataset's
-  layout exercising every mapping branch, the Transient-party clustering,
-  status from `reservation_status`, and window trimming. The real file is not
-  in the repository.
+  layout exercising every rule in order, the Transient-party clustering with
+  empty agent and company, the adr = 0 rule on a GROUP member, Undefined by
+  channel majority, status from `reservation_status`, window trimming, and
+  the residual-correlation BAR test on a constructed stepped contract that
+  must map to CORP. The real file is not in the repository.
 - `tests/test_pilot.py`: baselines and scoring on a tiny synthetic ledger
-  with known answers; the clamp at capacity; the holdout cut under both rules
-  including a cancellation that frees a room.
+  with known answers; the clamp and the clamp-rate statistic; the holdout
+  cut under both rules including a cancellation that frees a room and a
+  group refused whole.
 - Golden numbers are untouched; `run.py test` must stay green and the quick
   build must still print 64.50 / 78.80 / 82.98.
 
@@ -333,17 +415,24 @@ status Proposed. Nothing in the engine changes inside this project.
    Elle's explicit go-ahead, and the file stays out of git.
 4. Baselines and scoring, then the holdout, then the report writer.
 5. Run on H1 and H2, read the audit, write the report, and open ADRs for
-   whatever the engine got wrong.
+   whatever the engine got wrong, plus the capacity-block ADR.
 6. README and EXTENDING: point the PMS section at the schema and the
    converter; CLAUDE.md gains the `pilot` command.
 
-## 8. Open items
+## 8. Recollections to verify in the audit, and open items
+
+Recollections, not facts until the audit prints them:
+
+- Most duplicated rows are rooms of one group.
+- Aviation is a few hundred rows, under one room a night on average.
+- Bookings with `deposit_type` Non Refund cancel almost entirely.
+- Mean `lead_time` is near three months; at least one `adr` is negative and
+  one is in the thousands.
+- Whether `adr` includes tax or meals.
+
+Open items:
 
 - Real PMS column names (Opera, ezCloud, Smile) are unverified; the schema
   is locked only after one or two real exports.
-- Whether `adr` in the public dataset includes tax and meals: answered by
-  the audit, not assumed.
-- Mean `lead_time` near three months and a negative `adr` are recollections
-  to verify when the data is on disk.
-- A standing airline-crew block (rooms removed from capacity but paid) has
-  no home in the engine. Not needed for this dataset; noted for a real hotel.
+- A standing airline-crew block, and NONREV rooms generally, need a capacity
+  block the engine does not have. ADR Proposed, not built here.
