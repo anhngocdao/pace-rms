@@ -8,12 +8,14 @@ different clocks.
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 MONTH_FACTOR = {
     1: 0.72, 2: 0.78, 3: 0.88, 4: 0.96, 5: 1.08, 6: 1.18,
     7: 1.22, 8: 1.20, 9: 1.14, 10: 1.02, 11: 0.90, 12: 0.82,
 }
+
+BANDS = ("peak", "shoulder", "trough")
 
 DOW_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -26,17 +28,64 @@ def span(first: dt.date, last: dt.date) -> List[dt.date]:
     return daterange(first, (last - first).days + 1)
 
 
-def month_factor(d: dt.date) -> float:
-    return MONTH_FACTOR[d.month]
-
-
-def season_band(d: dt.date) -> str:
-    f = month_factor(d)
+def _band_from_factor(f: float) -> str:
     if f >= 1.12:
         return "peak"
     if f >= 0.95:
         return "shoulder"
     return "trough"
+
+
+@dataclass(frozen=True)
+class Seasonality:
+    """What the engine knows about a hotel's year.
+
+    price_month_factor scales the reference rate; demand_season_band picks the
+    estimation cell.  They are two fields because on a resort price swings far
+    more than occupancy (ADR 0007).
+    """
+    price_month_factor: Dict[int, float]
+    demand_season_band: Dict[int, str]
+
+    def validate(self) -> "Seasonality":
+        months = set(range(1, 13))
+        if set(self.price_month_factor) != months or set(self.demand_season_band) != months:
+            raise ValueError("seasonality needs all twelve months")
+        bad = [b for b in self.demand_season_band.values() if b not in BANDS]
+        if bad:
+            raise ValueError("unknown season band %r; use %s" % (bad[0], "/".join(BANDS)))
+        if any(f <= 0 for f in self.price_month_factor.values()):
+            raise ValueError("price month factors must be positive")
+        return self
+
+
+def toronto_seasonality() -> Seasonality:
+    return Seasonality(dict(MONTH_FACTOR), {m: _band_from_factor(f) for m, f in MONTH_FACTOR.items()})
+
+
+_ACTIVE = toronto_seasonality()
+
+
+def set_seasonality(s: Seasonality) -> None:
+    global _ACTIVE
+    _ACTIVE = s.validate()
+
+
+def reset_seasonality() -> None:
+    global _ACTIVE
+    _ACTIVE = toronto_seasonality()
+
+
+def active_seasonality() -> Seasonality:
+    return _ACTIVE
+
+
+def month_factor(d: dt.date) -> float:
+    return _ACTIVE.price_month_factor[d.month]
+
+
+def season_band(d: dt.date) -> str:
+    return _ACTIVE.demand_season_band[d.month]
 
 
 def demand_class(d: dt.date):
