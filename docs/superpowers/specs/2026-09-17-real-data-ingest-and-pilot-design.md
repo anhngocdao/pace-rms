@@ -195,25 +195,47 @@ are counted; a function that inferred from the ledger would lose them.
 
 Two rules govern every field. First, a field a hotel knows about itself is
 entered by the hotel; a field it does not know is derived from history.
-Second, anything derived for the pilot is computed from the first twelve
-settled months only (about July 2015 to June 2016) and then frozen, so the
-engine never learns the shape of a season it is about to be scored on.
-Scoring starts in July 2016. A hotel in production does the same: it enters
-last year's seasonality, not next year's.
+Second, anything a hotel would learn from last year (seasonality, segment
+price ratios) is derived from the first twelve settled months only (July
+2015 to June 2016) and frozen, so the engine is never handed the season it
+is scored on. A physical fact the hotel simply knows (sellable rooms) is not
+a forecast and is inferred from the whole period, which only reduces its
+downward bias. Scoring starts in July 2016.
 
-| field | who knows it | pilot source (first 12 months, frozen) |
+The price basket. Every price field is computed from the same basket, so
+that the fields the engine multiplies together (`base_rate` times
+`price_month_factor` times `segment_rate_ratio`) do not carry three
+different filters whose errors compound. Basket rows: status stayed, not
+NONREV, adr > 0, adr inside the 1st to 99th percentile, most common
+`reserved_room_type`, the most common meal plan, two adults, no children,
+same filter as the BAR test. Statistic: median, never mean, because the file
+has negative and four-digit adr. Fields differ only in which segment
+branches they admit. The public BAR basket is branches DIRECT and ONLINE_TA.
+
+| field | who knows it | pilot source |
 |---|---|---|
-| sellable_rooms | hotel | inferred with the ceiling check (section above) |
+| sellable_rooms | hotel | inferred from the whole period with the ceiling check; the audit prints the yearly maximum, and if one year is clearly lower (rooms taken out of service) a single number is not used |
 | currency | hotel | EUR |
-| rate_floor, rate_ceiling | hotel | 2nd and 98th percentile of paid adr |
-| rate_step | hotel | 1 EUR |
-| base_rate | hotel (its BAR anchor) | median adr of branch DIRECT, most common room type, shoulder months |
-| variable_cost | hotel | not in the data: two values fixed before the run, low and high; if the recommended BAR in table 2 moves materially between them the table says the result depends on the cost assumption |
-| max_lead, max_los | hotel | 99th percentile of lead_time and of nights |
-| price_month_factor (12 numbers) | hotel, from last year's rates | mean paid adr of the month over the twelve-month mean |
-| demand_season_band (12 labels: peak, shoulder, trough) | hotel, from last year's demand | terciles of gross demand by stay month, gross = room nights stayed plus cancelled plus no_show, excluding deposit_type Non Refund; the occupancy-based version is printed beside it to show the gap |
-| segment_rate_ratio (CORP and GROUP relative to BAR) | hotel (contract rates, commission) | median adr of CORP-target rows over median adr of DIRECT rows in the same month, likewise GROUP; the Online TA net-rate caveat applies to any OTA ratio |
-| events | hotel | none: the Toronto event list is not used; Easter, Christmas and New Year are only report labels |
+| rate_floor, rate_ceiling | hotel (BAR limits) | 2nd and 98th percentile of the public BAR basket over the first twelve months, widened by a fixed margin set before the run (10 percent each way), because next year's rates usually exceed last year's; the report prints the share of scoring-period basket adr outside the range, since a high share means table 2 is truncated at that end |
+| rate_step | hotel | chosen so the ladder has about 90 steps, as Toronto's does (109 to 469 in steps of 4 gives 91): (ceiling minus floor) over 90, rounded to 1, 2 or 5 EUR; a 1 EUR step over a few hundred EUR would give hundreds of rungs with no observations each and weaken the engine by configuration |
+| base_rate | hotel (its BAR anchor) | by construction consistent with the month factors: median over months of (basket median of month m divided by factor m), so it is the price at factor 1 under the same convention as the table; if the DIRECT branch alone is too thin at H1 the basket already includes ONLINE_TA and the audit says so |
+| price_month_factor (12 numbers) | hotel, from last year's rates | monthly basket median over the twelve-month mean, then rescaled to mean 1.0, the convention of the Toronto table (whose mean is 0.99); computed on the public BAR basket only, so winter contract volume at a resort does not inflate the swing; Easter week and 24 December to 1 January are excluded from the monthly medians, so March 2016 does not carry Easter into March 2017; the audit prints the same-basket change between July and August 2016 and July and August 2015 as a report-only measure of price drift |
+| demand_season_band (12 labels) | hotel, from last year's demand | terciles of gross demand by stay month (room nights stayed plus cancelled plus no_show, excluding deposit_type Non Refund), labels peak, shoulder, trough as `demand_class` expects; Toronto has 4, 3 and 5 months in those bands while terciles force 4, 4, 4, and the audit prints both counts because the label decides how much data each estimation cell gets; the occupancy-based version is printed beside it; if the audit shows duplicates are mostly cancellations, a second version without duplicates is printed and a label change is recorded |
+| segment_rate_ratio (CORP, GROUP relative to BAR) | hotel (contract rates, commission) | per month, ratio of the CORP-branch basket median to the public BAR basket median, only for months with enough rows on both sides (threshold fixed before the run); then the median of those months, weighted by room nights across the two very different CORP origins (Corporate and Aviation at business rates, OFFLINE_TO_CONTRACT and OFFLINE_TO_TRANSIENT at tour-operator net rates); the audit prints each origin's ratio separately, the ratio by season band, and the ONLINE_TA over DIRECT ratio, which if steadily below one across months is the best evidence the dataset offers that Online TA adr is net |
+| segment_commission | hotel | the engine carries a commission per segment (`config.py`, RETAIL 0.02 and so on); `variable_cost` excludes commission so nothing is deducted twice; for the pilot OTA commission is fixed before the run, and set to zero if the audit indicates Online TA adr is already net |
+| variable_cost | hotel | not in the data: expressed as a share of `base_rate` so H1 and H2 share one assumption; two values fixed before the run, low and high; if the recommended BAR in table 2 moves materially between them the table says the result depends on the cost assumption |
+| max_lead, max_los | hotel | 99th percentile of lead_time and of nights over the first twelve months; rows beyond either bound are neither dropped nor trimmed in the ledger (long stays and early bookings cluster in H1's summer, exactly the nights that matter), and a test asserts it; `max_lead` must be at least 120 for H1 or the 120 mark in table 1 is not run |
+| sellout_threshold | engine parameter, exposed | `unconstrain.py`, `elasticity.py` and `experiment.py` default it to 0.97 as a function argument; it decides which nights count as censored, and with inferred rooms and NONREV outside the ledger that decision is fragile, so it becomes a `hotel.json` field with 0.97 on the simulation path and a mandatory value on the ingest path |
+| events | hotel | none for the main run: the Toronto list is not used, the engine gets no hand-entered events and neither do the baselines |
+
+How the engine uses the segment ratio, checked in code: `quoted_rate`
+returns `reference_rate` for contracted segments, and `reference_rate` is
+`base_rate` times `price_month_factor` times the ratio. So CORP and GROUP
+rates in the engine do follow the month factors, like a tour-operator
+contract with seasonal steps, and unlike a flat corporate rate. A fixed
+ratio is therefore too low in high season and too high in low season for
+flat contracts. This goes into the seasonality ADR, and the audit prints the
+ratio by season band so the size of the error is visible.
 
 Why price and demand seasonality are two fields. In `calendar.py` one
 table, `MONTH_FACTOR`, feeds both `reference_rate` (the denominator of every
@@ -221,26 +243,22 @@ price ratio, also the ladder prior in `policy.py`) and `season_band`, which
 `demand_class` uses as the estimation cell for pace curves, unconstraining
 and elasticity. In the simulation the two move together. On a resort they
 do not: summer ADR swings far more than summer occupancy, because a nearly
-full hotel raises rates rather than selling more rooms. Deriving one table
-from prices would exaggerate the demand cells; deriving it from occupancy
-would over-normalise summer prices and make August's BAR look expensive.
-Since `season_band` is consumed only through `demand_class`, the two can be
-separated with configuration alone: `price_month_factor` for
-`reference_rate` and the ladder prior, `demand_season_band` for
-`demand_class`. The demand bands are computed from gross demand rather than
-occupancy because a full August yields an occupancy factor below true
-demand, flattening exactly the months that matter.
+full hotel raises rates rather than selling more rooms. Since `season_band`
+is consumed only through `demand_class`, the two are separated with
+configuration alone: `price_month_factor` for `reference_rate` and the
+ladder prior, `demand_season_band` for `demand_class`. Demand bands come
+from gross demand rather than occupancy because a full August yields an
+occupancy factor below true demand, flattening exactly the months that
+matter.
 
-The engine also reads `SEGMENTS[code].rate_multiplier` (CORP 0.82, GROUP
-0.70, tuned for the simulated hotel). A real hotel knows its contract rates
-and commissions, so this becomes `segment_rate_ratio` in `hotel.json`. It is
-hotel configuration, not simulator calibration, so ADR 0006 is not in play.
 `prior_elasticity` stays as it is; the audit prints the realised gap and,
 more importantly, the elasticity the engine fits on this data per segment.
 Historical rates were set in response to demand, so the observed price and
 demand correlation may be positive; if a fitted elasticity has the wrong
 sign or sits near zero, that is written up as an ADR Proposed and table 2
-is declared unreadable for that hotel rather than printed.
+is declared unreadable for that hotel rather than printed. Other engine
+constants (`MIN_ACCEPTANCE`, `PRIOR_WEIGHT`, `MIN_ROWS`) are internals, not
+hotel facts; they stay fixed and are printed in the report header.
 
 Defaults are not silent. On the ingest path every field in the table is
 mandatory and a missing one is an error; a real `hotel.json` that forgets
@@ -255,8 +273,13 @@ the whole period) is a label, not an input, and may use all the data; the
 spec keeps the two apart by name: `demand_season_band` is what the engine
 reads, "report season" is how rows are cut.
 
-Known limit: one year of factors freezes Easter into March (27 March 2016),
-while in 2017 it falls on 16 April. Recorded, not corrected.
+Known limits: one year of factors still freezes some movable-holiday effect
+into fixed months even with Easter week excluded. And a revenue manager in
+production would enter known events (Lisbon's Santos Populares in June, Web
+Summit from November 2016), so with `events` empty the engine runs weaker
+than it would deployed; event nights are flagged in table 1, and Web Summit,
+which has no prior year to learn from, is the kind of event this pilot
+cannot be fair to the engine about.
 
 ### Validation rules
 
