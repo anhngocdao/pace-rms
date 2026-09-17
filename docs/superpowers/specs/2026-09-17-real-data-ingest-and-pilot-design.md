@@ -20,12 +20,13 @@ ourselves. What it cannot measure: a RevPAR lift. History only records what
 sold at the rate that was charged; no counterfactual policy can be replayed
 on it, and the report says so in its first lines.
 
-Non-goals: changing engine mechanisms, adding a fifth demand segment to the
-engine, calibrating the simulator to real data (a different project and a
-different kind of claim, see ADR 0006), and any machine learning. One
-configuration seam does have to open (section 3, "What the engine needs
-from hotel.json"): the seasonality table is hard-coded for the simulated
-Toronto hotel and cannot stay that way on an Algarve resort.
+Non-goals: changing any algorithm in the engine, adding a fifth demand
+segment, calibrating the simulator to real data (a different project and a
+different kind of claim, see ADR 0006), and any machine learning. The engine
+does change in one way: it reads seasonality, the event calendar and the
+segment price ratios from configuration instead of module constants
+(section 3, "What the engine needs from hotel.json"). Its behaviour on the
+simulation is unchanged, and the golden numbers prove it.
 
 ## 2. Shape of the work
 
@@ -192,32 +193,70 @@ are counted; a function that inferred from the ledger would lose them.
 
 ### What the engine needs from hotel.json
 
-The engine reads these `Hotel` fields: `rooms`, `base_rate`, `rate_floor`,
-`rate_ceiling`, `rate_step`, `variable_cost`, `max_lead`, `max_los`, and
-`rate_ladder`, which derives from them. `hotel.json` must supply them all.
-For the public dataset the converter derives what it can and states the
-rest: `base_rate` = median `adr` of Direct bookings in shoulder months for
-the most common room type; floor and ceiling from the 2nd and 98th
-percentile of paid `adr`; `rate_step` 1 EUR; `max_lead` from the 99th
-percentile of `lead_time`; `max_los` from the 99th percentile of `nights`;
-`variable_cost` is not in the data and is set to a stated assumption, which
-touches GOPPAR-style figures only and none of the three tables.
+Two rules govern every field. First, a field a hotel knows about itself is
+entered by the hotel; a field it does not know is derived from history.
+Second, anything derived for the pilot is computed from the first twelve
+settled months only (about July 2015 to June 2016) and then frozen, so the
+engine never learns the shape of a season it is about to be scored on.
+Scoring starts in July 2016. A hotel in production does the same: it enters
+last year's seasonality, not next year's.
 
-Seasonality is the seam that has to open. `calendar.py` holds a fixed
-`MONTH_FACTOR` table and fixed season bands for the simulated Toronto
-hotel; `policy.py` uses them for the ladder prior and the rate ceiling
-walk, `forecast.py` and `unconstrain.py` use `demand_class` (season band by
-weekday) as the estimation cell, and `reference_rate` uses the month factor
-as the denominator of every price ratio. Run unchanged on the Algarve, the
-engine would normalise prices against Toronto's seasons and pool nights
-into Toronto's demand classes. Required change, recorded first as an ADR
-with status Proposed and then built as step 0 of section 7: the month
-factors and season bands become per-hotel inputs carried in `hotel.json`,
-with the current table as the default so the golden numbers do not move.
-The converter derives them from the data: month factor = mean paid `adr` of
-the month over the annual mean; season bands from terciles of monthly
-physical occupancy, the same split table 1 uses. Nothing else in the engine
-changes; a mechanism the pilot shows to be wrong is written up, not fixed.
+| field | who knows it | pilot source (first 12 months, frozen) |
+|---|---|---|
+| sellable_rooms | hotel | inferred with the ceiling check (section above) |
+| currency | hotel | EUR |
+| rate_floor, rate_ceiling | hotel | 2nd and 98th percentile of paid adr |
+| rate_step | hotel | 1 EUR |
+| base_rate | hotel (its BAR anchor) | median adr of branch DIRECT, most common room type, shoulder months |
+| variable_cost | hotel | not in the data: two values fixed before the run, low and high; if the recommended BAR in table 2 moves materially between them the table says the result depends on the cost assumption |
+| max_lead, max_los | hotel | 99th percentile of lead_time and of nights |
+| price_month_factor (12 numbers) | hotel, from last year's rates | mean paid adr of the month over the twelve-month mean |
+| demand_season_band (12 labels: peak, shoulder, trough) | hotel, from last year's demand | terciles of gross demand by stay month, gross = room nights stayed plus cancelled plus no_show, excluding deposit_type Non Refund; the occupancy-based version is printed beside it to show the gap |
+| segment_rate_ratio (CORP and GROUP relative to BAR) | hotel (contract rates, commission) | median adr of CORP-target rows over median adr of DIRECT rows in the same month, likewise GROUP; the Online TA net-rate caveat applies to any OTA ratio |
+| events | hotel | none: the Toronto event list is not used; Easter, Christmas and New Year are only report labels |
+
+Why price and demand seasonality are two fields. In `calendar.py` one
+table, `MONTH_FACTOR`, feeds both `reference_rate` (the denominator of every
+price ratio, also the ladder prior in `policy.py`) and `season_band`, which
+`demand_class` uses as the estimation cell for pace curves, unconstraining
+and elasticity. In the simulation the two move together. On a resort they
+do not: summer ADR swings far more than summer occupancy, because a nearly
+full hotel raises rates rather than selling more rooms. Deriving one table
+from prices would exaggerate the demand cells; deriving it from occupancy
+would over-normalise summer prices and make August's BAR look expensive.
+Since `season_band` is consumed only through `demand_class`, the two can be
+separated with configuration alone: `price_month_factor` for
+`reference_rate` and the ladder prior, `demand_season_band` for
+`demand_class`. The demand bands are computed from gross demand rather than
+occupancy because a full August yields an occupancy factor below true
+demand, flattening exactly the months that matter.
+
+The engine also reads `SEGMENTS[code].rate_multiplier` (CORP 0.82, GROUP
+0.70, tuned for the simulated hotel). A real hotel knows its contract rates
+and commissions, so this becomes `segment_rate_ratio` in `hotel.json`. It is
+hotel configuration, not simulator calibration, so ADR 0006 is not in play.
+`prior_elasticity` stays as it is; the audit prints the realised gap and,
+more importantly, the elasticity the engine fits on this data per segment.
+Historical rates were set in response to demand, so the observed price and
+demand correlation may be positive; if a fitted elasticity has the wrong
+sign or sits near zero, that is written up as an ADR Proposed and table 2
+is declared unreadable for that hotel rather than printed.
+
+Defaults are not silent. On the ingest path every field in the table is
+mandatory and a missing one is an error; a real `hotel.json` that forgets
+seasonality must not run on Toronto's seasons unnoticed. On the simulation
+path the current constants stay. A test feeds a `hotel.json` that spells out
+the Toronto table explicitly and must reproduce 64.50 / 78.80 / 82.98,
+proving the configuration path, not only the default path. This is step 0
+of section 7, preceded by an ADR with status Proposed.
+
+The report's season split for table 1 (terciles of physical occupancy over
+the whole period) is a label, not an input, and may use all the data; the
+spec keeps the two apart by name: `demand_season_band` is what the engine
+reads, "report season" is how rows are cut.
+
+Known limit: one year of factors freezes Easter into March (27 March 2016),
+while in 2017 it falls on 16 April. Recorded, not corrected.
 
 ### Validation rules
 
@@ -371,7 +410,12 @@ Audit printed before writing anything, and copied into the pilot report:
   week; a steady, large gap means `adr` includes meals;
 - cancellation rate with and without `deposit_type` = Non Refund;
 - clamped cancel dates, `adr` <= 0 and extreme `adr`, all counted;
-- `lead_time` distribution per hotel, to justify the lead marks in section 5.
+- `lead_time` distribution per hotel, to justify the lead marks in section 5;
+- the derived `hotel.json` fields with the twelve-month window they came
+  from, the demand season bands from gross demand beside the ones from
+  occupancy, and the segment rate ratios beside the simulated 0.82 and 0.70;
+- the elasticity the engine fits per segment on the warm-up year, with its
+  sign.
 
 `sellable_rooms` is null for both hotels. `rates_include_tax` is "unknown".
 The dataset has no rate codes, so any rule that mentions promotional rate
@@ -380,11 +424,12 @@ codes does not apply to it and the report says so.
 ## 5. The pilot command and report
 
 `run.py pilot <bookings.csv> <hotel.json> [--out out/]`. Ingest, then a
-forward walk. Warm-up is the first six settled months, roughly July to
-December 2015; forecasting starts about January 2016, and from then on every
-forecast for a night uses only snapshots up to that day. Baselines built on
-a trailing window learn the first summer's pickup from winter weeks; the
-report says so where it applies.
+forward walk. The first twelve settled months (July 2015 to June 2016) are
+warm-up: they fix the `hotel.json` factors above and give the engine and the
+baselines their history. Scoring runs from July 2016 to August 2017; every
+forecast for a night uses only snapshots up to that day. Nothing before July
+2016 is scored, so no method is judged on a period whose seasonality it was
+handed in advance.
 
 Every table compares only nights on which every method produced a forecast,
 and prints that count.
@@ -426,11 +471,10 @@ Methods:
 
 Headline rules:
 
-- The headline is engine against the average, and it rests on about 14
-  months (July 2016 to August 2017), one high season per hotel. The report
-  says so next to the number.
-- A secondary comparison, engine against additive pickup over the whole
-  forecast period, is printed so the first half of the data is not lost.
+- The headline is engine against the average, and it rests on 14 months
+  (July 2016 to August 2017), one high season per hotel. The report says so
+  next to the number. No secondary comparison over an earlier window is
+  printed: a number with a warning label gets quoted without the label.
 - At any lead mark where a single baseline beats the average, that baseline
   is printed beside it. The headline never compares against the average
   alone.
@@ -536,8 +580,11 @@ status Proposed. Nothing in the engine changes inside this project.
 
 ## 7. Order of work
 
-0. ADR Proposed for per-hotel seasonality, then the configuration seam in
-   `calendar.py` with the current table as default; golden numbers rerun.
+0. ADR Proposed for per-hotel seasonality, events and segment rate ratios;
+   then the configuration seam (`price_month_factor`, `demand_season_band`,
+   `events`, `segment_rate_ratio`) with the simulation constants kept on the
+   simulation path only; golden numbers rerun, plus the explicit-Toronto
+   `hotel.json` test.
 1. Schema document `docs/booking-log.md` and sample `data/sample-bookings.csv`.
 2. `pace/ingest.py` with tests.
 3. Converter with fixture tests; download of `hotels.csv` (about 16 MB from
@@ -569,10 +616,9 @@ Open items:
   is locked only after one or two real exports.
 - A standing airline-crew block, and NONREV rooms generally, need a capacity
   block the engine does not have. ADR Proposed, not built here.
-- `variable_cost` for the Portuguese hotels is an assumption; it affects no
-  table in the report.
-- The engine's four segments carry fixed `rate_multiplier` and
-  `prior_elasticity` values tuned for the simulated hotel (`config.py`). The
-  audit prints realised segment ADR ratios so the gap to those multipliers is
-  visible; changing them is an engine calibration and belongs in an ADR, not
-  in this project.
+- `variable_cost` for the Portuguese hotels is an assumption run at two
+  values; it sets the floor below which the engine prefers to hold a room,
+  so it touches table 2 and the segment allocation.
+- `prior_elasticity` stays tuned for the simulated hotel; the fitted values
+  and their signs are printed, and a wrong sign makes table 2 unreadable for
+  that hotel (ADR Proposed).
