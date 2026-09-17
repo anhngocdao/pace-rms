@@ -67,7 +67,7 @@ The engine can be pointed at a real hotel with its own seasons, events, contract
 
 - [ ] **Step 2: Check length and dashes**
 
-Run: `wc -l docs/adr/0007-hotel-facts-are-configuration.md && grep -c $'—\|–' docs/adr/0007-hotel-facts-are-configuration.md`
+Run: `wc -l docs/adr/0007-hotel-facts-are-configuration.md && python3 -c "import sys; s=open('docs/adr/0007-hotel-facts-are-configuration.md',encoding='utf-8').read(); print('dashes', s.count(chr(8212)) + s.count(chr(8211)))"`
 Expected: under 40 lines, count 0.
 
 - [ ] **Step 3: Commit**
@@ -2692,5 +2692,5 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Section 4 converter: rule order, branch codes, Transient-party clustering with empty-field rule, Undefined by channel majority and the 1 percent stop, `booked_on` from lead, status from `reservation_status`, duplicates kept, `first_stay` and `last_stay` trimming (the pilot plan applies the trim when it calls `ingest.load(first_stay=..., last_stay=...)`; the converter's audit prints p99 nights so the value is known), BAR test with month and two-week demeaning and the basket filter, audit contents: Tasks 10 and 11. Audit items not yet produced here and deferred to the pilot plan: inferred room count with and without duplicates (needs `ingest.infer_sellable_rooms` on both sets; add to the pilot plan's audit step), share of censored nights, prior share, fitted elasticity.
 - Section 9 settings committed before download, hash recorded: Task 12.
 - Section 7 order: Tasks follow 0 to 3 and the download gate; steps 4 and 5 of the spec (baselines, holdout, report, run, ADRs) are the pilot plan.
-- Placeholder scan: no TBD/TODO; every code step has code. Type check: `Booking.target` is `Optional[str]` everywhere; `Report.warnings` is a `Counter`; `IngestResult.nonrev` is `List[Booking]` and `nonrev_on(nonrev, night, asof)` is the only reader; `HotelConfig.sellable_rooms` is `Optional[int]` and `load()` fills it before `apply()`.
+- Placeholder scan: no placeholder markers remain; every code step has code. Type check: `Booking.target` is `Optional[str]` everywhere; `Report.warnings` is a `Counter`; `IngestResult.nonrev` is `List[Booking]` and `nonrev_on(nonrev, night, asof)` is the only reader; `HotelConfig.sellable_rooms` is `Optional[int]` and `load()` fills it before `apply()`.
 - Known gaps for the pilot plan: `first_stay`/`last_stay` trim; two `variable_cost` values; commission secondary run; NONREV rerun rule; the report; ADRs for weaknesses; spec section 10 "What the audit found".
