@@ -16,6 +16,8 @@ open out/dashboard.html
 
 No dependencies. No lockfile. Python 3.9 or newer.
 
+[![check](https://github.com/anhngocdao/pace-rms/actions/workflows/check.yml/badge.svg)](https://github.com/anhngocdao/pace-rms/actions/workflows/check.yml)
+
 ## Why this exists
 
 Most revenue management projects stop at a demand forecast. Forecasting is the
@@ -112,7 +114,7 @@ pace/
   network.py       bid prices for (room type, night) cells, from an LP dual
   networkeval.py   whether the network control earns anything, measured
 plugins/           extension examples, loaded automatically
-tests/             69 checks over the parts where a quiet mistake is expensive
+tests/             78 checks, including the golden backtest numbers
 ```
 
 ## Commands
@@ -126,7 +128,7 @@ python3 run.py experiment         score the randomised rate experiment
 python3 run.py network            score the network bid price against the nightly one
 python3 run.py bench              where the time goes, and how it scales
 python3 run.py dashboard          rebuild the HTML from out/run.json
-python3 run.py test               69 checks, about 9 seconds
+python3 run.py test               78 checks, about 40 seconds
 ```
 
 Everything the dashboard shows is read from `out/run.json`, so the numbers on
