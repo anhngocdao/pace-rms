@@ -142,12 +142,50 @@ beside the ledger. Consequences, all stated in the report:
   while forecasting sees only the NONREV rooms already on the books at that
   lead; otherwise it would look into the future.
 - NONREV rooms are never cut in the holdout.
-- The engine itself sees those rooms as available, so it slightly
-  overstates remaining capacity on nights with NONREV rooms. For the public
-  dataset Complementary is a small share (the audit prints it). A capacity
-  block that removes rooms from sale while keeping or dropping revenue,
-  which would also serve a standing airline-crew contract, is recorded as
-  an ADR with status Proposed and is not built here.
+- The engine compares `rooms_on` with `hotel.rooms` to decide whether a
+  night was censored (`unconstrain.py`, `elasticity.py` with its sell-out
+  threshold, `policy.py` for the expected sell-out). With NONREV outside
+  the ledger, a night that was really full with 175 paid rooms and 5
+  complimentary ones looks like 175 of 180 to the engine: not censored, so
+  the unconstrainer does not lift demand on exactly the busiest nights, and
+  the engine forecasts low there while the baselines, which never
+  unconstrain, are untouched. That would be an ingest error scored against
+  the engine. The report therefore prints the number of nights that were
+  physically full (paid plus NONREV at or above sellable rooms) but that the
+  ledger does not see as full.
+- Rule fixed before the run: the audit prints NONREV rooms per night on
+  nights at or above 90 percent physical occupancy (median and p90) and the
+  number of full nights with at least one NONREV room. If that p90 exceeds 2
+  percent of sellable rooms, the engine is run a second time with
+  `hotel.rooms` set to sellable rooms minus the p90, and both runs are
+  reported. This changes a configuration value, not engine code.
+- A capacity block that removes rooms from sale while keeping revenue (an
+  airline-crew contract) or dropping it (comp rooms) is recorded as an ADR
+  with status Proposed and is not built here. The ADR also has to say which
+  ADR definition the engine uses, with or without free rooms, because hotels
+  report both ways and a comparison with a real hotel's report must use the
+  same one. A free room for a group leader (adr = 0, still GROUP) lowers the
+  group ADR a little; that is how hotels price groups and stays as is.
+
+Two occupancy measures, and where each is used:
+
+| measure | counts | used for |
+|---|---|---|
+| physical occupancy | paid rooms plus NONREV rooms stayed | inferring sellable rooms and the ceiling check; the over-capacity warning; the three seasons; full nights in table 1; clean nights in the holdout |
+| paid demand | paid rooms only | actuals for scoring; known demand in the holdout; ADR |
+
+A night at 80 percent paid plus 8 percent complimentary is constrained and
+is not a clean night at an 85 percent threshold. Only NONREV rows with
+status stayed or in_house occupy a room; cancelled or no-show NONREV rows
+occupy nothing. Each NONREV row is kept with its `booked_on`, not folded
+into a per-night total, because three consumers need different views:
+scoring clamps with the final total (fair, every method is clamped alike);
+the holdout uses the NONREV rooms on the books at the moment of each sale,
+so a comp room entered after paid rooms reached the cap overshoots the cap
+and neither evicts an accepted booking nor gets cut; and any baseline that
+uses capacity while forecasting sees only NONREV entered up to that day.
+Sellable-room inference reads the records, not the ledger, so NONREV rows
+are counted; a function that inferred from the ledger would lose them.
 
 ### Validation rules
 
@@ -375,7 +413,10 @@ not room or board mix. Distribution of the gap per season.
 
 Fixed wording next to the table: this is a comparison, not evidence of
 revenue, because demand at any other rate was never observed; and if Online
-TA `adr` is a net rate the OTA gap is biased by a constant.
+TA `adr` is a net rate the OTA gap is biased by a constant. Nights with
+NONREV rooms are flagged and their gap shown separately, because the engine
+sees more rooms free than there were and may recommend a lower BAR on
+exactly the nights that were nearly full.
 
 ### Table 3, unconstraining checked by holdout
 
@@ -437,8 +478,12 @@ status Proposed. Nothing in the engine changes inside this project.
   mixed currency with and
   without an fx table, and 60 deliberate errors to prove collection stops at
   50. Asserts nightly `rooms_on`, snapshots at leads 0, 7 and 30,
-  `seg_revenue` per segment, the separate NONREV count, and sellable-room
-  inference with its ceiling check.
+  `seg_revenue` per segment, the separate NONREV count with its dates, and
+  sellable-room inference with its ceiling check. Invariants: per night,
+  paid rooms in the ledger plus NONREV rooms equals the count of stayed
+  rows; the inferred room count includes NONREV rooms; a night that is full
+  only thanks to comp rooms is marked full for table 1 and is not a clean
+  night for the holdout.
 - `tests/test_convert_antonio.py`: a 40-row fixture in the public dataset's
   layout exercising every rule in order and asserting the branch code each
   row receives, the Transient-party clustering with agent present and
@@ -451,8 +496,9 @@ status Proposed. Nothing in the engine changes inside this project.
 - `tests/test_pilot.py`: baselines and scoring on a tiny synthetic ledger
   with known answers; the clamp and the clamp-rate statistic; the holdout
   cut under all three rules including a cancellation that frees a room, a
-  group refused whole at the 90 percent mark, and a baseline that must not
-  see a NONREV room entered after its forecast day.
+  group refused whole at the 90 percent mark, a comp room entered after the
+  cap was reached (overshoots, evicts nothing, is not cut), and a baseline
+  that must not see a NONREV room entered after its forecast day.
 - Golden numbers are untouched; `run.py test` must stay green and the quick
   build must still print 64.50 / 78.80 / 82.98.
 
@@ -478,6 +524,9 @@ Recollections, not facts until the audit prints them:
 - Bookings with `deposit_type` Non Refund cancel almost entirely.
 - Mean `lead_time` is near three months; at least one `adr` is negative and
   one is in the thousands.
+- Complementary is about 700 rows and the adr = 0 branch is larger than
+  that; the impact measure that matters is NONREV rooms on near-full nights,
+  not the row share.
 - Whether `adr` includes tax or meals.
 
 Open items:
