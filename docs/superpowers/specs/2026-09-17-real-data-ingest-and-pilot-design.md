@@ -20,9 +20,12 @@ ourselves. What it cannot measure: a RevPAR lift. History only records what
 sold at the rate that was charged; no counterfactual policy can be replayed
 on it, and the report says so in its first lines.
 
-Non-goals: changing the engine, adding a fifth demand segment to the engine,
-calibrating the simulator to real data (a different project and a different
-kind of claim, see ADR 0006), and any machine learning.
+Non-goals: changing engine mechanisms, adding a fifth demand segment to the
+engine, calibrating the simulator to real data (a different project and a
+different kind of claim, see ADR 0006), and any machine learning. One
+configuration seam does have to open (section 3, "What the engine needs
+from hotel.json"): the seasonality table is hard-coded for the simulated
+Toronto hotel and cannot stay that way on an Algarve resort.
 
 ## 2. Shape of the work
 
@@ -186,6 +189,35 @@ and neither evicts an accepted booking nor gets cut; and any baseline that
 uses capacity while forecasting sees only NONREV entered up to that day.
 Sellable-room inference reads the records, not the ledger, so NONREV rows
 are counted; a function that inferred from the ledger would lose them.
+
+### What the engine needs from hotel.json
+
+The engine reads these `Hotel` fields: `rooms`, `base_rate`, `rate_floor`,
+`rate_ceiling`, `rate_step`, `variable_cost`, `max_lead`, `max_los`, and
+`rate_ladder`, which derives from them. `hotel.json` must supply them all.
+For the public dataset the converter derives what it can and states the
+rest: `base_rate` = median `adr` of Direct bookings in shoulder months for
+the most common room type; floor and ceiling from the 2nd and 98th
+percentile of paid `adr`; `rate_step` 1 EUR; `max_lead` from the 99th
+percentile of `lead_time`; `max_los` from the 99th percentile of `nights`;
+`variable_cost` is not in the data and is set to a stated assumption, which
+touches GOPPAR-style figures only and none of the three tables.
+
+Seasonality is the seam that has to open. `calendar.py` holds a fixed
+`MONTH_FACTOR` table and fixed season bands for the simulated Toronto
+hotel; `policy.py` uses them for the ladder prior and the rate ceiling
+walk, `forecast.py` and `unconstrain.py` use `demand_class` (season band by
+weekday) as the estimation cell, and `reference_rate` uses the month factor
+as the denominator of every price ratio. Run unchanged on the Algarve, the
+engine would normalise prices against Toronto's seasons and pool nights
+into Toronto's demand classes. Required change, recorded first as an ADR
+with status Proposed and then built as step 0 of section 7: the month
+factors and season bands become per-hotel inputs carried in `hotel.json`,
+with the current table as the default so the golden numbers do not move.
+The converter derives them from the data: month factor = mean paid `adr` of
+the month over the annual mean; season bands from terciles of monthly
+physical occupancy, the same split table 1 uses. Nothing else in the engine
+changes; a mechanism the pilot shows to be wrong is written up, not fixed.
 
 ### Validation rules
 
@@ -504,6 +536,8 @@ status Proposed. Nothing in the engine changes inside this project.
 
 ## 7. Order of work
 
+0. ADR Proposed for per-hotel seasonality, then the configuration seam in
+   `calendar.py` with the current table as default; golden numbers rerun.
 1. Schema document `docs/booking-log.md` and sample `data/sample-bookings.csv`.
 2. `pace/ingest.py` with tests.
 3. Converter with fixture tests; download of `hotels.csv` (about 16 MB from
@@ -535,3 +569,10 @@ Open items:
   is locked only after one or two real exports.
 - A standing airline-crew block, and NONREV rooms generally, need a capacity
   block the engine does not have. ADR Proposed, not built here.
+- `variable_cost` for the Portuguese hotels is an assumption; it affects no
+  table in the report.
+- The engine's four segments carry fixed `rate_multiplier` and
+  `prior_elasticity` values tuned for the simulated hotel (`config.py`). The
+  audit prints realised segment ADR ratios so the gap to those multipliers is
+  visible; changing them is an engine calibration and belongs in an ADR, not
+  in this project.
