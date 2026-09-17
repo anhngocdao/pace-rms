@@ -217,15 +217,15 @@ branches they admit. The public BAR basket is branches DIRECT and ONLINE_TA.
 | sellable_rooms | hotel | inferred from the whole period with the ceiling check; the audit prints the yearly maximum, and if one year is clearly lower (rooms taken out of service) a single number is not used |
 | currency | hotel | EUR |
 | rate_floor, rate_ceiling | hotel (BAR limits) | 2nd and 98th percentile of the public BAR basket over the first twelve months, widened by a fixed margin set before the run (10 percent each way), because next year's rates usually exceed last year's; the report prints the share of scoring-period basket adr outside the range, since a high share means table 2 is truncated at that end |
-| rate_step | hotel | chosen so the ladder has about 90 steps, as Toronto's does (109 to 469 in steps of 4 gives 91): (ceiling minus floor) over 90, rounded to 1, 2 or 5 EUR; a 1 EUR step over a few hundred EUR would give hundreds of rungs with no observations each and weaken the engine by configuration |
+| rate_step | hotel | chosen so the ladder has about 90 steps, as Toronto's does (109 to 469 in steps of 4 gives 91): (ceiling minus floor) over 90, rounded to 1, 2 or 5 EUR, never below 1 EUR even if that leaves fewer steps; the actual step count is printed; a 1 EUR step over a few hundred EUR would give hundreds of rungs with no observations each and weaken the engine by configuration |
 | base_rate | hotel (its BAR anchor) | by construction consistent with the month factors: median over months of (basket median of month m divided by factor m), so it is the price at factor 1 under the same convention as the table; if the DIRECT branch alone is too thin at H1 the basket already includes ONLINE_TA and the audit says so |
-| price_month_factor (12 numbers) | hotel, from last year's rates | monthly basket median over the twelve-month mean, then rescaled to mean 1.0, the convention of the Toronto table (whose mean is 0.99); computed on the public BAR basket only, so winter contract volume at a resort does not inflate the swing; Easter week and 24 December to 1 January are excluded from the monthly medians, so March 2016 does not carry Easter into March 2017; the audit prints the same-basket change between July and August 2016 and July and August 2015 as a report-only measure of price drift |
-| demand_season_band (12 labels) | hotel, from last year's demand | terciles of gross demand by stay month (room nights stayed plus cancelled plus no_show, excluding deposit_type Non Refund), labels peak, shoulder, trough as `demand_class` expects; Toronto has 4, 3 and 5 months in those bands while terciles force 4, 4, 4, and the audit prints both counts because the label decides how much data each estimation cell gets; the occupancy-based version is printed beside it; if the audit shows duplicates are mostly cancellations, a second version without duplicates is printed and a label change is recorded |
+| price_month_factor (12 numbers) | hotel, from last year's rates | monthly basket median over the twelve-month mean, then rescaled to mean 1.0, the convention of the Toronto table (whose mean is 0.99); computed on the public BAR basket only, so winter contract volume at a resort does not inflate the swing; Easter week and 24 December to 1 January are excluded from the monthly medians, so March 2016 does not carry Easter into March 2017, and the `base_rate` computation excludes the same weeks so the two stay consistent by construction; a month with fewer basket rows than the minimum in section 9 widens its filter to any number of adults, and the audit lists which months were widened; the audit prints the same-basket change between July and August 2016 and July and August 2015 as a report-only measure of price drift |
+| demand_season_band (12 labels) | hotel, from last year's demand | months ranked by gross demand (room nights stayed plus cancelled plus no_show, excluding deposit_type Non Refund) and labelled with Toronto's own split, the top 4 peak, the next 3 shoulder, the bottom 5 trough, so each estimation cell gets about the volume the engine's `MIN_ROWS` and `PRIOR_WEIGHT` were tuned on; terciles were rejected for that reason; the occupancy-based version is printed beside it; if the audit shows duplicates are mostly cancellations, a second version without duplicates is printed and a label change is recorded |
 | segment_rate_ratio (CORP, GROUP relative to BAR) | hotel (contract rates, commission) | per month, ratio of the CORP-branch basket median to the public BAR basket median, only for months with enough rows on both sides (threshold fixed before the run); then the median of those months, weighted by room nights across the two very different CORP origins (Corporate and Aviation at business rates, OFFLINE_TO_CONTRACT and OFFLINE_TO_TRANSIENT at tour-operator net rates); the audit prints each origin's ratio separately, the ratio by season band, and the ONLINE_TA over DIRECT ratio, which if steadily below one across months is the best evidence the dataset offers that Online TA adr is net |
-| segment_commission | hotel | the engine carries a commission per segment (`config.py`, RETAIL 0.02 and so on); `variable_cost` excludes commission so nothing is deducted twice; for the pilot OTA commission is fixed before the run, and set to zero if the audit indicates Online TA adr is already net |
+| segment_commission | hotel | the engine carries a commission per segment (`config.py`, RETAIL 0.02 and so on); `variable_cost` excludes commission so nothing is deducted twice. Whether Online TA adr is gross or net cannot be read off the data: a steadily low Online TA over DIRECT ratio may mean net rates or simply cheaper OTA deals, and a ratio near one proves nothing either; Booking.com in Europe then was mostly agency (gross in the PMS), Expedia both. So the main run treats Online TA adr as gross with the OTA commission fixed in section 9, a secondary run uses commission zero for table 2 only, and the ratio is printed as information, never as a rule. With the two `variable_cost` values table 2 is a 2 by 2 grid; tables 1 and 3 do not depend on commission |
 | variable_cost | hotel | not in the data: expressed as a share of `base_rate` so H1 and H2 share one assumption; two values fixed before the run, low and high; if the recommended BAR in table 2 moves materially between them the table says the result depends on the cost assumption |
 | max_lead, max_los | hotel | 99th percentile of lead_time and of nights over the first twelve months; rows beyond either bound are neither dropped nor trimmed in the ledger (long stays and early bookings cluster in H1's summer, exactly the nights that matter), and a test asserts it; `max_lead` must be at least 120 for H1 or the 120 mark in table 1 is not run |
-| sellout_threshold | engine parameter, exposed | `unconstrain.py`, `elasticity.py` and `experiment.py` default it to 0.97 as a function argument; it decides which nights count as censored, and with inferred rooms and NONREV outside the ledger that decision is fragile, so it becomes a `hotel.json` field with 0.97 on the simulation path and a mandatory value on the ingest path |
+| sellout_threshold | engine parameter, exposed | `unconstrain.py`, `elasticity.py` and `experiment.py` default it to 0.97 as a function argument; it decides which nights count as censored, and with inferred rooms and NONREV outside the ledger that decision is fragile, so it becomes a `hotel.json` field with 0.97 on the simulation path and a mandatory value on the ingest path; the pilot uses 0.97, the same as the simulation, with no sensitivity sweep, because sweeping and keeping the best value would be tuning the engine on the scoring data; the audit prints the share of nights marked censored in the first twelve months next to the same share on the simulated hotel, since an inferred, low-biased room count can mark far more nights at H1 |
 | events | hotel | none for the main run: the Toronto list is not used, the engine gets no hand-entered events and neither do the baselines |
 
 How the engine uses the segment ratio, checked in code: `quoted_rate`
@@ -258,7 +258,15 @@ demand correlation may be positive; if a fitted elasticity has the wrong
 sign or sits near zero, that is written up as an ADR Proposed and table 2
 is declared unreadable for that hotel rather than printed. Other engine
 constants (`MIN_ACCEPTANCE`, `PRIOR_WEIGHT`, `MIN_ROWS`) are internals, not
-hotel facts; they stay fixed and are printed in the report header.
+hotel facts; they stay fixed and are printed in the report header. Printing
+them is not enough: they were tuned for the simulated hotel's volume, and
+if estimation cells at H1 or H2 often fall below `MIN_ROWS` the engine
+falls back to its Toronto priors and the pilot would be scoring those
+priors, not what the engine learned. The audit therefore prints, per
+segment and season band, the share of cells resolved from data against the
+share resolved from the prior, for the first twelve months and for the
+scoring period. If most cells are prior, that is a conclusion of the pilot
+and is printed next to the headline.
 
 Defaults are not silent. On the ingest path every field in the table is
 mandatory and a missing one is an error; a real `hotel.json` that forgets
@@ -645,3 +653,34 @@ Open items:
 - `prior_elasticity` stays tuned for the simulated hotel; the fitted values
   and their signs are printed, and a wrong sign makes table 2 unreadable for
   that hotel (ADR Proposed).
+
+## 9. Settings fixed before the data is downloaded
+
+Every number below is chosen here, committed, and only then is `hotels.csv`
+downloaded. The report prints the hash of that commit. Fields derived from
+the first twelve months are still computed later, but the rules that
+compute them are frozen here. This is what makes "no number is rounded in
+the engine's favour" checkable rather than promised.
+
+| setting | value |
+|---|---|
+| BAR test residual correlation threshold | 0.6 |
+| Baseline trailing window | 10 weeks, same weekday |
+| `variable_cost`, low and high, as share of `base_rate` | 0.08 and 0.18 |
+| OTA commission, main run and secondary run | 0.15 and 0.00 |
+| NONREV rule: rerun with reduced capacity when p90 NONREV on near-full nights exceeds | 2 percent of sellable rooms; near-full = at least 90 percent physical occupancy |
+| Floor and ceiling widening | 10 percent each way, on the 2nd and 98th percentile |
+| Price basket trim | 1st to 99th percentile of adr |
+| Minimum basket rows per month for `price_month_factor` and ratios | 30; below it, widen adults filter, and record the month |
+| Minimum rows on both sides for a month to count in `segment_rate_ratio` | 30 |
+| Close-cheap-first mark | 90 percent of the simulated cap |
+| `sellout_threshold` | 0.97, no sweep |
+| Group threshold | 10 rooms |
+| Undefined stop rule | more than 1 percent of room nights |
+| Holdout grid | clean threshold 80, 85, 90 percent by cap 60, 70, 80 percent, cap below threshold only |
+| Holdout neighbour window | 90th percentile of `nights` |
+| Cancel-date imputation and any other draw | seed 20250115 |
+| Demand band split | top 4 months peak, next 3 shoulder, bottom 5 trough |
+| `rate_step` | (ceiling minus floor) over 90, rounded to 1, 2 or 5 EUR, minimum 1 EUR |
+| Lead marks | 120 (H1 only, if `max_lead` allows), 90, 60, 30, 14, 7; lead 1 separate |
+| Rate comparison windows for table 2 | mark 60: leads 75 to 45; mark 30: 40 to 21; mark 14: 21 to 7; mark 7: 10 to 4 |
