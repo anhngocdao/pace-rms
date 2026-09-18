@@ -5,6 +5,7 @@ simulator builds; the engine cannot tell the two apart, which is the point.
 """
 import csv
 import datetime as dt
+import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -310,3 +311,86 @@ def detect_groups(bookings: List[Booking], cfg: HotelConfig, rep: Report) -> int
     if changed:
         rep.notes.append("%d rows recognised as group rooms by company, booking day, arrival and nights" % changed)
     return changed
+
+
+def impute_cancel_dates(bookings: List[Booking], rep: Report, seed: int) -> int:
+    """Draw the ratio (days to cancel / lead) from dated cancellations of the same
+    segment and apply it to this row's own lead, so short leads never get long
+    delays that then clamp to arrival.  updated_on caps the result if present."""
+    rng = random.Random(seed)
+    ratios: Dict[str, List[float]] = defaultdict(list)
+    for b in bookings:
+        if b.status == "cancelled" and b.status_date is not None and b.target:
+            lead = (b.arrival - b.booked_on).days
+            if lead > 0:
+                ratios[b.target].append(min(1.0, max(0.0, (b.status_date - b.booked_on).days / lead)))
+    done = 0
+    missing_segments = set()
+    for b in bookings:
+        if b.status != "cancelled" or b.status_date is not None:
+            continue
+        lead = (b.arrival - b.booked_on).days
+        pool = ratios.get(b.target or "", [])
+        if pool:
+            when = b.booked_on + dt.timedelta(days=round(rng.choice(pool) * lead))
+        else:
+            when = b.booked_on
+            missing_segments.add(b.target or "(unmapped)")
+        upper = b.updated_on if b.updated_on is not None else b.arrival
+        b.status_date = min(max(when, b.booked_on), upper)
+        b.imputed_cancel = True
+        done += 1
+    if done:
+        rep.notes.append("%d cancellations had no date; dates imputed from same-segment ratios, seed %d" % (done, seed))
+    for seg in sorted(missing_segments):
+        rep.notes.append("segment %s had no dated cancellations to learn from; its undated rows use the low bound (booking day)" % seg)
+    return done
+
+
+def cancel_bounds(bookings: List[Booking]) -> Tuple[List[Booking], List[Booking]]:
+    """Two copies for the report: imputed rows at their low bound and at their high bound."""
+    low, high = [], []
+    for b in bookings:
+        if b.imputed_cancel:
+            low.append(Booking(**{**b.__dict__, "status_date": b.booked_on}))
+            high.append(Booking(**{**b.__dict__, "status_date": b.arrival}))
+        else:
+            low.append(b); high.append(b)
+    return low, high
+
+
+@dataclass
+class RoomInference:
+    rooms: int
+    peak_night: Optional[dt.date]
+    nights_within_2pct: int
+    second_highest: int
+    per_year_max: Dict[int, int]
+
+
+def physical_occupancy(bookings: List[Booking]) -> Dict[dt.date, int]:
+    """Rooms physically occupied per night: stayed and in_house rows, NONREV
+    included, no_show and day use excluded.  Reads the records, not the ledger,
+    so NONREV rooms are counted."""
+    occ: Dict[dt.date, int] = defaultdict(int)
+    for b in bookings:
+        if not b.occupies or b.nights == 0:
+            continue
+        for k in range(b.nights):
+            occ[b.arrival + dt.timedelta(days=k)] += 1
+    return occ
+
+
+def infer_sellable_rooms(bookings: List[Booking]) -> RoomInference:
+    occ = physical_occupancy(bookings)
+    if not occ:
+        return RoomInference(0, None, 0, 0, {})
+    peak_night = max(occ, key=lambda d: (occ[d], d))
+    rooms = occ[peak_night]
+    counts = sorted(occ.values(), reverse=True)
+    within = sum(1 for c in counts if c >= rooms * 0.98)
+    second = counts[1] if len(counts) > 1 else rooms
+    per_year: Dict[int, int] = {}
+    for d, c in occ.items():
+        per_year[d.year] = max(per_year.get(d.year, 0), c)
+    return RoomInference(rooms, peak_night, within, second, per_year)

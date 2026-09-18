@@ -217,3 +217,61 @@ class DetectGroups(unittest.TestCase):
         rows = [_row(booking_id="B%d" % i, segment="CORP", company="ACME") for i in range(5)]
         _, n = self._run(rows, detect_groups=False)
         self.assertEqual(n, 0)
+
+
+class ImputeCancelDates(unittest.TestCase):
+    def _bookings(self):
+        rows = [_row(booking_id="C%d" % i, segment="WEB", status="cancelled", booked_on="2025-01-01",
+                     arrival="2025-01-21", status_date="2025-01-%02d" % (6 + i)) for i in range(5)]   # ratio 0.25..0.45
+        rows.append(_row(booking_id="U1", segment="WEB", status="cancelled", booked_on="2025-03-01", arrival="2025-03-11"))
+        rows.append(_row(booking_id="U2", segment="WEB", status="cancelled", booked_on="2025-03-01", arrival="2025-03-31", updated_on="2025-03-05"))
+        rows.append(_row(booking_id="U3", segment="CORP", status="cancelled", booked_on="2025-03-01", arrival="2025-03-11"))
+        cfg = _cfg(); b, rep = ingest.read_bookings(_csv(rows), cfg); ingest.map_segments(b, cfg, rep)
+        return b, rep
+
+    def test_ratio_is_applied_to_the_rows_own_lead(self):
+        b, rep = self._bookings()
+        n = ingest.impute_cancel_dates(b, rep, seed=1)
+        u1 = next(x for x in b if x.booking_id == "U1")
+        self.assertEqual(n, 3); self.assertTrue(u1.imputed_cancel)
+        self.assertTrue(dt.date(2025, 3, 3) <= u1.status_date <= dt.date(2025, 3, 6))   # 10-day lead times 0.25..0.45
+
+    def test_updated_on_is_the_upper_bound(self):
+        b, rep = self._bookings()
+        ingest.impute_cancel_dates(b, rep, seed=1)
+        u2 = next(x for x in b if x.booking_id == "U2")
+        self.assertLessEqual(u2.status_date, dt.date(2025, 3, 5))
+
+    def test_segment_without_dated_cancellations_uses_low_bound(self):
+        b, rep = self._bookings()
+        ingest.impute_cancel_dates(b, rep, seed=1)
+        u3 = next(x for x in b if x.booking_id == "U3")
+        self.assertEqual(u3.status_date, dt.date(2025, 3, 1))
+        self.assertTrue(any("CORP" in n for n in rep.notes))
+
+    def test_same_seed_same_dates(self):
+        a, ra = self._bookings(); ingest.impute_cancel_dates(a, ra, seed=5)
+        c, rc = self._bookings(); ingest.impute_cancel_dates(c, rc, seed=5)
+        self.assertEqual([x.status_date for x in a], [x.status_date for x in c])
+
+    def test_bounds_put_imputed_rows_at_booking_day_and_arrival(self):
+        b, rep = self._bookings(); ingest.impute_cancel_dates(b, rep, seed=1)
+        low, high = ingest.cancel_bounds(b)
+        u1_low = next(x for x in low if x.booking_id == "U1"); u1_high = next(x for x in high if x.booking_id == "U1")
+        self.assertEqual(u1_low.status_date, dt.date(2025, 3, 1)); self.assertEqual(u1_high.status_date, dt.date(2025, 3, 11))
+
+
+class InferSellableRooms(unittest.TestCase):
+    def test_counts_stayed_and_in_house_including_nonrev_not_no_show_or_day_use(self):
+        rows = [_row(booking_id="S%d" % i, segment="WEB", arrival="2025-02-01", nights="1") for i in range(10)]
+        rows += [_row(booking_id="N1", segment="COMP", rate="0", arrival="2025-02-01", nights="1")]
+        rows += [_row(booking_id="I1", segment="WEB", arrival="2025-02-01", nights="1", status="in_house")]
+        rows += [_row(booking_id="X1", segment="WEB", arrival="2025-02-01", nights="1", status="no_show")]
+        rows += [_row(booking_id="D1", segment="WEB", arrival="2025-02-01", nights="0")]
+        rows += [_row(booking_id="T%d" % i, segment="WEB", arrival="2026-02-01", nights="1") for i in range(12)]
+        cfg = _cfg(); b, rep = ingest.read_bookings(_csv(rows), cfg); ingest.map_segments(b, cfg, rep)
+        inf = ingest.infer_sellable_rooms(b)
+        self.assertEqual(inf.rooms, 12)
+        self.assertEqual(inf.second_highest, 12)   # 2025-02-01 has 10 + 1 comp + 1 in_house
+        self.assertEqual(inf.per_year_max, {2025: 12, 2026: 12})
+        self.assertEqual(inf.nights_within_2pct, 2)
