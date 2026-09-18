@@ -67,8 +67,13 @@ _ACTIVE = toronto_seasonality()
 
 
 def set_seasonality(s: Seasonality) -> None:
+    """The active seasonality owns its month dictionaries.  They are copied on
+    the way in, so a caller that keeps the config it passed cannot reach into
+    the engine's live tables and change a month without coming back through
+    validation."""
     global _ACTIVE
-    _ACTIVE = s.validate()
+    s.validate()
+    _ACTIVE = Seasonality(dict(s.price_month_factor), dict(s.demand_season_band))
 
 
 def reset_seasonality() -> None:

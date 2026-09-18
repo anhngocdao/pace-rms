@@ -57,6 +57,16 @@ def _months(raw: dict, name: str) -> dict:
     return out
 
 
+def _check_segments(ratio, commission) -> None:
+    """Both tables name segments the engine actually has."""
+    for table, name in ((ratio, "segment_rate_ratio"), (commission, "segment_commission")):
+        if not isinstance(table, dict):
+            raise ConfigError("%s must map segment codes to numbers" % name)
+    for code in list(ratio) + list(commission):
+        if code not in config.DEFAULT_SEGMENTS:
+            raise ConfigError("unknown segment %r in hotel.json" % code)
+
+
 def load_hotel_json(path: str) -> HotelConfig:
     """Load and validate a hotel.json. Every field in REQUIRED is mandatory:
     a real hotel must not run on Toronto's seasons, events, contract ratios
@@ -73,9 +83,7 @@ def load_hotel_json(path: str) -> HotelConfig:
         raise ConfigError("hotel.json is missing: %s" % ", ".join(missing))
     raw["price_month_factor"] = _months(raw["price_month_factor"], "price_month_factor")
     raw["demand_season_band"] = _months(raw["demand_season_band"], "demand_season_band")
-    for code in list(raw["segment_rate_ratio"]) + list(raw["segment_commission"]):
-        if code not in config.DEFAULT_SEGMENTS:
-            raise ConfigError("unknown segment %r in hotel.json" % code)
+    _check_segments(raw["segment_rate_ratio"], raw["segment_commission"])
     known = {f for f in HotelConfig.__dataclass_fields__}
     extra = [k for k in raw if k not in known]
     if extra:
@@ -84,19 +92,33 @@ def load_hotel_json(path: str) -> HotelConfig:
 
 
 def apply(cfg: HotelConfig) -> Hotel:
-    """Point the engine at this hotel.  Call once per process before any fit."""
-    C.set_seasonality(C.Seasonality(cfg.price_month_factor, cfg.demand_season_band))
-    config.reset_segments()
-    config.configure_segments(cfg.segment_rate_ratio, cfg.segment_commission)
+    """Point the engine at this hotel.  Call once per process before any fit.
+
+    Every field is checked and both objects are built before a single global
+    is touched, so a config the engine refuses leaves seasonality and segments
+    exactly as they were instead of half this hotel and half the simulated one.
+    """
     if cfg.sellable_rooms is None:
         raise ConfigError("sellable_rooms is still null; run the ingest inference first")
-    return Hotel(
-        name=cfg.name, currency=cfg.currency, rooms=int(cfg.sellable_rooms),
-        base_rate=float(cfg.base_rate), rate_floor=float(cfg.rate_floor),
-        rate_ceiling=float(cfg.rate_ceiling), rate_step=float(cfg.rate_step),
-        variable_cost=float(cfg.variable_cost), max_lead=int(cfg.max_lead),
-        max_los=int(cfg.max_los), sellout_threshold=float(cfg.sellout_threshold),
-    )
+    _check_segments(cfg.segment_rate_ratio, cfg.segment_commission)
+    try:
+        seasonality = C.Seasonality(cfg.price_month_factor, cfg.demand_season_band).validate()
+    except ValueError as exc:
+        raise ConfigError("seasonality in hotel.json is unusable: %s" % exc)
+    try:
+        hotel = Hotel(
+            name=cfg.name, currency=cfg.currency, rooms=int(cfg.sellable_rooms),
+            base_rate=float(cfg.base_rate), rate_floor=float(cfg.rate_floor),
+            rate_ceiling=float(cfg.rate_ceiling), rate_step=float(cfg.rate_step),
+            variable_cost=float(cfg.variable_cost), max_lead=int(cfg.max_lead),
+            max_los=int(cfg.max_los), sellout_threshold=float(cfg.sellout_threshold),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("hotel.json has a field the engine cannot read: %s" % exc)
+    C.set_seasonality(seasonality)
+    config.reset_segments()
+    config.configure_segments(cfg.segment_rate_ratio, cfg.segment_commission)
+    return hotel
 
 
 def event_calendar(cfg: HotelConfig) -> EventCalendar:

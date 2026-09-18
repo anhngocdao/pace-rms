@@ -97,5 +97,49 @@ class LoadHotelJson(unittest.TestCase):
         self.assertAlmostEqual(cal.multiplier(dt.date(2024, 9, 1)), 1.0)
 
 
+class ApplyIsAllOrNothing(unittest.TestCase):
+    """apply() either points the whole engine at this hotel or leaves it alone.
+    Half a hotel is the worst of the three outcomes: a process running one
+    hotel's seasons against another's contract ratios, with nothing said."""
+
+    def tearDown(self):
+        C.reset_seasonality()
+        config.reset_segments()
+
+    def _engine_state(self):
+        s = C.active_seasonality()
+        return (dict(s.price_month_factor), dict(s.demand_season_band),
+                {code: (seg.rate_multiplier, seg.commission) for code, seg in config.SEGMENTS.items()})
+
+    def _refused(self, **over):
+        before = self._engine_state()
+        cfg = HC.load_hotel_json(_write(dict(TORONTO, **over)))
+        with self.assertRaises(HC.ConfigError):
+            HC.apply(cfg)
+        self.assertEqual(self._engine_state(), before)
+
+    def test_null_rooms_leaves_seasonality_and_segments_untouched(self):
+        self._refused(sellable_rooms=None,
+                      price_month_factor={str(m): 2.0 for m in range(1, 13)},
+                      demand_season_band={str(m): "peak" for m in range(1, 13)},
+                      segment_rate_ratio={"CORP": 0.31, "GROUP": 0.29})
+
+    def test_an_unusable_season_band_leaves_segments_untouched(self):
+        self._refused(demand_season_band={str(m): "summer" for m in range(1, 13)},
+                      segment_rate_ratio={"CORP": 0.31, "GROUP": 0.29})
+
+    def test_an_unreadable_number_leaves_seasonality_untouched(self):
+        self._refused(sellable_rooms="forty",
+                      price_month_factor={str(m): 2.0 for m in range(1, 13)})
+
+    def test_the_active_seasonality_is_not_the_config_object(self):
+        cfg = HC.load_hotel_json(_write(TORONTO))
+        HC.apply(cfg)
+        cfg.price_month_factor[7] = 9.9
+        cfg.demand_season_band[7] = "trough"
+        self.assertEqual(C.month_factor(dt.date(2024, 7, 1)), 1.22)
+        self.assertEqual(C.active_seasonality().demand_season_band[7], "peak")
+
+
 if __name__ == "__main__":
     unittest.main()

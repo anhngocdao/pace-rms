@@ -8,6 +8,8 @@ from collections import Counter
 from unittest import mock
 
 from tools import convert_antonio as CA
+from pace import calendar as C
+from pace import config
 from pace import hotelconfig as HC
 
 SETTINGS = {"group_threshold_rooms": 10, "undefined_stop_share": 0.01, "seed": 20250115}
@@ -493,6 +495,13 @@ class DerivedHotelJsonIsLoadable(unittest.TestCase):
     the round trip: derive, strip _derivation, write, load for real."""
 
     NAME_OF = {v: k for k, v in CA.MONTHS.items()}
+
+    def tearDown(self):
+        # This class ends on an apply() that raises. Nothing global should be
+        # left behind by it, and this makes sure of it either way: a resort's
+        # seasons reaching the golden backtest is a failure two files away.
+        C.reset_seasonality()
+        config.reset_segments()
 
     def _make_row(self, year, month_num, day, **kw):
         d = dt.date(year, month_num, day)
