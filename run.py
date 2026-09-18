@@ -9,9 +9,11 @@
   python3 run.py experiment  score the randomised rate experiment against the truth
   python3 run.py network     score the network bid price against the nightly one
   python3 run.py bench       where the time goes, and how it scales
+  python3 run.py ingest      replay a real booking log into the ledger
   python3 run.py test        run the checks
 """
 
+import datetime as dt
 import json
 import os
 import sys
@@ -81,6 +83,32 @@ def main(argv):
                 return 0
         print("no recommendation for %s" % target)
         return 1
+
+    if cmd == "ingest":
+        if len(argv) < 4:
+            print("usage: python3 run.py ingest <bookings.csv> <hotel.json>")
+            return 1
+        from pace import ingest
+        from pace.hotelconfig import event_calendar
+        from pace.policy import PaceEngine
+        try:
+            res = ingest.load(argv[2], argv[3])
+        except ingest.IngestError as exc:
+            print(exc)
+            return 1
+        rep = res.report
+        print("rows %d, ledger bookings %d, cancels %d, nights %s to %s"
+              % (len(res.bookings), res.ledger.n_bookings, res.ledger.n_cancels, res.first_stay, res.last_stay))
+        print("rooms %d (%s)" % (res.hotel.rooms, "inferred" if res.inference else "from hotel.json"))
+        for k, v in sorted(rep.warnings.items()):
+            if not k.startswith("_"):
+                print("warning %-28s %d" % (k, v))
+        for n in rep.notes:
+            print("note", n)
+        engine = PaceEngine(res.hotel, event_calendar(res.cfg))
+        engine.observe(res.last_stay + dt.timedelta(days=1), res.ledger)
+        print("engine fitted:", engine.ready)
+        return 0
 
     if cmd == "test":
         import unittest

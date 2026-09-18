@@ -78,6 +78,12 @@ re-scoring. And the engine never reads that stream. It reads a ledger holding
 only what was accepted plus the denials a real hotel could log, so demand on
 sold-out nights reaches it censored, exactly as it would in production.
 
+The engine can now read a real booking log, through the schema in
+[docs/booking-log.md](docs/booking-log.md). The first real-data pilot, on the
+public Portuguese hotel dataset, is specified in
+[docs/superpowers/specs/2026-09-17-real-data-ingest-and-pilot-design.md](docs/superpowers/specs/2026-09-17-real-data-ingest-and-pilot-design.md),
+with its results to follow.
+
 ## The five decisions
 
 | Decision | Mechanism | Where |
@@ -128,6 +134,7 @@ python3 run.py experiment         score the randomised rate experiment
 python3 run.py network            score the network bid price against the nightly one
 python3 run.py bench              where the time goes, and how it scales
 python3 run.py dashboard          rebuild the HTML from out/run.json
+python3 run.py ingest bookings.csv hotel.json   # a real booking log into the ledger
 python3 run.py test               78 checks, about 40 seconds
 ```
 

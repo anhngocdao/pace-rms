@@ -17,6 +17,7 @@ python3 run.py robustness      # four markets, same engine
 python3 run.py experiment      # randomised rate experiment (null result)
 python3 run.py network --quick # network model with LOS and room types
 python3 run.py bench           # milliseconds per decision
+python3 run.py ingest bookings.csv hotel.json   # a real booking log into the ledger
 ```
 
 ## Hard constraints
@@ -56,6 +57,10 @@ commit message says why the number moved. A number never moves silently.
   A new mechanism is not finished until it can explain itself there.
 - `docs/adr/` records decisions. A new mechanism starts as an ADR marked
   "Proposed" before any code lands.
+- `docs/booking-log.md` is the schema a real booking log must match to reach
+  `pace/ingest.py`. On that path `hotel.json` fields are mandatory, not
+  defaults; a real hotel must not run on Toronto's seasons or thresholds
+  by falling through (ADR 0007).
 
 ## Ritual for every change
 
@@ -87,3 +92,5 @@ now true, not what was done. `git log --oneline` shows the pattern.
   stay and room types (METHOD.md section 14). Also on purpose.
 - `run.py test` writes nothing under `out/`; the golden tests run in a
   temporary directory so a full build's dashboard survives a test run.
+- `tests/test_golden.py::ExplicitTorontoConfig` takes about 14 s; it proves
+  the configuration path reproduces the golden numbers (ADR 0007).
