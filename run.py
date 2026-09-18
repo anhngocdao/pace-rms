@@ -89,11 +89,11 @@ def main(argv):
             print("usage: python3 run.py ingest <bookings.csv> <hotel.json>")
             return 1
         from pace import ingest
-        from pace.hotelconfig import event_calendar
+        from pace.hotelconfig import ConfigError, event_calendar
         from pace.policy import PaceEngine
         try:
             res = ingest.load(argv[2], argv[3])
-        except ingest.IngestError as exc:
+        except (ingest.IngestError, ConfigError) as exc:
             print(exc)
             return 1
         rep = res.report

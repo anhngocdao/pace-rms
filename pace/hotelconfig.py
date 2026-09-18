@@ -61,8 +61,13 @@ def load_hotel_json(path: str) -> HotelConfig:
     """Load and validate a hotel.json. Every field in REQUIRED is mandatory:
     a real hotel must not run on Toronto's seasons, events, contract ratios
     or threshold by falling through to a default (ADR 0007)."""
-    with open(path, encoding="utf-8") as fh:
-        raw = json.load(fh)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except OSError as exc:
+        raise ConfigError("cannot read hotel.json at %s: %s" % (path, exc))
+    except json.JSONDecodeError as exc:
+        raise ConfigError("hotel.json at %s is not valid JSON: %s" % (path, exc))
     missing = [k for k in REQUIRED if k not in raw]
     if missing:
         raise ConfigError("hotel.json is missing: %s" % ", ".join(missing))
