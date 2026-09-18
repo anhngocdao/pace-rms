@@ -337,6 +337,9 @@ def impute_cancel_dates(bookings: List[Booking], rep: Report, seed: int) -> int:
             when = b.booked_on
             missing_segments.add(b.target or "(unmapped)")
         upper = b.updated_on if b.updated_on is not None else b.arrival
+        if b.updated_on is not None and b.updated_on < b.booked_on:
+            rep.warnings["updated_on_before_booking"] += 1
+        upper = max(upper, b.booked_on)
         b.status_date = min(max(when, b.booked_on), upper)
         b.imputed_cancel = True
         done += 1
@@ -348,7 +351,10 @@ def impute_cancel_dates(bookings: List[Booking], rep: Report, seed: int) -> int:
 
 
 def cancel_bounds(bookings: List[Booking]) -> Tuple[List[Booking], List[Booking]]:
-    """Two copies for the report: imputed rows at their low bound and at their high bound."""
+    """Two copies for the report: imputed rows at their low bound and at their high bound.
+    Rows that were not imputed are not copied; the low list, the high list and the
+    input all share that same object, so a caller that wants to mutate one must
+    copy it first."""
     low, high = [], []
     for b in bookings:
         if b.imputed_cancel:

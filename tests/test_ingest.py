@@ -260,6 +260,43 @@ class ImputeCancelDates(unittest.TestCase):
         u1_low = next(x for x in low if x.booking_id == "U1"); u1_high = next(x for x in high if x.booking_id == "U1")
         self.assertEqual(u1_low.status_date, dt.date(2025, 3, 1)); self.assertEqual(u1_high.status_date, dt.date(2025, 3, 11))
 
+    def test_imputed_date_never_precedes_the_booking_day(self):
+        # UB has a segment (WEB/RETAIL) with dated cancellations to learn from, so it
+        # really goes through the draw, but its updated_on precedes its own booked_on.
+        rows = [_row(booking_id="C%d" % i, segment="WEB", status="cancelled", booked_on="2025-01-01",
+                     arrival="2025-01-21", status_date="2025-01-%02d" % (6 + i)) for i in range(5)]
+        rows.append(_row(booking_id="UB", segment="WEB", status="cancelled", booked_on="2025-03-01",
+                          arrival="2025-03-21", updated_on="2025-02-15"))
+        cfg = _cfg(); b, rep = ingest.read_bookings(_csv(rows), cfg); ingest.map_segments(b, cfg, rep)
+        ingest.impute_cancel_dates(b, rep, seed=1)
+        ub = next(x for x in b if x.booking_id == "UB")
+        self.assertGreaterEqual(ub.status_date, dt.date(2025, 3, 1))
+        self.assertEqual(rep.warnings["updated_on_before_booking"], 1)
+
+    def test_lead_of_zero_lands_on_the_booking_day(self):
+        # booked_on == arrival: nothing may divide by the zero-day lead, and the
+        # imputed date has nowhere to land but that single day.
+        rows = [_row(booking_id="C%d" % i, segment="WEB", status="cancelled", booked_on="2025-01-01",
+                     arrival="2025-01-21", status_date="2025-01-%02d" % (6 + i)) for i in range(5)]
+        rows.append(_row(booking_id="Z1", segment="WEB", status="cancelled",
+                          booked_on="2025-04-01", arrival="2025-04-01"))
+        cfg = _cfg(); b, rep = ingest.read_bookings(_csv(rows), cfg); ingest.map_segments(b, cfg, rep)
+        ingest.impute_cancel_dates(b, rep, seed=1)
+        z1 = next(x for x in b if x.booking_id == "Z1")
+        self.assertEqual(z1.status_date, dt.date(2025, 4, 1))
+
+    def test_ratio_of_one_lands_on_the_upper_bound_without_overshoot(self):
+        # A pool of a single dated cancellation whose delay equals its lead forces
+        # ratio == 1.0; the imputed date must land on the upper bound, not past it.
+        rows = [_row(booking_id="CD1", segment="CORP", status="cancelled",
+                     booked_on="2025-02-01", arrival="2025-02-11", status_date="2025-02-11")]
+        rows.append(_row(booking_id="R1", segment="CORP", status="cancelled",
+                          booked_on="2025-05-01", arrival="2025-05-21"))
+        cfg = _cfg(); b, rep = ingest.read_bookings(_csv(rows), cfg); ingest.map_segments(b, cfg, rep)
+        ingest.impute_cancel_dates(b, rep, seed=1)
+        r1 = next(x for x in b if x.booking_id == "R1")
+        self.assertEqual(r1.status_date, dt.date(2025, 5, 21))
+
 
 class InferSellableRooms(unittest.TestCase):
     def test_counts_stayed_and_in_house_including_nonrev_not_no_show_or_day_use(self):
