@@ -1,0 +1,102 @@
+import csv
+import datetime as dt
+import io
+import os
+import tempfile
+import unittest
+
+from pace import hotelconfig as HC
+from pace import ingest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HEADER = ["booking_id", "booked_on", "arrival", "nights", "rooms", "rate", "currency", "segment",
+          "rate_code", "source", "room_type", "company", "status", "status_date", "updated_on"]
+
+
+def _csv(rows, header=HEADER):
+    fd, path = tempfile.mkstemp(suffix=".csv")
+    with os.fdopen(fd, "w", newline="") as fh:
+        w = csv.writer(fh); w.writerow(header); w.writerows(rows)
+    return path
+
+
+def _cfg(**over):
+    cfg = HC.load_hotel_json(os.path.join(ROOT, "data", "sample-hotel.json"))
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _row(**kw):
+    base = dict(booking_id="B1", booked_on="2025-01-01", arrival="2025-02-01", nights="2", rooms="1",
+                rate="120", currency="EUR", segment="WEB", rate_code="", source="", room_type="STD",
+                company="", status="stayed", status_date="", updated_on="")
+    base.update(kw)
+    return [base[h] for h in HEADER]
+
+
+class ReadBookings(unittest.TestCase):
+    def test_reads_a_clean_row(self):
+        rows, rep = ingest.read_bookings(_csv([_row()]), _cfg())
+        self.assertEqual(rep.errors, [])
+        self.assertEqual(rows[0].nights, 2)
+        self.assertEqual(rows[0].arrival, dt.date(2025, 2, 1))
+
+    def test_departure_gives_nights(self):
+        header = [h for h in HEADER if h != "nights"] + ["departure"]
+        r = _row(); r = [v for h, v in zip(HEADER, r) if h != "nights"] + ["2025-02-04"]
+        rows, rep = ingest.read_bookings(_csv([r], header), _cfg())
+        self.assertEqual(rows[0].nights, 3)
+
+    def test_total_revenue_gives_rate(self):
+        header = [h for h in HEADER if h != "rate"] + ["total_revenue"]
+        r = [v for h, v in zip(HEADER, _row()) if h != "rate"] + ["300"]
+        rows, _ = ingest.read_bookings(_csv([r], header), _cfg())
+        self.assertEqual(rows[0].rate, 150.0)
+
+    def test_multi_room_rows_expand(self):
+        rows, _ = ingest.read_bookings(_csv([_row(rooms="3")]), _cfg())
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([b.booking_id for b in rows], ["B1#1", "B1#2", "B1#3"])
+        self.assertTrue(all(b.rooms == 1 for b in rows))
+
+    def test_day_use_is_allowed(self):
+        rows, rep = ingest.read_bookings(_csv([_row(nights="0")]), _cfg())
+        self.assertEqual(rep.errors, []); self.assertEqual(rows[0].nights, 0)
+
+    def test_errors_are_collected_up_to_fifty(self):
+        bad = [_row(booking_id="B%d" % i, arrival="not-a-date") for i in range(60)]
+        _, rep = ingest.read_bookings(_csv(bad), _cfg())
+        self.assertEqual(len(rep.errors), 50)
+        self.assertEqual(rep.errors[0][1], "arrival")
+        with self.assertRaises(ingest.IngestError):
+            rep.fail_if_errors()
+
+    def test_rate_outside_range_only_warns(self):
+        _, rep = ingest.read_bookings(_csv([_row(rate="0"), _row(booking_id="B2", rate="900")]), _cfg())
+        self.assertEqual(rep.errors, [])
+        self.assertEqual(rep.warnings["rate_nonpositive"], 1)
+        self.assertEqual(rep.warnings["rate_out_of_range"], 1)
+
+    def test_mixed_currency_needs_fx(self):
+        rows, rep = ingest.read_bookings(_csv([_row(), _row(booking_id="B2", currency="USD", rate="100")]), _cfg())
+        self.assertEqual(rep.errors, []); self.assertEqual(rows[1].rate, 92.0)
+        _, rep2 = ingest.read_bookings(_csv([_row(currency="GBP")]), _cfg(fx={}))
+        self.assertEqual(rep2.errors[0][1], "currency")
+
+    def test_cancel_dates_are_clamped_and_counted(self):
+        rows, rep = ingest.read_bookings(_csv([
+            _row(status="cancelled", status_date="2025-02-10"),
+            _row(booking_id="B2", status="cancelled", status_date="2024-12-01"),
+            _row(booking_id="B3", status="cancelled"),
+        ]), _cfg())
+        self.assertEqual(rows[0].status_date, dt.date(2025, 2, 1))
+        self.assertEqual(rows[1].status_date, dt.date(2025, 1, 1))
+        self.assertIsNone(rows[2].status_date)
+        self.assertEqual(rep.warnings["cancel_after_arrival"], 1)
+        self.assertEqual(rep.warnings["cancel_before_booking"], 1)
+        self.assertEqual(rep.warnings["cancelled_without_date"], 1)
+
+    def test_unknown_status_is_an_error(self):
+        _, rep = ingest.read_bookings(_csv([_row(status="checked")]), _cfg())
+        self.assertEqual(rep.errors[0][1], "status")
