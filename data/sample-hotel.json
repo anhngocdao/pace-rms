@@ -1,0 +1,35 @@
+{
+  "name": "Sample Hotel",
+  "currency": "EUR",
+  "fx": {"USD": 0.92},
+  "sellable_rooms": 40,
+  "rates_include_tax": "no",
+  "group_threshold_rooms": 5,
+  "detect_groups": true,
+  "rate_floor": 60,
+  "rate_ceiling": 400,
+  "rate_step": 4,
+  "base_rate": 140,
+  "variable_cost": 18,
+  "max_lead": 180,
+  "max_los": 7,
+  "sellout_threshold": 0.97,
+  "price_month_factor": {
+    "1": 0.8, "2": 0.8, "3": 0.9, "4": 1.0, "5": 1.05, "6": 1.15,
+    "7": 1.25, "8": 1.25, "9": 1.1, "10": 1.0, "11": 0.85, "12": 0.85
+  },
+  "demand_season_band": {
+    "1": "trough", "2": "trough", "3": "trough", "4": "shoulder", "5": "shoulder",
+    "6": "peak", "7": "peak", "8": "peak", "9": "peak", "10": "shoulder", "11": "trough", "12": "trough"
+  },
+  "segment_rate_ratio": {"CORP": 0.8, "GROUP": 0.7},
+  "segment_commission": {"RETAIL": 0.0, "OTA": 0.15, "CORP": 0.0, "GROUP": 0.0},
+  "events": [],
+  "segment_map_order": ["segment", "rate_code", "source"],
+  "segment_map": {
+    "segment": {"WEB": "RETAIL", "PHONE": "RETAIL", "BOOKING": "OTA", "EXPEDIA": "OTA",
+                "CORP": "CORP", "GROUP": "GROUP", "COMP": "NONREV", "HOUSE": "NONREV"},
+    "rate_code": {"BAR": "RETAIL", "CORP-*": "CORP", "TO-*": "CORP"},
+    "source": {"Walk-in": "RETAIL", "Agoda": "OTA"}
+  }
+}
