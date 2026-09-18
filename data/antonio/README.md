@@ -16,3 +16,5 @@ Convert:
 
 Outputs `h1-bookings.csv`, `h2-bookings.csv`, `h1-hotel.json`, `h2-hotel.json`
 and `audit.md`, all ignored by git.
+
+Pre-registration commit: d23024c
