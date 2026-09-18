@@ -358,6 +358,43 @@ class Ratios(unittest.TestCase):
         self.assertAlmostEqual(per_origin["OFFLINE_TO_CONTRACT"], 0.6, places=3)
         self.assertAlmostEqual(ratios["CORP"], 0.6, places=3)
 
+    def test_a_thin_public_rate_month_votes_once_it_is_properly_widened(self):
+        # July and August give CORPORATE a deliberately different ratio each
+        # (0.75 and 0.85, not the same value twice) so their two-element
+        # median cannot coincidentally survive a third value being added:
+        # with two equal values, whatever a third value is, the tied value
+        # stays the median, which would hide this exact bug the way the
+        # equal-weight fixture above hides a tie-break bug in a different
+        # function. September's public rate (DIRECT) basket has zero
+        # two-adult rows, so its own basket widens under
+        # price_month_factor's per-month rule, while CORPORATE has just as
+        # many rows in September as in the other two months. Before
+        # segment_rate_ratio read _monthly_basket_medians, its own
+        # basket(out_rows, BAR_BRANCHES, settings=settings) call still
+        # decided "strict" for the whole window (July's and August's
+        # two-adult rows alone clear min_basket_rows), so September never
+        # got a key in monthly_median(bar_rows) and could not vote no
+        # matter how much CORPORATE data it had; the median of the two
+        # surviving months, 0.75 and 0.85, is their average, 0.8. After the
+        # fix, September's own basket widens (via the same shared helper
+        # price_month_factor uses) and it votes with the ratio its widened,
+        # three-adult sample gives, moving the three-month median to 0.85.
+        rows = []
+        rows += [_arow(arrival_date_year="2015", arrival_date_month="July", adr="200") for _ in range(35)]
+        rows += [_arow(arrival_date_year="2015", arrival_date_month="July", market_segment="Corporate",
+                       adr="150") for _ in range(35)]
+        rows += [_arow(arrival_date_year="2015", arrival_date_month="August", adr="200") for _ in range(35)]
+        rows += [_arow(arrival_date_year="2015", arrival_date_month="August", market_segment="Corporate",
+                       adr="170") for _ in range(35)]
+        rows += [_arow(arrival_date_year="2015", arrival_date_month="September", adr="100",
+                       adults="3") for _ in range(10)]
+        rows += [_arow(arrival_date_year="2015", arrival_date_month="September", market_segment="Corporate",
+                       adr="160") for _ in range(35)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        ratios, per_origin, _ = CA.segment_rate_ratio(out, dict(SETTINGS, min_ratio_rows=8))
+        self.assertAlmostEqual(per_origin["CORPORATE"], 0.85, places=3)
+        self.assertAlmostEqual(ratios["CORP"], 0.85, places=3)
+
 
 class BarTest(unittest.TestCase):
     def _rows(self, contract_step):

@@ -313,8 +313,17 @@ def _weighted_median(pairs: List[Tuple[float, float]]) -> float:
 
 def segment_rate_ratio(out_rows, settings):
     need = int(settings.get("min_ratio_rows", 30))
-    bar_rows, _ = basket(out_rows, BAR_BRANCHES, settings=settings)
-    bar_med = monthly_median(bar_rows)
+    # The public-rate side reads the same per-month decision price_month_factor
+    # and base_rate read, so a month thin enough to widen still gets a real
+    # median here (and votes below) instead of silently missing a key the
+    # way a plain basket() plus monthly_median() would drop it. The row-count
+    # gate below still needs a row-level pool, so it reads the wide (party
+    # size not filtered) basket for the same month: that is the pool that
+    # actually produced bar_med[m] whether or not the month widened, since a
+    # non-widened month's wide pool is a superset of the exact rows its
+    # median came from and a widened month's wide pool is exactly those rows.
+    bar_med, _ = _monthly_basket_medians(out_rows, settings)
+    bar_rows, _ = basket(out_rows, BAR_BRANCHES, settings=settings, min_rows=10 ** 9)
     per_origin: Dict[str, float] = {}
     weights: Dict[str, float] = {}
     by_band: Dict[str, Dict[str, float]] = defaultdict(dict)
@@ -325,12 +334,12 @@ def segment_rate_ratio(out_rows, settings):
         for o in rows:
             by_m[_d(o).month].append(float(o["rate"]))
         monthly = [statistics.median(v) / bar_med[m] for m, v in by_m.items()
-                   if len(v) >= need and m in bar_med and sum(1 for o in bar_rows if _d(o).month == m) >= need]
+                   if len(v) >= need and sum(1 for o in bar_rows if _d(o).month == m) >= need]
         if monthly:
             per_origin[origin] = statistics.median(monthly)
             weights[origin] = float(sum(int(o["nights"]) for o in rows))
             for band in ("peak", "shoulder", "trough"):
-                sel = [statistics.median(v) / bar_med[m] for m, v in by_m.items() if bands[m] == band and m in bar_med and len(v) >= need]
+                sel = [statistics.median(v) / bar_med[m] for m, v in by_m.items() if bands[m] == band and len(v) >= need]
                 if sel:
                     by_band[origin][band] = statistics.median(sel)
     ratios = {}
