@@ -198,7 +198,16 @@ def monthly_median(rows) -> Dict[int, float]:
     return {m: statistics.median(v) for m, v in by_m.items() if v}
 
 
-def price_month_factor(out_rows, settings) -> Tuple[Dict[int, float], List[int]]:
+def _monthly_basket_medians(out_rows, settings) -> Tuple[Dict[int, float], List[int]]:
+    """The twelve per-month BAR basket medians, widening any month whose
+    two-adult pool is thinner than min_basket_rows and filling any month
+    with no BAR rows at all from the cross-month median of the months that
+    do have one. price_month_factor rescales these twelve numbers to a mean
+    of one; base_rate divides these same twelve numbers by that same
+    rescaling. Both read this one function so a month that price_month_factor
+    widens cannot silently disappear from base_rate's own per-month view,
+    which is what happened when base_rate had its own separate, whole-window
+    basket() call instead."""
     need = int(settings.get("min_basket_rows", 30))
     strict, _ = basket(out_rows, BAR_BRANCHES, settings=settings, min_rows=0)
     wide, _ = basket(out_rows, BAR_BRANCHES, settings=settings, min_rows=10 ** 9)
@@ -214,9 +223,13 @@ def price_month_factor(out_rows, settings) -> Tuple[Dict[int, float], List[int]]
             med[m] = statistics.median(float(o["rate"]) for o in w) if w else float("nan")
     known = [v for v in med.values() if v == v]
     if not known:
-        raise ConvertStop("no BAR (DIRECT/ONLINE_TA) rows in the warm-up window; price_month_factor has nothing to build on")
+        raise ConvertStop("no BAR (DIRECT/ONLINE_TA) rows in the warm-up window; nothing to build a monthly basket on")
     fill = statistics.median(known)
-    med = {m: (v if v == v else fill) for m, v in med.items()}
+    return {m: (v if v == v else fill) for m, v in med.items()}, widened
+
+
+def price_month_factor(out_rows, settings) -> Tuple[Dict[int, float], List[int]]:
+    med, widened = _monthly_basket_medians(out_rows, settings)
     mean = sum(med.values()) / 12
     if mean <= 0:
         raise ConvertStop("price_month_factor's monthly medians average to zero or less; check the adr column")
@@ -224,10 +237,7 @@ def price_month_factor(out_rows, settings) -> Tuple[Dict[int, float], List[int]]
 
 
 def base_rate(out_rows, factors, settings) -> float:
-    rows, _ = basket(out_rows, BAR_BRANCHES, settings=settings)
-    med = monthly_median(rows)
-    if not med:
-        raise ConvertStop("no BAR (DIRECT/ONLINE_TA) rows in the warm-up window; base_rate has nothing to build on")
+    med, _ = _monthly_basket_medians(out_rows, settings)
     return statistics.median(med[m] / factors[m] for m in med)
 
 
@@ -384,10 +394,14 @@ def bar_test(out_rows, settings) -> dict:
     return result
 
 
-def _majority_target_by_channel(out_rows) -> Dict[str, str]:
+def _majority_target_by_channel(out_rows, window=WARMUP) -> Dict[str, str]:
+    """What an Undefined-segment row of a given channel should map to, read
+    only from the warm-up window: this is a derived fact (Task 11's rule is
+    that history is read from the first twelve settled months and then
+    frozen), so a row from the scoring period must not be able to shift it."""
     votes: Dict[str, Counter] = defaultdict(Counter)
     for o in out_rows:
-        if o["_branch"].startswith("UNDEFINED"):
+        if o["_branch"].startswith("UNDEFINED") or not _in_window(o, window):
             continue
         votes[o["_raw"]["distribution_channel"]][TARGET_OF.get(o["_branch"], "CORP")] += 1
     return {ch: c.most_common(1)[0][0] for ch, c in votes.items()}
@@ -408,7 +422,7 @@ def derive_hotel_json(out_rows, hotel_code: str, settings: dict) -> dict:
     if hotel_code == "H1" and max_lead < 120:
         notes.append("max_lead raised from %d to 120 so the 120-day mark can run" % max_lead)
         max_lead = 120
-    majority = _majority_target_by_channel(out_rows)
+    majority = _majority_target_by_channel(out_rows, window=WARMUP)
     seg_map = dict(TARGET_OF)
     seg_map["OFFLINE_TO_TRANSIENT"] = "OTA" if verdict["verdict"] == "OTA" else "CORP"
     for ch, branch in CHANNEL_BRANCH.items():

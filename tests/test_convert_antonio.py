@@ -5,6 +5,7 @@ import statistics
 import tempfile
 import unittest
 from collections import Counter
+from unittest import mock
 
 from tools import convert_antonio as CA
 from pace import hotelconfig as HC
@@ -141,6 +142,25 @@ class TransientParty(unittest.TestCase):
         self.assertTrue(all(o["_branch"] == "TP_CLUSTER" for o in out))
 
 
+class ChannelMajorityWindow(unittest.TestCase):
+    def test_majority_by_channel_reads_only_the_warm_up_window(self):
+        # Inside the warm-up window, GDS-channel rows are mostly Corporate
+        # (target CORP). Outside it (after 2016-06-30), the same channel is
+        # mostly Direct (target RETAIL) instead. Task 11's rule is that a
+        # derived fact is read from the first twelve settled months and then
+        # frozen, so the derived mapping must follow the in-window majority
+        # (CORP) and must not flip because of what happens after scoring
+        # starts, even though the out-of-window rows outnumber the in-window
+        # ones here.
+        rows = [_arow(market_segment="Corporate", distribution_channel="GDS",
+                       arrival_date_year="2016", arrival_date_month="January") for _ in range(5)]
+        rows += [_arow(market_segment="Direct", distribution_channel="GDS",
+                        arrival_date_year="2016", arrival_date_month="August") for _ in range(10)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        majority = CA._majority_target_by_channel(out)
+        self.assertEqual(majority["GDS"], "CORP")
+
+
 class Basket(unittest.TestCase):
     def _rows(self):
         rows = []
@@ -173,14 +193,56 @@ class Basket(unittest.TestCase):
         self.assertLess(max(float(r["rate"]) for r in rows), 9999)
 
     def test_factors_have_mean_one_and_base_rate_matches_by_construction(self):
+        # This fixture deliberately widens February (its two-adult rows are
+        # replaced with a smaller three-adult pool, the same trick as
+        # test_thin_month_widens_adults_filter below). factors[m] is always
+        # med[m] / mean by construction, so med[m] / factors[m] collapses to
+        # exactly mean for any month whose med[m] agrees with the med used to
+        # build factors, which every one of these twelve months' does once
+        # both functions read _monthly_basket_medians: this checks that
+        # identity holds over the full, all-twelve-months set, and that
+        # price_month_factor's own widened list matches the shared helper's.
+        # It would hold just as well for eleven months as for twelve, since
+        # a median of otherwise-identical values does not move when one
+        # entry is missing, so it cannot by itself prove base_rate reuses
+        # the per-month decision rather than rebuilding its own; that is
+        # what test_base_rate_reuses_price_month_factors_shared_helper below
+        # is for.
         out = self._rows()
+        out = [o for o in out if not (o["arrival"].startswith("2016-02") and o["_raw"]["adults"] == "2")]
+        out += [dict(o, arrival="2016-02-10", _raw=dict(o["_raw"], adults="3")) for o in out[:35]]
         settings = dict(SETTINGS, min_basket_rows=30)
         factors, widened = CA.price_month_factor(out, settings)
+        self.assertIn(2, widened)
         self.assertAlmostEqual(sum(factors.values()) / 12, 1.0, places=6)
-        self.assertEqual(widened, [])
         br = CA.base_rate(out, factors, settings)
-        med = CA.monthly_median(CA.basket(out, CA.BAR_BRANCHES, settings=settings)[0])
+        med, med_widened = CA._monthly_basket_medians(out, settings)
+        self.assertEqual(sorted(med), list(range(1, 13)))
+        self.assertEqual(med_widened, widened)
         self.assertAlmostEqual(br, statistics.median(med[m] / factors[m] for m in med), places=6)
+
+    def test_base_rate_reuses_price_month_factors_shared_helper(self):
+        # base_rate's own median-of-ratios collapses to the same constant
+        # regardless of whether a widened month is missing or present (see
+        # the note above), so no fixture built purely from _arow rows and
+        # checked only by base_rate's return value can prove it reuses
+        # price_month_factor's per-month widen decisions rather than
+        # rebuilding them from a fresh whole-window basket() call: dropping
+        # or mis-computing a minority of twelve near-identical ratios never
+        # moves their median. What can be checked directly, since
+        # _monthly_basket_medians is the one place either function may
+        # compute a month's basket median, is that base_rate actually calls
+        # it, the same way price_month_factor does, instead of calling
+        # basket() itself for the whole window and losing a widened month's
+        # entry in the process (which is exactly the bug: base_rate used to
+        # call basket(out_rows, BAR_BRANCHES, settings=settings) directly).
+        out = self._rows()
+        settings = dict(SETTINGS, min_basket_rows=30)
+        factors, _ = CA.price_month_factor(out, settings)
+        with mock.patch("tools.convert_antonio._monthly_basket_medians",
+                        wraps=CA._monthly_basket_medians) as spy:
+            CA.base_rate(out, factors, settings)
+        spy.assert_called_once_with(out, settings)
 
     def test_thin_month_widens_adults_filter(self):
         out = self._rows()
@@ -195,17 +257,61 @@ class Basket(unittest.TestCase):
         self.assertEqual(CA.rate_step(40.0, 220.0), 2.0)
 
 
+class MaxLeadFloor(unittest.TestCase):
+    def _rows(self):
+        rows = []
+        for m in range(7, 13):
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=list(CA.MONTHS)[m - 1],
+                           adr=str(100 + m)) for _ in range(20)]
+        for m in range(1, 7):
+            rows += [_arow(arrival_date_year="2016", arrival_date_month=list(CA.MONTHS)[m - 1],
+                           adr=str(100 + m)) for _ in range(20)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        return out
+
+    def test_h1_max_lead_is_floored_at_120_but_h2_is_not(self):
+        # Every row in this fixture keeps _arow's default lead_time="30", so
+        # the raw p99 lead time is 30 for both hotels. The 120-day mark the
+        # pilot plan runs against only works if H1 is floored up to at least
+        # 120; H2 has no such floor and should keep the raw, unfloored value.
+        out = self._rows()
+        settings = dict(SETTINGS, min_basket_rows=15, min_ratio_rows=10, floor_ceiling_widen=0.10,
+                        sellout_threshold=0.95, ota_commission_main=0.15, variable_cost_low_share=0.35,
+                        bar_corr_threshold=0.6)
+        derived_h1 = CA.derive_hotel_json(out, "H1", settings)
+        self.assertEqual(derived_h1["max_lead"], 120)
+        self.assertTrue(any("120" in n for n in derived_h1["_derivation"]["notes"]))
+        derived_h2 = CA.derive_hotel_json(out, "H2", settings)
+        self.assertEqual(derived_h2["max_lead"], 30)
+
+
 class Bands(unittest.TestCase):
     def test_top_four_three_five_split(self):
         rows = []
         for m in range(1, 13):
             n = 5 + m   # more demand later in the year
             rows += [_arow(arrival_date_year="2016" if m <= 6 else "2015", arrival_date_month=list(CA.MONTHS)[m - 1]) for _ in range(n)]
+        # January additionally carries a heavy load of ordinary
+        # cancellations (not Non Refund, so _gross_nights still counts
+        # them). Gross demand counts a cancelled request the same as a
+        # stay; occupancy counts only rows that actually stayed. With every
+        # row a plain stay, the two series would count exactly the same
+        # room nights and could never disagree, so a mistaken implementation
+        # that ranked bands from occupancy instead of gross demand (exactly
+        # the mistake the design warns against) would pass unnoticed. This
+        # pushes January to the top of gross demand while its occupancy
+        # stays at the bottom, which is the situation the design says to
+        # rank by gross for.
+        rows += [_arow(arrival_date_year="2016", arrival_date_month="January",
+                       reservation_status="Canceled", is_canceled="1") for _ in range(200)]
         out, _, _ = CA.branch_rows(rows, SETTINGS)
         gross, occ, _ = CA.demand_season_band(out)
         labels = Counter(gross.values())
         self.assertEqual((labels["peak"], labels["shoulder"], labels["trough"]), (4, 3, 5))
-        self.assertEqual(gross[12], "peak"); self.assertEqual(gross[1], "trough")
+        self.assertEqual(gross[12], "peak")
+        self.assertEqual(gross[1], "peak")     # the cancellations, not the stays, earn January this
+        self.assertEqual(occ[1], "trough")     # occupancy only counts the few rows that actually stayed
+        self.assertNotEqual(gross[1], occ[1])
 
     def test_non_refund_excluded_from_gross(self):
         rows = [_arow(arrival_date_year="2015", arrival_date_month="August") for _ in range(5)]
@@ -229,6 +335,28 @@ class Ratios(unittest.TestCase):
         self.assertAlmostEqual(per_origin["CORPORATE"], 0.8, places=3)
         self.assertAlmostEqual(per_origin["OFFLINE_TO_CONTRACT"], 0.6, places=3)
         self.assertAlmostEqual(ratios["CORP"], 0.7, places=3)   # equal room nights, weighted median of the two origins
+
+    def test_corp_ratio_weights_by_room_nights_not_by_row_count(self):
+        # Same per-origin ratios as above (0.8 and 0.6), but this time
+        # CORPORATE is all one-night stays and OFFLINE_TO_CONTRACT is all
+        # nine-night stays, so the two origins carry the same row count but
+        # wildly different room-nights (105 vs 945). A weighted median that
+        # actually weights by room-nights must land on OFFLINE_TO_CONTRACT's
+        # own ratio, not on the row-count-weighted (here: equal-row-count)
+        # plain average of 0.7 the tie-break case above exercises.
+        rows = []
+        for m in ("July", "August", "September"):
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=m, adr="200") for _ in range(35)]
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=m, market_segment="Corporate", adr="160",
+                           stays_in_weekend_nights="0", stays_in_week_nights="1") for _ in range(35)]
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=m, market_segment="Offline TA/TO",
+                           customer_type="Contract", adr="120",
+                           stays_in_weekend_nights="3", stays_in_week_nights="6") for _ in range(35)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        ratios, per_origin, _ = CA.segment_rate_ratio(out, dict(SETTINGS, min_ratio_rows=30))
+        self.assertAlmostEqual(per_origin["CORPORATE"], 0.8, places=3)
+        self.assertAlmostEqual(per_origin["OFFLINE_TO_CONTRACT"], 0.6, places=3)
+        self.assertAlmostEqual(ratios["CORP"], 0.6, places=3)
 
 
 class BarTest(unittest.TestCase):
@@ -260,6 +388,41 @@ class BarTest(unittest.TestCase):
     def test_verdict_needs_both_demeanings_to_agree(self):
         res = CA.bar_test(self._rows(contract_step=True), dict(SETTINGS, bar_corr_threshold=0.6, min_basket_rows=5))
         self.assertIn(res["verdict"], ("CORP", "inconclusive"))
+
+    def _rows_floating_with_bar(self):
+        # Same week/month/day scaffolding as _rows above, but the Offline
+        # TA/TO transient price is a fixed proportion of that week's public
+        # rate rather than flat or stepped, so it genuinely floats with BAR:
+        # a constant positive multiple of a series correlates perfectly with
+        # it after either demeaning, which is the one case neither existing
+        # test produces (the other fixture's Offline TA/TO series is either
+        # flat or a mid-month step, never one that moves with BAR itself).
+        rows = []
+        for week in range(27, 51):
+            m = 7 + (week - 27) // 4
+            d = 1 + ((week - 27) % 4) * 7
+            bar = 150 + 20 * ((week % 4) - 1.5)
+            to = round(bar * 0.85, 2)
+            for _ in range(8):
+                rows.append(_arow(arrival_date_year="2015", arrival_date_month=list(CA.MONTHS)[m - 1],
+                                  arrival_date_day_of_month=str(d), arrival_date_week_number=str(week), adr=str(bar)))
+                rows.append(_arow(arrival_date_year="2015", arrival_date_month=list(CA.MONTHS)[m - 1],
+                                  arrival_date_day_of_month=str(d), arrival_date_week_number=str(week),
+                                  market_segment="Offline TA/TO", customer_type="Transient", adr=str(to)))
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        return out
+
+    def test_cell_that_floats_with_bar_maps_to_ota(self):
+        out = self._rows_floating_with_bar()
+        settings = dict(SETTINGS, bar_corr_threshold=0.6, min_basket_rows=5, min_ratio_rows=5,
+                        floor_ceiling_widen=0.10, sellout_threshold=0.95, ota_commission_main=0.15,
+                        variable_cost_low_share=0.35)
+        res = CA.bar_test(out, settings)
+        self.assertEqual(res["verdict"], "OTA")
+        # And the wiring: derive_hotel_json must actually write that verdict
+        # into segment_map, not just compute it and drop it.
+        derived = CA.derive_hotel_json(out, "H2", settings)
+        self.assertEqual(derived["segment_map"]["segment"]["OFFLINE_TO_TRANSIENT"], "OTA")
 
 
 class DerivedHotelJsonIsLoadable(unittest.TestCase):
