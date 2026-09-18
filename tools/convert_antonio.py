@@ -15,6 +15,8 @@ import sys
 from collections import Counter, defaultdict
 from typing import Dict, List, Tuple
 
+from pace import ingest as PI
+
 MONTHS = {m: i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June", "July", "August",
      "September", "October", "November", "December"], start=1)}
@@ -32,6 +34,15 @@ class ConvertStop(RuntimeError):
 
 def _empty(v: str) -> bool:
     return v is None or v.strip() in ("", "NULL", "NA")
+
+
+def _norm(v: str) -> str:
+    """Case- and whitespace-insensitive key for a categorical value such as
+    customer_type. A booking-log source at schema version 0 has not been
+    checked against a real PMS export's own capitalisation, so a rule built
+    against one file's spelling (Transient-party) must not go silently dead
+    against another's (Transient-Party) or a stray leading space."""
+    return (v or "").strip().lower()
 
 
 def arrival_of(r: dict) -> dt.date:
@@ -56,7 +67,7 @@ def status_of(r: dict) -> Tuple[str, str]:
 def cluster_transient_party(rows: List[dict], threshold: int) -> set:
     groups: Dict[tuple, List[int]] = defaultdict(list)
     for i, r in enumerate(rows):
-        if r["customer_type"] != "Transient-party":
+        if _norm(r["customer_type"]) != "transient-party":
             continue
         agent = "" if _empty(r["agent"]) else r["agent"].strip()
         company = "" if _empty(r["company"]) else r["company"].strip()
@@ -78,7 +89,7 @@ def _table_branch(r: dict) -> str:
     if seg == "Aviation":
         return "AVIATION"
     if seg == "Offline TA/TO":
-        return "OFFLINE_TO_CONTRACT" if ct == "Contract" else "OFFLINE_TO_TRANSIENT"
+        return "OFFLINE_TO_CONTRACT" if _norm(ct) == "contract" else "OFFLINE_TO_TRANSIENT"
     if seg == "Undefined":
         return CHANNEL_BRANCH.get(r["distribution_channel"], "UNDEFINED_FALLBACK")
     raise ValueError("unknown market_segment %r" % seg)
@@ -102,7 +113,7 @@ def branch_rows(rows: List[dict], settings: dict) -> Tuple[List[dict], Counter, 
             branch = "COMP"
         elif seg == "Groups":
             branch = "GROUPS"
-        elif seg == "Offline TA/TO" and ct == "Group":
+        elif seg == "Offline TA/TO" and _norm(ct) == "group":
             branch = "OFFLINE_TO_GROUP"
         elif i in clustered:
             branch = "TP_CLUSTER"
@@ -459,6 +470,23 @@ def derive_hotel_json(out_rows, hotel_code: str, settings: dict) -> dict:
     }
 
 
+def _to_booking(o: dict, row_no: int) -> PI.Booking:
+    """One booking-log row, already produced by branch_rows, as the same
+    Booking dataclass pace.ingest.infer_sellable_rooms reads. This calls the
+    real inference rather than a second copy of it, so the audit's duplicate
+    room count and pace/ingest.py's own stay only ever disagree because the
+    input differs (with duplicates kept versus dropped), never because the
+    counting logic drifted apart."""
+    def _pd(s):
+        return dt.date.fromisoformat(s) if s else None
+    return PI.Booking(
+        booking_id=o["booking_id"], booked_on=dt.date.fromisoformat(o["booked_on"]),
+        arrival=dt.date.fromisoformat(o["arrival"]), nights=int(o["nights"]), rooms=int(o["rooms"]),
+        rate=float(o["rate"]), currency=o["currency"], segment=o["segment"], rate_code=o["rate_code"],
+        source=o["source"], room_type=o["room_type"], company=o["company"], status=o["status"],
+        status_date=_pd(o["status_date"]), updated_on=_pd(o["updated_on"]), row=row_no)
+
+
 def audit(out_rows, hotel_code: str, settings: dict, derived: dict) -> str:
     raw = [o["_raw"] for o in out_rows]
     counts = Counter(o["_branch"] for o in out_rows)
@@ -475,7 +503,26 @@ def audit(out_rows, hotel_code: str, settings: dict, derived: dict) -> str:
     dup = Counter(tuple(sorted(r.items())) for r in raw)
     dups = [k for k, n in dup.items() if n > 1]
     dup_status = Counter(dict(k)["reservation_status"] for k in dups)
-    lines += ["", "## Duplicate rows", "", "- identical rows appearing more than once: %d, by status %s" % (len(dups), dict(dup_status))]
+    extra_copies = sum(dup[k] - 1 for k in dups)
+    shared = sum(1 for k in dups if not (_empty(dict(k)["agent"]) and _empty(dict(k)["company"])))
+    seen = set()
+    deduped = []
+    for o in out_rows:
+        key = tuple(sorted(o["_raw"].items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(o)
+    with_dup = PI.infer_sellable_rooms([_to_booking(o, i) for i, o in enumerate(out_rows)])
+    without_dup = PI.infer_sellable_rooms([_to_booking(o, i) for i, o in enumerate(deduped)])
+    lines += ["", "## Duplicate rows", "",
+              "- identical rows appearing more than once: %d, extra copies beyond the first: %d, by status %s"
+              % (len(dups), extra_copies, dict(dup_status)),
+              "- of those, %d share a non-empty agent or company with the other copy on the same arrival "
+              "(a check on the group explanation: an identical row is more likely a second room of the "
+              "same party than an anonymisation collision when it carries an agent or company code)" % shared,
+              "- inferred sellable rooms with duplicates: %d (busiest night %s); without duplicates: %d (busiest night %s)"
+              % (with_dup.rooms, with_dup.peak_night, without_dup.rooms, without_dup.peak_night)]
     hb = [float(o["rate"]) for o in out_rows if o["_raw"]["meal"] == "HB" and o["status"] == "stayed" and float(o["rate"]) > 0]
     bb = [float(o["rate"]) for o in out_rows if o["_raw"]["meal"] == "BB" and o["status"] == "stayed" and float(o["rate"]) > 0]
     if hb and bb:

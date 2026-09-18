@@ -90,6 +90,17 @@ class RuleOrder(unittest.TestCase):
         b, _ = self._branches(rows)
         self.assertEqual(b, ["ONLINE_TA", "CORPORATE", "AVIATION", "OFFLINE_TO_CONTRACT", "OFFLINE_TO_TRANSIENT"])
 
+    def test_group_and_contract_customer_type_are_case_and_whitespace_insensitive(self):
+        # Same risk as Transient-Party: a vendor's own capitalisation of
+        # Group or Contract must not silently fall through to the wrong
+        # branch (OFFLINE_TO_GROUP would become OFFLINE_TO_TRANSIENT, and a
+        # non-group row wrongly cased as "group" would need to NOT become a
+        # group either, which the other-case-insensitive comparisons below
+        # both exercise).
+        b, _ = self._branches([_arow(market_segment="Offline TA/TO", customer_type=" group "),
+                                _arow(market_segment="Offline TA/TO", customer_type="CONTRACT")])
+        self.assertEqual(b, ["OFFLINE_TO_GROUP", "OFFLINE_TO_CONTRACT"])
+
     def test_undefined_goes_by_channel(self):
         rows = [_arow(market_segment="Undefined", distribution_channel="TA/TO"),
                 _arow(market_segment="Undefined", distribution_channel="Undefined")]
@@ -111,7 +122,11 @@ class RuleOrder(unittest.TestCase):
 
 class TransientParty(unittest.TestCase):
     def _tp(self, n, **kw):
-        return [_arow(customer_type="Transient-party", market_segment="Offline TA/TO", **kw) for _ in range(n)]
+        # "Transient-Party" (capital P) is the real dataset's own spelling;
+        # see test_differently_cased_customer_type_still_clusters for the
+        # guard that a vendor's own capitalisation cannot silently disable
+        # the whole clustering rule the way it did before this was fixed.
+        return [_arow(customer_type="Transient-Party", market_segment="Offline TA/TO", **kw) for _ in range(n)]
 
     def test_cluster_at_threshold_becomes_group(self):
         out, _, _ = CA.branch_rows(self._tp(10, agent="9", company="NULL"), SETTINGS)
@@ -140,6 +155,15 @@ class TransientParty(unittest.TestCase):
         rows = self._tp(5, agent="9", company="NULL", adr="0") + self._tp(5, agent="9", company="NULL")
         out, _, _ = CA.branch_rows(rows, SETTINGS)
         self.assertTrue(all(o["_branch"] == "TP_CLUSTER" for o in out))
+
+    def test_differently_cased_customer_type_still_clusters(self):
+        # The real file spells this value "Transient-Party"; a differently
+        # cased or whitespace-padded variant from some other PMS export must
+        # still be recognised, so this is a guard on the comparison itself
+        # rather than on this one file's own spelling.
+        rows = [_arow(customer_type=" TRANSIENT-party ", market_segment="Offline TA/TO", agent="9", company="NULL")
+                for _ in range(10)]
+        self.assertEqual(len(CA.cluster_transient_party(rows, 10)), 10)
 
 
 class ChannelMajorityWindow(unittest.TestCase):
