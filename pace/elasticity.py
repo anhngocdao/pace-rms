@@ -36,7 +36,7 @@ import datetime as dt
 import math
 from collections import defaultdict
 from statistics import fmean
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .calendar import EventCalendar, demand_class
 from .config import SEGMENTS, Hotel
@@ -73,7 +73,8 @@ def prior_k(code: str) -> float:
 
 def fit_segment(ledger: Ledger, hotel: Hotel, cal: EventCalendar,
                 completed: Iterable[dt.date], code: str,
-                sellout_threshold: float = 0.97) -> Tuple[float, int]:
+                sellout_threshold: Optional[float] = None) -> Tuple[float, int]:
+    sellout_threshold = hotel.sellout_threshold if sellout_threshold is None else sellout_threshold
     if not SEGMENTS[code].floats_with_bar:
         # Contracted business is quoted a rate the engine does not set, so
         # there is no price variation to read a response from.  Its

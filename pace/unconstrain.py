@@ -19,7 +19,7 @@ import datetime as dt
 import math
 from collections import defaultdict
 from statistics import fmean, pstdev
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .calendar import EventCalendar, demand_class
 from .config import SEGMENT_ORDER, Hotel
@@ -103,7 +103,8 @@ MIN_ACCEPTANCE = 0.25       # keeps the price normalisation well conditioned
 
 
 def class_demand(ledger: Ledger, completed: Iterable[dt.date], hotel: Hotel,
-                 cal: EventCalendar, response, sellout_threshold: float = 0.97) -> ClassDemand:
+                 cal: EventCalendar, response,
+                 sellout_threshold: Optional[float] = None) -> ClassDemand:
     """Unconstrained demand per class, restated at the reference rate.
 
     Two corrections, applied in this order and for different reasons.
@@ -119,6 +120,7 @@ def class_demand(ledger: Ledger, completed: Iterable[dt.date], hotel: Hotel,
     expectation above the censoring point and the whole class is re-estimated
     until it settles.
     """
+    sellout_threshold = hotel.sellout_threshold if sellout_threshold is None else sellout_threshold
     raw: Dict[tuple, List[Tuple[float, bool]]] = defaultdict(list)
     booked_raw: Dict[tuple, List[float]] = defaultdict(list)
     rooms = hotel.rooms
