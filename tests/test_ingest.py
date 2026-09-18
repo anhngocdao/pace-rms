@@ -139,3 +139,81 @@ class ReadBookings(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].booking_id, "B1")
         self.assertEqual(rep.errors[0][1], "rate")
+
+
+class MapSegments(unittest.TestCase):
+    def _mapped(self, *rows, **over):
+        cfg = _cfg(**over)
+        bookings, rep = ingest.read_bookings(_csv(list(rows)), cfg)
+        ingest.map_segments(bookings, cfg, rep)
+        return bookings, rep
+
+    def test_first_key_wins_when_present(self):
+        b, _ = self._mapped(_row(segment="BOOKING", rate_code="BAR"))
+        self.assertEqual(b[0].target, "OTA")
+
+    def test_default_value_falls_through_to_rate_code(self):
+        b, _ = self._mapped(_row(segment="DEFAULT", rate_code="BAR"))
+        self.assertEqual(b[0].target, "RETAIL")
+
+    def test_prefix_needs_the_star(self):
+        b, _ = self._mapped(_row(segment="", rate_code="CORP-ACME"))
+        self.assertEqual(b[0].target, "CORP")
+        b2, rep2 = self._mapped(_row(segment="", rate_code="BARX"))
+        self.assertIsNone(b2[0].target); self.assertEqual(rep2.unmapped["rate_code=BARX"], 1)
+
+    def test_source_is_the_last_key(self):
+        b, _ = self._mapped(_row(segment="", rate_code="", source="Agoda"))
+        self.assertEqual(b[0].target, "OTA")
+
+    def test_unmapped_values_are_grouped_not_listed_per_row(self):
+        rows = [_row(booking_id="B%d" % i, segment="NEWCODE") for i in range(120)]
+        _, rep = self._mapped(*rows)
+        self.assertEqual(rep.unmapped["segment=NEWCODE"], 120)
+        self.assertEqual(rep.errors, [])
+        with self.assertRaises(ingest.IngestError) as cm:
+            rep.fail_if_errors()
+        self.assertIn("NEWCODE", str(cm.exception))
+
+    def test_order_is_configurable(self):
+        b, _ = self._mapped(_row(segment="BOOKING", rate_code="BAR"), segment_map_order=["rate_code", "segment"])
+        self.assertEqual(b[0].target, "RETAIL")
+
+
+class DetectGroups(unittest.TestCase):
+    def _run(self, rows, **over):
+        cfg = _cfg(**over)
+        bookings, rep = ingest.read_bookings(_csv(rows), cfg)
+        ingest.map_segments(bookings, cfg, rep)
+        n = ingest.detect_groups(bookings, cfg, rep)
+        return bookings, n
+
+    def test_same_company_day_arrival_nights_at_threshold_is_a_group(self):
+        rows = [_row(booking_id="B%d" % i, segment="CORP", company="ACME") for i in range(5)]
+        b, n = self._run(rows)
+        self.assertEqual(n, 5); self.assertTrue(all(x.target == "GROUP" for x in b))
+
+    def test_company_alone_is_not_a_group(self):
+        rows = [_row(booking_id="B%d" % i, segment="CORP", company="ACME", arrival="2025-02-%02d" % (i + 1)) for i in range(5)]
+        b, n = self._run(rows)
+        self.assertEqual(n, 0); self.assertTrue(all(x.target == "CORP" for x in b))
+
+    def test_different_booking_days_do_not_cluster(self):
+        rows = [_row(booking_id="B%d" % i, segment="BOOKING", company="AGENT9", booked_on="2025-01-%02d" % (i + 1)) for i in range(6)]
+        _, n = self._run(rows)
+        self.assertEqual(n, 0)
+
+    def test_nonrev_rows_stay_nonrev(self):
+        rows = [_row(booking_id="B%d" % i, segment="COMP", company="ACME", rate="0") for i in range(5)]
+        b, n = self._run(rows)
+        self.assertEqual(n, 0); self.assertTrue(all(x.target == "NONREV" for x in b))
+
+    def test_empty_company_never_matches(self):
+        rows = [_row(booking_id="B%d" % i, segment="WEB", company="") for i in range(8)]
+        _, n = self._run(rows)
+        self.assertEqual(n, 0)
+
+    def test_detect_groups_can_be_switched_off(self):
+        rows = [_row(booking_id="B%d" % i, segment="CORP", company="ACME") for i in range(5)]
+        _, n = self._run(rows, detect_groups=False)
+        self.assertEqual(n, 0)

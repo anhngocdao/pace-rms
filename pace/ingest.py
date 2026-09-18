@@ -5,9 +5,9 @@ simulator builds; the engine cannot tell the two apart, which is the point.
 """
 import csv
 import datetime as dt
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .hotelconfig import HotelConfig
 
@@ -256,3 +256,57 @@ def _parse_row(i: int, r: dict, cfg: HotelConfig, rep: Report) -> Optional[Booki
         company=(r.get("company") or "").strip(), status=status, status_date=status_date,
         updated_on=dates["updated_on"], row=i,
     )
+
+
+def _lookup(table: Dict[str, str], value: str) -> Optional[str]:
+    if value in table:
+        return table[value]
+    for key, target in table.items():
+        if key.endswith("*") and value.startswith(key[:-1]):
+            return target
+    return None
+
+
+def map_segments(bookings: List[Booking], cfg: HotelConfig, rep: Report) -> None:
+    """segment_map_order decides which columns are tried; a row falls through to
+    the next key only when its value is empty or absent from that key's table.
+    No match anywhere is an error, grouped by value."""
+    for b in bookings:
+        target = None
+        tried = []
+        for key in cfg.segment_map_order:
+            value = getattr(b, key, "")
+            if not value:
+                continue
+            tried.append("%s=%s" % (key, value))
+            target = _lookup(cfg.segment_map.get(key, {}), value)
+            if target is not None:
+                break
+        if target is None:
+            rep.unmapped[tried[0] if tried else "(all mapping columns empty)"] += 1
+            continue
+        if target not in TARGETS:
+            raise IngestError("hotel.json maps to unknown target %r" % target)
+        b.target = target
+
+
+def detect_groups(bookings: List[Booking], cfg: HotelConfig, rep: Report) -> int:
+    """Same company, booked on the same day, same arrival and nights, reaching
+    the threshold: one decision, many rooms.  Runs after mapping and never
+    touches NONREV rows.  Off when the converter already decided groups."""
+    if not cfg.detect_groups:
+        return 0
+    clusters: Dict[tuple, List[Booking]] = defaultdict(list)
+    for b in bookings:
+        if b.target in (None, "NONREV", "GROUP") or not b.company:
+            continue
+        clusters[(b.company, b.booked_on, b.arrival, b.nights)].append(b)
+    changed = 0
+    for members in clusters.values():
+        if len(members) >= cfg.group_threshold_rooms:
+            for b in members:
+                b.target = "GROUP"
+                changed += 1
+    if changed:
+        rep.notes.append("%d rows recognised as group rooms by company, booking day, arrival and nights" % changed)
+    return changed
