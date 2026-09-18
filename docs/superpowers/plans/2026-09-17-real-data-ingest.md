@@ -16,7 +16,7 @@
 - Python 3.9: no `match`, no `X | Y` unions, no `tomllib`, no `str.removeprefix` reliance.
 - No engine algorithm changes. Only the four seams named above; every seam keeps the current constant as its default on the simulation path.
 - After every task: `python3 run.py test` green, and `python3 run.py build --quick` prints static 64.50, ladder 78.80, engine 82.98.
-- Commit voice: one sentence with a verb saying what is now true (see `git log --oneline`). End every commit message with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- Commit voice: one sentence with a verb saying what is now true (see `git log --oneline`). End every commit message with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 - No em dashes or en dashes anywhere (code comments, docs, messages).
 - `hotels.csv` is downloaded only in Task 13, only after Elle says yes in chat, and never committed (`.gitignore`).
 - Work on branch `ingest`. Never commit to `main`.
@@ -76,7 +76,7 @@ Expected: under 40 lines, count 0.
 git add docs/adr/0007-hotel-facts-are-configuration.md
 git commit -m "Four facts about a hotel are named as configuration before any of them moves out of a constant
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -227,7 +227,7 @@ Expected: new tests PASS; suite OK; RevPAR 64.50 / 78.80 / 82.98.
 git add pace/calendar.py tests/test_calendar_config.py
 git commit -m "Seasonality is an object the engine reads, with Toronto's table as the thing it reads by default
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -330,7 +330,7 @@ Expected: PASS; OK; 64.50 / 78.80 / 82.98.
 git add pace/config.py pace/unconstrain.py pace/elasticity.py pace/experiment.py tests/test_hotelconfig.py
 git commit -m "The sell-out threshold belongs to the hotel and the contract ratios can be set for one
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -577,7 +577,7 @@ Edit line 2 of `docs/adr/0007-hotel-facts-are-configuration.md` to `Status: Acce
 git add pace/hotelconfig.py tests/test_hotelconfig.py tests/test_golden.py tests/fixtures/toronto-hotel.json docs/adr/0007-hotel-facts-are-configuration.md
 git commit -m "A hotel.json that spells out Toronto reproduces the golden numbers, so the configuration path is the real one
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -673,7 +673,7 @@ antonio/audit.md
 git add docs/booking-log.md data/sample-bookings.csv data/sample-hotel.json data/.gitignore
 git commit -m "The booking log has a written shape and a sample a hotel can compare its export against
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1053,7 +1053,7 @@ Expected: all PASS; suite OK (stdlib scan includes the new module).
 git add pace/ingest.py tests/test_ingest.py
 git commit -m "A booking log is read row by row, and every bad row is reported before anything stops
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1222,7 +1222,7 @@ Expected: PASS; OK.
 git add pace/ingest.py tests/test_ingest.py
 git commit -m "A hotel's own codes reach the four segments through an ordered table, and a group is one decision on one day
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1401,7 +1401,7 @@ Expected: PASS; OK.
 git add pace/ingest.py tests/test_ingest.py
 git commit -m "A cancellation without a date gets one from its own segment's habits, and the room count is read off the busiest real night
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1645,7 +1645,7 @@ Expected: PASS; OK; 64.50 / 78.80 / 82.98.
 git add pace/ingest.py tests/test_ingest.py
 git commit -m "A real booking log becomes the same ledger the simulator builds, with comp rooms counted beside it rather than inside it
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1958,7 +1958,7 @@ Expected: PASS; OK. (`test_stdlib_only` only scans `pace/` and `plugins/`; `tool
 git add tools/__init__.py tools/convert_antonio.py tests/test_convert_antonio.py
 git commit -m "Every row of the public dataset gets the name of the rule that placed it, in the order the rules were agreed
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2502,7 +2502,7 @@ Expected: PASS; OK. If `Ratios` or `BarTest` fails on a threshold detail, fix th
 git add tools/convert_antonio.py tests/test_convert_antonio.py
 git commit -m "The converter derives what a hotel would know about itself from its first year, from one price basket, and writes down how
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2580,7 +2580,7 @@ and `audit.md`, all ignored by git.
 git add data/antonio/settings.json data/antonio/README.md
 git commit -m "Every number that could be tuned after seeing the data is committed before the data exists on this machine
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 git rev-parse --short HEAD
 ```
 
@@ -2680,7 +2680,7 @@ Expected: OK; 64.50 / 78.80 / 82.98; CLAUDE.md under 120 lines.
 git add run.py README.md EXTENDING.md CLAUDE.md
 git commit -m "A real booking log has a command, and the docs point a hotel at the shape it needs to send
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
 ---
