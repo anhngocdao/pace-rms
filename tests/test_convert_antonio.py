@@ -69,6 +69,14 @@ class RuleOrder(unittest.TestCase):
         b, _ = self._branches([_arow(adr="0", stays_in_weekend_nights="0", stays_in_week_nights="0")])
         self.assertEqual(b, ["DIRECT"])
 
+    def test_adr_zero_on_offline_to_group_member_keeps_group(self):
+        b, _ = self._branches([_arow(market_segment="Offline TA/TO", customer_type="Group", adr="0")])
+        self.assertEqual(b, ["OFFLINE_TO_GROUP"])
+
+    def test_adr_zero_no_show_is_adr0(self):
+        b, _ = self._branches([_arow(adr="0", reservation_status="No-Show", is_canceled="1")])
+        self.assertEqual(b, ["ADR0"])
+
     def test_table_branches(self):
         rows = [_arow(market_segment="Online TA"), _arow(market_segment="Corporate"), _arow(market_segment="Aviation"),
                 _arow(market_segment="Offline TA/TO", customer_type="Contract"),
@@ -118,3 +126,11 @@ class TransientParty(unittest.TestCase):
     def test_different_lead_or_segment_splits_the_cluster(self):
         rows = self._tp(6, agent="9") + self._tp(6, agent="9", lead_time="31")
         self.assertEqual(CA.cluster_transient_party(rows, 10), set())
+
+    def test_adr_zero_on_transient_party_cluster_member_keeps_group(self):
+        # A real master folio charges the leader and not the members, so a
+        # cluster mixes zero-rate and normal-rate rows and all of it must
+        # still land in TP_CLUSTER, none of it in ADR0.
+        rows = self._tp(5, agent="9", company="NULL", adr="0") + self._tp(5, agent="9", company="NULL")
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        self.assertTrue(all(o["_branch"] == "TP_CLUSTER" for o in out))
