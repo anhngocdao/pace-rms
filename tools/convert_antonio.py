@@ -138,3 +138,382 @@ def branch_rows(rows: List[dict], settings: dict) -> Tuple[List[dict], Counter, 
     if counts["UNDEFINED_FALLBACK"]:
         notes.append("%d rows had Undefined segment and Undefined channel; mapped to RETAIL with a warning" % counts["UNDEFINED_FALLBACK"])
     return out, counts, notes
+
+
+WARMUP = (dt.date(2015, 7, 1), dt.date(2016, 6, 30))
+EXCLUDED_WEEKS = [(dt.date(2016, 3, 21), dt.date(2016, 3, 27)),   # Easter week 2016
+                  (dt.date(2015, 12, 24), dt.date(2016, 1, 1))]
+BAR_BRANCHES = {"DIRECT", "ONLINE_TA"}
+CORP_BRANCHES = {"CORPORATE", "AVIATION", "OFFLINE_TO_CONTRACT", "OFFLINE_TO_TRANSIENT"}
+TARGET_OF = {"COMP": "NONREV", "ADR0": "NONREV", "GROUPS": "GROUP", "OFFLINE_TO_GROUP": "GROUP",
+             "TP_CLUSTER": "GROUP", "CORPORATE": "CORP", "AVIATION": "CORP", "OFFLINE_TO_CONTRACT": "CORP",
+             "DIRECT": "RETAIL", "ONLINE_TA": "OTA", "UNDEFINED_FALLBACK": "RETAIL"}
+
+
+def _d(o: dict) -> dt.date:
+    return dt.date.fromisoformat(o["arrival"])
+
+
+def _in_window(o: dict, window) -> bool:
+    return window[0] <= _d(o) <= window[1]
+
+
+def _excluded(o: dict) -> bool:
+    d = _d(o)
+    return any(a <= d <= b for a, b in EXCLUDED_WEEKS)
+
+
+def _percentile(values: List[float], p: float) -> float:
+    s = sorted(values)
+    if not s:
+        return 0.0
+    k = (len(s) - 1) * p
+    lo, hi = int(k), min(int(k) + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def basket(out_rows, branches: set, window=WARMUP, settings=None, min_rows=None, exclude_weeks=True):
+    cand = [o for o in out_rows if o["_branch"] in branches and o["status"] == "stayed"
+            and float(o["rate"]) > 0 and _in_window(o, window) and not (exclude_weeks and _excluded(o))]
+    if not cand:
+        return [], False
+    rates = [float(o["rate"]) for o in cand]
+    lo, hi = _percentile(rates, 0.01), _percentile(rates, 0.99)
+    cand = [o for o in cand if lo <= float(o["rate"]) <= hi]
+    room = Counter(o["room_type"] for o in cand).most_common(1)[0][0]
+    meal = Counter(o["_raw"]["meal"] for o in cand).most_common(1)[0][0]
+    cand = [o for o in cand if o["room_type"] == room and o["_raw"]["meal"] == meal
+            and o["_raw"]["children"] in ("0", "0.0", "") and o["_raw"]["babies"] == "0"]
+    strict = [o for o in cand if o["_raw"]["adults"] == "2"]
+    need = min_rows if min_rows is not None else int((settings or {}).get("min_basket_rows", 30))
+    if len(strict) >= need:
+        return strict, False
+    return cand, True
+
+
+def monthly_median(rows) -> Dict[int, float]:
+    by_m: Dict[int, List[float]] = defaultdict(list)
+    for o in rows:
+        by_m[_d(o).month].append(float(o["rate"]))
+    return {m: statistics.median(v) for m, v in by_m.items() if v}
+
+
+def price_month_factor(out_rows, settings) -> Tuple[Dict[int, float], List[int]]:
+    need = int(settings.get("min_basket_rows", 30))
+    strict, _ = basket(out_rows, BAR_BRANCHES, settings=settings, min_rows=0)
+    wide, _ = basket(out_rows, BAR_BRANCHES, settings=settings, min_rows=10 ** 9)
+    med: Dict[int, float] = {}
+    widened: List[int] = []
+    for m in range(1, 13):
+        s = [o for o in strict if _d(o).month == m]
+        if len(s) >= need:
+            med[m] = statistics.median(float(o["rate"]) for o in s)
+        else:
+            w = [o for o in wide if _d(o).month == m]
+            widened.append(m)
+            med[m] = statistics.median(float(o["rate"]) for o in w) if w else float("nan")
+    known = [v for v in med.values() if v == v]
+    if not known:
+        raise ConvertStop("no BAR (DIRECT/ONLINE_TA) rows in the warm-up window; price_month_factor has nothing to build on")
+    fill = statistics.median(known)
+    med = {m: (v if v == v else fill) for m, v in med.items()}
+    mean = sum(med.values()) / 12
+    if mean <= 0:
+        raise ConvertStop("price_month_factor's monthly medians average to zero or less; check the adr column")
+    return {m: v / mean for m, v in med.items()}, widened
+
+
+def base_rate(out_rows, factors, settings) -> float:
+    rows, _ = basket(out_rows, BAR_BRANCHES, settings=settings)
+    med = monthly_median(rows)
+    if not med:
+        raise ConvertStop("no BAR (DIRECT/ONLINE_TA) rows in the warm-up window; base_rate has nothing to build on")
+    return statistics.median(med[m] / factors[m] for m in med)
+
+
+def floor_ceiling(out_rows, settings) -> Tuple[float, float]:
+    rows, _ = basket(out_rows, BAR_BRANCHES, settings=settings)
+    rates = [float(o["rate"]) for o in rows]
+    widen = float(settings.get("floor_ceiling_widen", 0.10))
+    return round(_percentile(rates, 0.02) * (1 - widen), 2), round(_percentile(rates, 0.98) * (1 + widen), 2)
+
+
+def rate_step(floor: float, ceiling: float) -> float:
+    raw = (ceiling - floor) / 90.0
+    for step in (1.0, 2.0, 5.0):
+        if raw <= step * 1.5:
+            return step
+    return 5.0
+
+
+def _gross_nights(out_rows, window=WARMUP, drop_duplicates=False) -> Dict[int, float]:
+    seen = set()
+    gross: Dict[int, float] = defaultdict(float)
+    for o in out_rows:
+        if not _in_window(o, window) or o["_branch"] == "COMP":
+            continue
+        if o["_raw"]["deposit_type"] == "Non Refund":
+            continue
+        if drop_duplicates:
+            key = tuple(sorted((k, v) for k, v in o["_raw"].items()))
+            if key in seen:
+                continue
+            seen.add(key)
+        nights = int(o["nights"])
+        for k in range(nights):
+            gross[(_d(o) + dt.timedelta(days=k)).month] += 1
+    return gross
+
+
+def _rank_bands(by_month: Dict[int, float]) -> Dict[int, str]:
+    order = sorted(range(1, 13), key=lambda m: (-by_month.get(m, 0.0), m))
+    return {**{m: "peak" for m in order[:4]}, **{m: "shoulder" for m in order[4:7]}, **{m: "trough" for m in order[7:]}}
+
+
+def demand_season_band(out_rows, window=WARMUP):
+    gross = _gross_nights(out_rows, window)
+    occ: Dict[int, float] = defaultdict(float)
+    for o in out_rows:
+        if o["status"] == "stayed" and _in_window(o, window):
+            for k in range(int(o["nights"])):
+                occ[(_d(o) + dt.timedelta(days=k)).month] += 1
+    return _rank_bands(gross), _rank_bands(occ), {m: gross.get(m, 0.0) for m in range(1, 13)}
+
+
+def _weighted_median(pairs: List[Tuple[float, float]]) -> float:
+    """Median of values weighted by weight. When the cumulative weight lands
+    on exactly half the total, this is the boundary between two values with
+    equal standing, so the result averages them, the same way a plain median
+    averages the two middle values of an even-length list; that is the case
+    an equal-weight pair reduces to. Otherwise it is the first value whose
+    cumulative weight passes half."""
+    pairs = sorted(pairs)
+    if not pairs:
+        return float("nan")
+    total = sum(w for _, w in pairs)
+    acc = 0.0
+    for i, (v, w) in enumerate(pairs):
+        acc += w
+        if total and acc == total / 2 and i + 1 < len(pairs):
+            return (v + pairs[i + 1][0]) / 2
+        if acc >= total / 2:
+            return v
+    return pairs[-1][0]
+
+
+def segment_rate_ratio(out_rows, settings):
+    need = int(settings.get("min_ratio_rows", 30))
+    bar_rows, _ = basket(out_rows, BAR_BRANCHES, settings=settings)
+    bar_med = monthly_median(bar_rows)
+    per_origin: Dict[str, float] = {}
+    weights: Dict[str, float] = {}
+    by_band: Dict[str, Dict[str, float]] = defaultdict(dict)
+    bands, _, _ = demand_season_band(out_rows)
+    for origin in sorted(CORP_BRANCHES | set(GROUP_BRANCHES)):
+        rows, _ = basket(out_rows, {origin}, settings=settings, min_rows=0)
+        by_m: Dict[int, List[float]] = defaultdict(list)
+        for o in rows:
+            by_m[_d(o).month].append(float(o["rate"]))
+        monthly = [statistics.median(v) / bar_med[m] for m, v in by_m.items()
+                   if len(v) >= need and m in bar_med and sum(1 for o in bar_rows if _d(o).month == m) >= need]
+        if monthly:
+            per_origin[origin] = statistics.median(monthly)
+            weights[origin] = float(sum(int(o["nights"]) for o in rows))
+            for band in ("peak", "shoulder", "trough"):
+                sel = [statistics.median(v) / bar_med[m] for m, v in by_m.items() if bands[m] == band and m in bar_med and len(v) >= need]
+                if sel:
+                    by_band[origin][band] = statistics.median(sel)
+    ratios = {}
+    for target, origins in (("CORP", CORP_BRANCHES), ("GROUP", set(GROUP_BRANCHES))):
+        pairs = [(per_origin[o], weights[o]) for o in origins if o in per_origin]
+        if pairs:
+            ratios[target] = round(_weighted_median(pairs), 4)
+    return ratios, per_origin, dict(by_band)
+
+
+def _corr(xs: List[float], ys: List[float]) -> float:
+    n = len(xs)
+    if n < 3:
+        return float("nan")
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs); syy = sum((y - my) ** 2 for y in ys)
+    if sxx == 0 or syy == 0:
+        return 0.0
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / (sxx * syy) ** 0.5
+
+
+def _weekly_residuals(rows, block: str) -> Dict[int, float]:
+    """Weekly median adr minus its month (or two-week block) mean, keyed by week number."""
+    weekly: Dict[int, List[float]] = defaultdict(list)
+    week_block: Dict[int, str] = {}
+    for o in rows:
+        w = int(o["_raw"]["arrival_date_week_number"])
+        weekly[w].append(float(o["rate"]))
+        d = _d(o)
+        week_block[w] = ("%d-%02d" % (d.year, d.month)) if block == "month" else ("%d-%02d" % (d.year, w // 2))
+    med = {w: statistics.median(v) for w, v in weekly.items()}
+    blocks: Dict[str, List[float]] = defaultdict(list)
+    for w, v in med.items():
+        blocks[week_block[w]].append(v)
+    bmean = {b: sum(v) / len(v) for b, v in blocks.items()}
+    return {w: v - bmean[week_block[w]] for w, v in med.items()}
+
+
+def bar_test(out_rows, settings) -> dict:
+    thr = float(settings.get("bar_corr_threshold", 0.6))
+    need = int(settings.get("min_basket_rows", 30))
+    bar_rows, _ = basket(out_rows, BAR_BRANCHES, settings=settings, min_rows=need)
+    to_rows, _ = basket(out_rows, {"OFFLINE_TO_TRANSIENT"}, settings=settings, min_rows=need)
+    result = {"weeks": 0, "residual_corr_month": float("nan"), "residual_corr_2wk": float("nan"), "verdict": "CORP"}
+    if not bar_rows or not to_rows:
+        result["verdict"] = "inconclusive"
+        return result
+    corrs = []
+    for block in ("month", "2wk"):
+        a, b = _weekly_residuals(bar_rows, block), _weekly_residuals(to_rows, block)
+        weeks = sorted(set(a) & set(b))
+        result["weeks"] = len(weeks)
+        c = _corr([a[w] for w in weeks], [b[w] for w in weeks])
+        result["residual_corr_month" if block == "month" else "residual_corr_2wk"] = c
+        corrs.append(c)
+    votes = [c == c and c > thr for c in corrs]
+    if all(votes):
+        result["verdict"] = "OTA"
+    elif any(votes):
+        result["verdict"] = "inconclusive"
+    return result
+
+
+def _majority_target_by_channel(out_rows) -> Dict[str, str]:
+    votes: Dict[str, Counter] = defaultdict(Counter)
+    for o in out_rows:
+        if o["_branch"].startswith("UNDEFINED"):
+            continue
+        votes[o["_raw"]["distribution_channel"]][TARGET_OF.get(o["_branch"], "CORP")] += 1
+    return {ch: c.most_common(1)[0][0] for ch, c in votes.items()}
+
+
+def derive_hotel_json(out_rows, hotel_code: str, settings: dict) -> dict:
+    factors, widened = price_month_factor(out_rows, settings)
+    br = base_rate(out_rows, factors, settings)
+    floor, ceiling = floor_ceiling(out_rows, settings)
+    bands_gross, bands_occ, gross = demand_season_band(out_rows)
+    ratios, per_origin, by_band = segment_rate_ratio(out_rows, settings)
+    verdict = bar_test(out_rows, settings)
+    warm = [o for o in out_rows if _in_window(o, WARMUP)]
+    leads = [int(o["_raw"]["lead_time"]) for o in warm]
+    nights = [int(o["nights"]) for o in warm]
+    max_lead = int(_percentile(leads, 0.99)) if leads else 180
+    notes = []
+    if hotel_code == "H1" and max_lead < 120:
+        notes.append("max_lead raised from %d to 120 so the 120-day mark can run" % max_lead)
+        max_lead = 120
+    majority = _majority_target_by_channel(out_rows)
+    seg_map = dict(TARGET_OF)
+    seg_map["OFFLINE_TO_TRANSIENT"] = "OTA" if verdict["verdict"] == "OTA" else "CORP"
+    for ch, branch in CHANNEL_BRANCH.items():
+        seg_map[branch] = majority.get(ch, "RETAIL")
+    return {
+        "name": {"H1": "H1 Resort Hotel, Algarve", "H2": "H2 City Hotel, Lisbon"}[hotel_code],
+        "currency": "EUR", "fx": {}, "sellable_rooms": None, "rates_include_tax": "unknown",
+        "group_threshold_rooms": int(settings["group_threshold_rooms"]), "detect_groups": False,
+        "rate_floor": floor, "rate_ceiling": ceiling, "rate_step": rate_step(floor, ceiling),
+        "base_rate": round(br, 2),
+        "variable_cost": round(br * float(settings["variable_cost_low_share"]), 2),
+        "max_lead": max_lead, "max_los": max(1, int(_percentile(nights, 0.99))) if nights else 7,
+        "sellout_threshold": float(settings["sellout_threshold"]),
+        "price_month_factor": {str(m): round(f, 4) for m, f in factors.items()},
+        "demand_season_band": {str(m): b for m, b in bands_gross.items()},
+        "segment_rate_ratio": ratios,
+        "segment_commission": {"RETAIL": 0.0, "OTA": float(settings["ota_commission_main"]), "CORP": 0.0, "GROUP": 0.0},
+        "events": [],
+        "segment_map_order": ["segment"],
+        "segment_map": {"segment": seg_map},
+        "_derivation": {"window": [WARMUP[0].isoformat(), WARMUP[1].isoformat()], "widened_months": widened,
+                        "bands_from_occupancy": {str(m): b for m, b in bands_occ.items()},
+                        "gross_by_month": {str(m): v for m, v in gross.items()},
+                        "ratio_per_origin": per_origin, "ratio_by_band": by_band, "bar_test": verdict, "notes": notes},
+    }
+
+
+def audit(out_rows, hotel_code: str, settings: dict, derived: dict) -> str:
+    raw = [o["_raw"] for o in out_rows]
+    counts = Counter(o["_branch"] for o in out_rows)
+    lines = ["# Audit %s" % hotel_code, "", "## Rows per rule branch", ""]
+    lines += ["- %s: %d" % (b, n) for b, n in counts.most_common()]
+    adr0 = Counter((o["_raw"]["market_segment"], o["status"]) for o in out_rows if float(o["rate"]) == 0)
+    lines += ["", "## adr = 0 rows by market segment and status", ""] + ["- %s / %s: %d" % (k[0], k[1], n) for k, n in adr0.most_common()]
+    cross: Dict[str, Counter] = defaultdict(Counter)
+    for r in raw:
+        cross[r["market_segment"]][r["distribution_channel"]] += 1
+    lines += ["", "## market_segment by distribution_channel", ""] + ["- %s: %s" % (s, dict(c)) for s, c in cross.items()]
+    av_nights = {o["arrival"] for o in out_rows if o["_branch"] == "AVIATION"}
+    lines += ["", "## Aviation", "", "- rows: %d, nights with at least one Aviation room: %d" % (counts["AVIATION"], len(av_nights))]
+    dup = Counter(tuple(sorted(r.items())) for r in raw)
+    dups = [k for k, n in dup.items() if n > 1]
+    dup_status = Counter(dict(k)["reservation_status"] for k in dups)
+    lines += ["", "## Duplicate rows", "", "- identical rows appearing more than once: %d, by status %s" % (len(dups), dict(dup_status))]
+    hb = [float(o["rate"]) for o in out_rows if o["_raw"]["meal"] == "HB" and o["status"] == "stayed" and float(o["rate"]) > 0]
+    bb = [float(o["rate"]) for o in out_rows if o["_raw"]["meal"] == "BB" and o["status"] == "stayed" and float(o["rate"]) > 0]
+    if hb and bb:
+        lines += ["", "## Meal check", "", "- median adr HB %.2f vs BB %.2f (same hotel, all room types); a steady large gap means adr includes meals"
+                  % (statistics.median(hb), statistics.median(bb))]
+    canc = [r for r in raw if r["reservation_status"] == "Canceled"]
+    nr = [r for r in raw if r["deposit_type"] == "Non Refund"]
+    lines += ["", "## Cancellations", "",
+              "- cancellation rate all rows: %.1f%%" % (100 * len(canc) / max(1, len(raw))),
+              "- cancellation rate excluding Non Refund: %.1f%%" % (100 * sum(1 for r in canc if r["deposit_type"] != "Non Refund") / max(1, len(raw) - len(nr))),
+              "- Non Refund rows: %d, of which cancelled: %d" % (len(nr), sum(1 for r in nr if r["reservation_status"] == "Canceled"))]
+    leads = sorted(int(r["lead_time"]) for r in raw)
+    lines += ["", "## Lead time", "", "- median %d, p90 %d, p99 %d, max %d" % (leads[len(leads) // 2], leads[int(0.9 * (len(leads) - 1))], leads[int(0.99 * (len(leads) - 1))], leads[-1])]
+    d = derived["_derivation"]
+    lines += ["", "## Derived hotel.json (window %s to %s)" % tuple(d["window"]), "",
+              "- base_rate %.2f, floor %.2f, ceiling %.2f, step %.1f" % (derived["base_rate"], derived["rate_floor"], derived["rate_ceiling"], derived["rate_step"]),
+              "- price_month_factor %s" % derived["price_month_factor"],
+              "- widened months %s" % d["widened_months"],
+              "- demand bands from gross demand %s" % derived["demand_season_band"],
+              "- demand bands from occupancy %s" % d["bands_from_occupancy"],
+              "- segment_rate_ratio %s (simulated hotel: CORP 0.82, GROUP 0.70)" % derived["segment_rate_ratio"],
+              "- ratio per origin %s" % d["ratio_per_origin"],
+              "- ratio by band %s" % d["ratio_by_band"],
+              "- BAR test %s" % d["bar_test"],
+              "- notes %s" % d["notes"]]
+    return "\n".join(lines) + "\n"
+
+
+def convert(csv_path: str, out_dir: str, settings_path: str) -> None:
+    with open(settings_path, encoding="utf-8") as fh:
+        settings = json.load(fh)
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    os.makedirs(out_dir, exist_ok=True)
+    audits = []
+    for hotel_name, code in HOTEL_CODE.items():
+        sub = [r for r in rows if r["hotel"] == hotel_name]
+        out, counts, notes = branch_rows(sub, settings)
+        derived = derive_hotel_json(out, code, settings)
+        derived["_derivation"]["notes"] += notes
+        text = audit(out, code, settings, derived)
+        with open(os.path.join(out_dir, "%s-bookings.csv" % code.lower()), "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=OUT_COLUMNS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(out)
+        clean = {k: v for k, v in derived.items() if k != "_derivation"}
+        with open(os.path.join(out_dir, "%s-hotel.json" % code.lower()), "w", encoding="utf-8") as fh:
+            json.dump(clean, fh, indent=2)
+        audits.append(text)
+        print(text)
+    with open(os.path.join(out_dir, "audit.md"), "w", encoding="utf-8") as fh:
+        fh.write("\n\n".join(audits))
+
+
+def main(argv):
+    if len(argv) != 4:
+        print("usage: python3 -m tools.convert_antonio hotels.csv out_dir settings.json")
+        return 1
+    convert(argv[1], argv[2], argv[3])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

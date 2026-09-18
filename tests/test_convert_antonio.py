@@ -1,8 +1,13 @@
 import datetime as dt
+import json
+import os
+import statistics
+import tempfile
 import unittest
 from collections import Counter
 
 from tools import convert_antonio as CA
+from pace import hotelconfig as HC
 
 SETTINGS = {"group_threshold_rooms": 10, "undefined_stop_share": 0.01, "seed": 20250115}
 
@@ -134,3 +139,193 @@ class TransientParty(unittest.TestCase):
         rows = self._tp(5, agent="9", company="NULL", adr="0") + self._tp(5, agent="9", company="NULL")
         out, _, _ = CA.branch_rows(rows, SETTINGS)
         self.assertTrue(all(o["_branch"] == "TP_CLUSTER" for o in out))
+
+
+class Basket(unittest.TestCase):
+    def _rows(self):
+        rows = []
+        for m in range(7, 13):
+            for k in range(40):
+                rows.append(_arow(arrival_date_year="2015", arrival_date_month=list(CA.MONTHS)[m - 1],
+                                  adr=str(100 + 10 * (m - 6) + (k % 3)), adults="2"))
+        for m in range(1, 7):
+            for k in range(40):
+                rows.append(_arow(arrival_date_year="2016", arrival_date_month=list(CA.MONTHS)[m - 1],
+                                  adr=str(100 + 10 * m + (k % 3)), adults="2"))
+        # The three rows below must land inside the warm-up window (they
+        # used to default to 2016-07-10, one day past WARMUP's end, which
+        # made basket() drop them by date rather than by the filter each
+        # comment names) and the family row must sit at an ordinary price
+        # (500 was itself outside the p1..p99 band, so it was being trimmed
+        # by the price filter, not the adults filter its comment names).
+        rows.append(_arow(arrival_date_year="2016", arrival_date_month="June", adr="9999"))       # extreme, trimmed by p99
+        rows.append(_arow(arrival_date_year="2016", arrival_date_month="June", adr="-5"))         # negative, dropped
+        rows.append(_arow(arrival_date_year="2016", arrival_date_month="June", adults="4", adr="140"))  # family, out of basket
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        return out
+
+    def test_basket_filters(self):
+        out = self._rows()
+        rows, widened = CA.basket(out, {"DIRECT"}, min_rows=30)
+        self.assertFalse(widened)
+        self.assertTrue(all(float(r["rate"]) > 0 for r in rows))
+        self.assertTrue(all(r["_raw"]["adults"] == "2" for r in rows))
+        self.assertLess(max(float(r["rate"]) for r in rows), 9999)
+
+    def test_factors_have_mean_one_and_base_rate_matches_by_construction(self):
+        out = self._rows()
+        settings = dict(SETTINGS, min_basket_rows=30)
+        factors, widened = CA.price_month_factor(out, settings)
+        self.assertAlmostEqual(sum(factors.values()) / 12, 1.0, places=6)
+        self.assertEqual(widened, [])
+        br = CA.base_rate(out, factors, settings)
+        med = CA.monthly_median(CA.basket(out, CA.BAR_BRANCHES, settings=settings)[0])
+        self.assertAlmostEqual(br, statistics.median(med[m] / factors[m] for m in med), places=6)
+
+    def test_thin_month_widens_adults_filter(self):
+        out = self._rows()
+        out = [o for o in out if not (o["arrival"].startswith("2016-02") and o["_raw"]["adults"] == "2")]
+        out += [dict(o, arrival="2016-02-10", _raw=dict(o["_raw"], adults="3")) for o in out[:35]]
+        factors, widened = CA.price_month_factor(out, dict(SETTINGS, min_basket_rows=30))
+        self.assertIn(2, widened)
+
+    def test_rate_step_has_about_ninety_rungs_and_a_one_euro_floor(self):
+        self.assertEqual(CA.rate_step(50.0, 500.0), 5.0)
+        self.assertEqual(CA.rate_step(40.0, 100.0), 1.0)
+        self.assertEqual(CA.rate_step(40.0, 220.0), 2.0)
+
+
+class Bands(unittest.TestCase):
+    def test_top_four_three_five_split(self):
+        rows = []
+        for m in range(1, 13):
+            n = 5 + m   # more demand later in the year
+            rows += [_arow(arrival_date_year="2016" if m <= 6 else "2015", arrival_date_month=list(CA.MONTHS)[m - 1]) for _ in range(n)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        gross, occ, _ = CA.demand_season_band(out)
+        labels = Counter(gross.values())
+        self.assertEqual((labels["peak"], labels["shoulder"], labels["trough"]), (4, 3, 5))
+        self.assertEqual(gross[12], "peak"); self.assertEqual(gross[1], "trough")
+
+    def test_non_refund_excluded_from_gross(self):
+        rows = [_arow(arrival_date_year="2015", arrival_date_month="August") for _ in range(5)]
+        rows += [_arow(arrival_date_year="2016", arrival_date_month="January", deposit_type="Non Refund",
+                       reservation_status="Canceled", is_canceled="1") for _ in range(50)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        _, _, gross_by_month = CA.demand_season_band(out)
+        self.assertEqual(gross_by_month[1], 0)
+
+
+class Ratios(unittest.TestCase):
+    def test_corp_ratio_is_weighted_median_of_monthly_ratios(self):
+        rows = []
+        for m in ("July", "August", "September"):
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=m, adr="200") for _ in range(35)]
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=m, market_segment="Corporate", adr="160") for _ in range(35)]
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=m, market_segment="Offline TA/TO",
+                           customer_type="Contract", adr="120") for _ in range(35)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        ratios, per_origin, _ = CA.segment_rate_ratio(out, dict(SETTINGS, min_ratio_rows=30))
+        self.assertAlmostEqual(per_origin["CORPORATE"], 0.8, places=3)
+        self.assertAlmostEqual(per_origin["OFFLINE_TO_CONTRACT"], 0.6, places=3)
+        self.assertAlmostEqual(ratios["CORP"], 0.7, places=3)   # equal room nights, weighted median of the two origins
+
+
+class BarTest(unittest.TestCase):
+    def _rows(self, contract_step):
+        rows = []
+        # Six months of four weeks each, July through December 2015: the
+        # original range(27, 53) ran to 26 weeks, so the last iteration
+        # computed month 13 and crashed list(CA.MONTHS)[12]. range(27, 51)
+        # is the 24 weeks the day-of-month math and the comment both need.
+        for week in range(27, 51):
+            year, month = "2015", CA.MONTHS  # arrival built from week: use day-of-month cycling within July..December
+            m = 7 + (week - 27) // 4
+            d = 1 + ((week - 27) % 4) * 7
+            bar = 150 + 20 * ((week % 4) - 1.5)          # moves within the month
+            to = 120 + (10 if contract_step and week % 4 >= 2 else 0)   # steps mid-month when contract_step
+            for _ in range(8):
+                rows.append(_arow(arrival_date_year=year, arrival_date_month=list(CA.MONTHS)[m - 1],
+                                  arrival_date_day_of_month=str(d), arrival_date_week_number=str(week), adr=str(bar)))
+                rows.append(_arow(arrival_date_year=year, arrival_date_month=list(CA.MONTHS)[m - 1],
+                                  arrival_date_day_of_month=str(d), arrival_date_week_number=str(week),
+                                  market_segment="Offline TA/TO", customer_type="Transient", adr=str(to)))
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        return out
+
+    def test_flat_contract_maps_to_corp(self):
+        res = CA.bar_test(self._rows(contract_step=False), dict(SETTINGS, bar_corr_threshold=0.6, min_basket_rows=5))
+        self.assertEqual(res["verdict"], "CORP")
+
+    def test_verdict_needs_both_demeanings_to_agree(self):
+        res = CA.bar_test(self._rows(contract_step=True), dict(SETTINGS, bar_corr_threshold=0.6, min_basket_rows=5))
+        self.assertIn(res["verdict"], ("CORP", "inconclusive"))
+
+
+class DerivedHotelJsonIsLoadable(unittest.TestCase):
+    """derive_hotel_json's whole point is to feed pace/hotelconfig.py, whose
+    loader is strict and rejects unknown keys (including _derivation). This
+    builds a several-hundred-row fixture across the warm-up year and proves
+    the round trip: derive, strip _derivation, write, load for real."""
+
+    NAME_OF = {v: k for k, v in CA.MONTHS.items()}
+
+    def _make_row(self, year, month_num, day, **kw):
+        d = dt.date(year, month_num, day)
+        wk = d.isocalendar()[1]
+        return _arow(arrival_date_year=str(year), arrival_date_month=self.NAME_OF[month_num],
+                     arrival_date_day_of_month=str(day), arrival_date_week_number=str(wk), **kw)
+
+    def _fixture_rows(self):
+        months = [(2015, m) for m in range(7, 13)] + [(2016, m) for m in range(1, 7)]
+        rows = []
+        for year, mnum in months:
+            base = 90 + 5 * mnum
+            for day in (5, 12, 19, 26):
+                for k in range(6):
+                    rows.append(self._make_row(year, mnum, day, adr=str(base + (k % 3)), adults="2"))
+                for k in range(2):
+                    rows.append(self._make_row(year, mnum, day, market_segment="Online TA",
+                                                distribution_channel="TA/TO", adr=str(base + 2 + (k % 3)), adults="2"))
+                for k in range(3):
+                    rows.append(self._make_row(year, mnum, day, market_segment="Corporate",
+                                                distribution_channel="Corporate", adr=str(round(base * 0.8)), adults="2"))
+                for k in range(2):
+                    rows.append(self._make_row(year, mnum, day, market_segment="Offline TA/TO", customer_type="Contract",
+                                                distribution_channel="TA/TO", adr=str(round(base * 0.6)), adults="2"))
+                for k in range(2):
+                    rows.append(self._make_row(year, mnum, day, market_segment="Offline TA/TO", customer_type="Transient",
+                                                distribution_channel="TA/TO", adr=str(base + 1), adults="2"))
+            rows.append(self._make_row(year, mnum, 15, market_segment="Groups", distribution_channel="TA/TO",
+                                        adr=str(round(base * 0.55)), adults="2"))
+            rows.append(self._make_row(year, mnum, 20, market_segment="Complementary",
+                                        distribution_channel="Direct", adr="0"))
+        return rows
+
+    def test_derived_hotel_json_round_trips_through_the_real_loader(self):
+        settings = dict(SETTINGS, bar_corr_threshold=0.6, min_basket_rows=20, min_ratio_rows=8,
+                         floor_ceiling_widen=0.10, sellout_threshold=0.95, ota_commission_main=0.15,
+                         variable_cost_low_share=0.35)
+        rows = self._fixture_rows()
+        self.assertGreater(len(rows), 200)
+        out, counts, notes = CA.branch_rows(rows, settings)
+        for code in ("H1", "H2"):
+            derived = CA.derive_hotel_json(out, code, settings)
+            self.assertIn("_derivation", derived)
+            text = CA.audit(out, code, settings, derived)
+            self.assertTrue(text.startswith("# Audit %s" % code))
+            clean = {k: v for k, v in derived.items() if k != "_derivation"}
+            self.assertNotIn("_derivation", clean)
+            tmp_dir = tempfile.mkdtemp()
+            path = os.path.join(tmp_dir, "%s-hotel.json" % code.lower())
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(clean, fh, indent=2)
+            with open(path, encoding="utf-8") as fh:
+                raw_text = fh.read()
+            self.assertNotIn("NaN", raw_text)
+            cfg = HC.load_hotel_json(path)
+            self.assertEqual(len(cfg.price_month_factor), 12)
+            self.assertEqual(len(cfg.demand_season_band), 12)
+            self.assertIsNone(cfg.sellable_rooms)
+            with self.assertRaises(HC.ConfigError):
+                HC.apply(cfg)  # sellable_rooms is still null at this stage
