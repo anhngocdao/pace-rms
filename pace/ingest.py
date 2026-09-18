@@ -79,8 +79,15 @@ def _date(value: str) -> Optional[dt.date]:
 
 
 def read_bookings(path: str, cfg: HotelConfig) -> Tuple[List[Booking], Report]:
+    """Read a booking log, returning the rows that parsed and a Report of the rest.
+
+    Row numbers are the file's own physical line numbers (csv's line_num), not
+    a count of yielded records, so a blank line or a quoted multi-line field
+    never desyncs every error after it from the line a human would count.
+    """
     rep = Report()
-    out: List[Booking] = []
+    parsed: List[Booking] = []
+    seen_ids = set()
     with open(path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         cols = set(reader.fieldnames or [])
@@ -92,18 +99,33 @@ def read_bookings(path: str, cfg: HotelConfig) -> Tuple[List[Booking], Report]:
         if not ({"rate", "total_revenue"} & cols):
             rep.error(1, "rate", "need rate or total_revenue")
         if rep.errors:
-            return out, rep
-        for i, r in enumerate(reader, start=2):
+            return [], rep
+        for r in reader:
+            i = reader.line_num
             b = _parse_row(i, r, cfg, rep)
             if b is None:
                 continue
-            n = b.rooms
-            if n == 1:
-                out.append(b)
-            else:
-                for k in range(1, n + 1):
-                    copy = Booking(**{**b.__dict__, "booking_id": "%s#%d" % (b.booking_id, k), "rooms": 1})
-                    out.append(copy)
+            if b.booking_id in seen_ids:
+                rep.error(i, "booking_id", "duplicate booking_id")
+                continue
+            seen_ids.add(b.booking_id)
+            parsed.append(b)
+
+    # Expansion happens after every literal id in the file is known, so a
+    # synthesised "#N" id can be checked against ids the file already uses.
+    out: List[Booking] = []
+    for b in parsed:
+        if b.rooms == 1:
+            out.append(b)
+            continue
+        for k in range(1, b.rooms + 1):
+            new_id = "%s#%d" % (b.booking_id, k)
+            if new_id in seen_ids:
+                rep.error(b.row, "booking_id",
+                          "expanded id %r collides with an existing booking_id" % new_id)
+                continue
+            seen_ids.add(new_id)
+            out.append(Booking(**{**b.__dict__, "booking_id": new_id, "rooms": 1}))
     return out, rep
 
 
@@ -129,19 +151,30 @@ def _parse_row(i: int, r: dict, cfg: HotelConfig, rep: Report) -> Optional[Booki
     if dates["arrival"] is None and "arrival" not in bad_dates:
         bad("arrival", "empty")
 
+    has_nights = bool((r.get("nights") or "").strip())
+    has_departure = dates.get("departure") is not None
+
     nights = None
-    if (r.get("nights") or "").strip():
+    if has_nights:
         try:
             nights = int(r["nights"])
             if nights < 0:
                 bad("nights", "negative")
         except ValueError:
             bad("nights", "not an integer")
-    elif dates.get("departure") and dates["arrival"]:
-        nights = (dates["departure"] - dates["arrival"]).days
-        if nights < 0:
+
+    if has_departure and dates["arrival"] is not None:
+        from_departure = (dates["departure"] - dates["arrival"]).days
+        if from_departure < 0:
             bad("departure", "before arrival")
-    else:
+        elif has_nights:
+            if nights is not None and nights != from_departure:
+                bad("nights", "nights=%s disagrees with departure, which implies %d nights"
+                    % (r["nights"], from_departure))
+        else:
+            nights = from_departure
+
+    if not has_nights and not has_departure:
         bad("nights", "need nights or departure")
 
     rooms = 1
@@ -153,19 +186,35 @@ def _parse_row(i: int, r: dict, cfg: HotelConfig, rep: Report) -> Optional[Booki
         except ValueError:
             bad("rooms", "not an integer")
 
+    has_rate = bool((r.get("rate") or "").strip())
+    has_total_revenue = bool((r.get("total_revenue") or "").strip())
+
     rate = None
-    if (r.get("rate") or "").strip():
+    if has_rate:
         try:
             rate = float(r["rate"])
         except ValueError:
             bad("rate", "not a number")
-    elif (r.get("total_revenue") or "").strip():
+
+    if has_total_revenue:
         try:
-            total = float(r["total_revenue"])
-            rate = total / nights if nights else 0.0
+            total_revenue = float(r["total_revenue"])
         except ValueError:
             bad("total_revenue", "not a number")
-    else:
+            total_revenue = None
+        if total_revenue is not None:
+            if has_rate:
+                # A zero-night day-use row has no per-night total to check
+                # rate against, so both being present just keeps rate as given.
+                if rate is not None and nights and nights >= 1:
+                    implied = total_revenue / nights
+                    if abs(rate - implied) > 0.01:
+                        bad("rate", "rate=%s disagrees with total_revenue/nights=%.2f"
+                            % (r["rate"], implied))
+            else:
+                rate = total_revenue / nights if nights else 0.0
+
+    if not has_rate and not has_total_revenue:
         bad("rate", "need rate or total_revenue")
 
     currency = (r.get("currency") or cfg.currency).strip().upper()

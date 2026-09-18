@@ -13,7 +13,7 @@ One row per room. Multi-room rows are expanded by the ingest. Required:
 | booking_id | string | unique per row; converters may synthesise it |
 | booked_on | YYYY-MM-DD | date the booking entered the PMS |
 | arrival | YYYY-MM-DD | |
-| nights | integer >= 0 | 0 is day use; exactly one of nights / departure required |
+| nights | integer >= 0 | 0 is day use; give nights or departure, or both; when both are present they must agree |
 | segment | string | hotel's own code, mapped via hotel.json |
 | status | booked / in_house / stayed / cancelled / no_show | in_house counts as stayed |
 
@@ -22,7 +22,7 @@ Optional:
 | column | rule |
 |---|---|
 | departure | YYYY-MM-DD; nights = departure minus arrival when nights is absent |
-| rate | per room night, in the file's currency; exactly one of rate / total_revenue required |
+| rate | per room night, in the file's currency; give rate or total_revenue, or both; when both are present they must agree |
 | total_revenue | room revenue for the whole stay; rate = total_revenue / nights when nights > 0 |
 | currency | ISO code; defaults to hotel.json currency. More than one currency in a file is an error unless hotel.json carries an `fx` table to the hotel currency |
 | status_date | cancel date for cancelled; check-out date for stayed; ignored for no_show (equals arrival) |

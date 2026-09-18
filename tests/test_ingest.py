@@ -100,3 +100,42 @@ class ReadBookings(unittest.TestCase):
     def test_unknown_status_is_an_error(self):
         _, rep = ingest.read_bookings(_csv([_row(status="checked")]), _cfg())
         self.assertEqual(rep.errors[0][1], "status")
+
+    def test_blank_lines_do_not_shift_row_numbers(self):
+        rows = [_row(), [], _row(booking_id="B2", arrival="not-a-date")]
+        _, rep = ingest.read_bookings(_csv(rows), _cfg())
+        self.assertEqual(rep.errors[0][0], 4)
+        self.assertEqual(rep.errors[0][1], "arrival")
+
+    def test_duplicate_booking_id_is_an_error(self):
+        rows, rep = ingest.read_bookings(_csv([_row(), _row(arrival="2025-03-01")]), _cfg())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rep.errors[0], (3, "booking_id", "duplicate booking_id"))
+
+    def test_expanded_id_colliding_with_a_real_id_is_an_error(self):
+        rows, rep = ingest.read_bookings(_csv([
+            _row(booking_id="B1#2"),
+            _row(booking_id="B1", rooms="2"),
+        ]), _cfg())
+        ids = [b.booking_id for b in rows]
+        self.assertEqual(ids.count("B1#2"), 1)
+        self.assertIn("B1#1", ids)
+        self.assertTrue(any(e[1] == "booking_id" for e in rep.errors))
+
+    def test_nights_and_departure_must_agree_when_both_given(self):
+        header = HEADER + ["departure"]
+        agree = _row() + ["2025-02-03"]
+        disagree = _row(booking_id="B2") + ["2025-02-05"]
+        rows, rep = ingest.read_bookings(_csv([agree, disagree], header), _cfg())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].booking_id, "B1")
+        self.assertEqual(rep.errors[0][1], "nights")
+
+    def test_rate_and_total_revenue_must_agree_when_both_given(self):
+        header = HEADER + ["total_revenue"]
+        agree = _row() + ["240"]
+        disagree = _row(booking_id="B2") + ["999"]
+        rows, rep = ingest.read_bookings(_csv([agree, disagree], header), _cfg())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].booking_id, "B1")
+        self.assertEqual(rep.errors[0][1], "rate")
