@@ -10,7 +10,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from . import hotelconfig as HC
+from .config import Hotel
 from .hotelconfig import HotelConfig
+from .ledger import Hold, Ledger
 
 STATUSES = ("booked", "in_house", "stayed", "cancelled", "no_show")
 TARGETS = ("RETAIL", "OTA", "CORP", "GROUP", "NONREV")
@@ -400,3 +403,108 @@ def infer_sellable_rooms(bookings: List[Booking]) -> RoomInference:
     for d, c in occ.items():
         per_year[d.year] = max(per_year.get(d.year, 0), c)
     return RoomInference(rooms, peak_night, within, second, per_year)
+
+
+class _Req:
+    """The five fields Ledger.book reads off a request."""
+    __slots__ = ("rid", "segment", "rooms", "arrival", "los")
+
+    def __init__(self, rid, segment, rooms, arrival, los):
+        self.rid, self.segment, self.rooms, self.arrival, self.los = rid, segment, rooms, arrival, los
+
+
+def nonrev_on(nonrev: List[Booking], night: dt.date, asof: Optional[dt.date] = None) -> int:
+    """NONREV rooms occupying `night`.  With asof, only rows booked on or before it,
+    so a pace curve built from these can move with the same clock as the ledger's."""
+    n = 0
+    for b in nonrev:
+        if not b.occupies or b.nights == 0:
+            continue
+        if asof is not None and b.booked_on > asof:
+            continue
+        if b.arrival <= night < b.departure:
+            n += 1
+    return n
+
+
+def replay(bookings: List[Booking], hotel: Hotel, first_stay: dt.date, last_stay: dt.date,
+           rep: Report) -> Ledger:
+    """Walk the log one calendar day at a time, booking, cancelling, freezing the
+    on-the-books picture and settling nights as they pass, into the same Ledger
+    the simulator builds.  NONREV rows and zero-night rows never enter it."""
+    ledger = Ledger(hotel, first_stay, last_stay)
+    by_day: Dict[dt.date, List[Booking]] = defaultdict(list)
+    cancels: Dict[dt.date, List[Booking]] = defaultdict(list)
+    for b in bookings:
+        if b.target in (None, "NONREV") or b.nights == 0:
+            continue
+        by_day[b.booked_on].append(b)
+        if b.status == "cancelled" and b.status_date is not None:
+            cancels[b.status_date].append(b)
+    holds: Dict[str, Hold] = {}
+    day = min(by_day) if by_day else first_stay
+    settled_upto = first_stay - dt.timedelta(days=1)
+    rid = 0
+    while day <= last_stay:
+        for b in by_day.get(day, ()):
+            rid += 1
+            hold = ledger.book(day, _Req(rid, b.target, 1, b.arrival, b.nights), b.rate)
+            if b.status == "no_show":
+                hold.no_show = True
+            holds[b.booking_id] = hold
+        for b in cancels.get(day, ()):
+            hold = holds.pop(b.booking_id, None)
+            if hold is not None:
+                ledger.cancel(hold)
+        ledger.snapshot(day, hotel.max_lead)
+        while settled_upto < day and settled_upto < last_stay:
+            night = settled_upto + dt.timedelta(days=1)
+            if night >= first_stay:
+                if ledger.rooms_on(night) > hotel.rooms:
+                    rep.warnings["over_capacity_nights"] += 1
+                ledger.settle(night)
+            settled_upto = night
+        day += dt.timedelta(days=1)
+    return ledger
+
+
+@dataclass
+class IngestResult:
+    ledger: Ledger
+    hotel: Hotel
+    cfg: HotelConfig
+    bookings: List[Booking]
+    nonrev: List[Booking]
+    inference: Optional[RoomInference]
+    report: Report
+    first_stay: dt.date
+    last_stay: dt.date
+
+
+def load(csv_path: str, hotel_json_path: str, seed: int = 20250115,
+         first_stay: Optional[dt.date] = None, last_stay: Optional[dt.date] = None) -> IngestResult:
+    """Read, map, group, impute and replay a booking log in one call, failing
+    before any global config is applied when the file has errors."""
+    cfg = HC.load_hotel_json(hotel_json_path)
+    bookings, rep = read_bookings(csv_path, cfg)
+    map_segments(bookings, cfg, rep)
+    detect_groups(bookings, cfg, rep)
+    impute_cancel_dates(bookings, rep, seed)
+    rep.fail_if_errors()
+    inference = None
+    if cfg.sellable_rooms is None:
+        inference = infer_sellable_rooms(bookings)
+        cfg.sellable_rooms = inference.rooms
+        rep.notes.append(
+            "sellable_rooms inferred as %d from the busiest night (%s); %d nights within 2%% of it, "
+            "second highest %d; yearly maxima %s. Inferred counts are biased low."
+            % (inference.rooms, inference.peak_night, inference.nights_within_2pct,
+               inference.second_highest, inference.per_year_max))
+    hotel = HC.apply(cfg)
+    nonrev = [b for b in bookings if b.target == "NONREV"]
+    if first_stay is None:
+        first_stay = min(b.arrival for b in bookings)
+    if last_stay is None:
+        last_stay = max(b.departure for b in bookings) - dt.timedelta(days=1)
+    ledger = replay(bookings, hotel, first_stay, last_stay, rep)
+    return IngestResult(ledger, hotel, cfg, bookings, nonrev, inference, rep, first_stay, last_stay)

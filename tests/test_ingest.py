@@ -312,3 +312,80 @@ class InferSellableRooms(unittest.TestCase):
         self.assertEqual(inf.second_highest, 12)   # 2025-02-01 has 10 + 1 comp + 1 in_house
         self.assertEqual(inf.per_year_max, {2025: 12, 2026: 12})
         self.assertEqual(inf.nights_within_2pct, 2)
+
+
+class Replay(unittest.TestCase):
+    def _load(self, rows, **over):
+        cfg_path = os.path.join(ROOT, "data", "sample-hotel.json")
+        if over:
+            import json
+            with open(cfg_path) as fh: d = json.load(fh)
+            d.update(over)
+            fd, cfg_path = tempfile.mkstemp(suffix=".json")
+            with os.fdopen(fd, "w") as fh: json.dump(d, fh)
+        return ingest.load(_csv(rows), cfg_path, seed=1)
+
+    def tearDown(self):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality(); config.reset_segments()
+
+    def test_paid_rooms_plus_nonrev_equals_stayed_rows_per_night(self):
+        rows = [_row(booking_id="S%d" % i, segment="WEB", arrival="2025-02-01", nights="2") for i in range(6)]
+        rows += [_row(booking_id="N%d" % i, segment="COMP", rate="0", arrival="2025-02-01", nights="1") for i in range(2)]
+        res = self._load(rows)
+        night = dt.date(2025, 2, 1)
+        self.assertEqual(res.ledger.rooms_on(night), 6)
+        self.assertEqual(ingest.nonrev_on(res.nonrev, night), 2)
+        self.assertEqual(res.ledger.rooms_on(night) + ingest.nonrev_on(res.nonrev, night), 8)
+        self.assertEqual(res.ledger.rooms_on(dt.date(2025, 2, 2)), 6)
+        self.assertNotIn("NONREV", res.ledger.segment_mix(night))
+
+    def test_snapshots_follow_booking_and_cancel_dates(self):
+        rows = [_row(booking_id="A", segment="WEB", booked_on="2025-01-02", arrival="2025-02-01", nights="1"),
+                _row(booking_id="B", segment="WEB", booked_on="2025-01-25", arrival="2025-02-01", nights="1"),
+                _row(booking_id="C", segment="WEB", booked_on="2025-01-02", arrival="2025-02-01", nights="1",
+                     status="cancelled", status_date="2025-01-20")]
+        res = self._load(rows)
+        night = dt.date(2025, 2, 1)
+        self.assertEqual(res.ledger.otb_at(night, 30), 2)   # 2025-01-02: A and C
+        self.assertEqual(res.ledger.otb_at(night, 7), 2)    # 2025-01-25: A and B, C cancelled on the 20th
+        self.assertEqual(res.ledger.otb_at(night, 0), 2)
+
+    def test_no_show_stays_on_the_books_until_arrival_then_drops(self):
+        rows = [_row(booking_id="X", segment="WEB", booked_on="2025-01-02", arrival="2025-02-01", nights="1", status="no_show")]
+        res = self._load(rows)
+        night = dt.date(2025, 2, 1)
+        self.assertEqual(res.ledger.otb_at(night, 7), 1)
+        self.assertEqual(res.ledger.settled[night]["rooms_sold"], 0)
+
+    def test_revenue_by_segment_uses_converted_rate(self):
+        rows = [_row(booking_id="U", segment="BOOKING", currency="USD", rate="100", arrival="2025-02-01", nights="1")]
+        res = self._load(rows)
+        self.assertAlmostEqual(res.ledger.seg_revenue[dt.date(2025, 2, 1)]["OTA"], 92.0)
+
+    def test_inference_fills_null_rooms_and_notes_the_ceiling(self):
+        rows = [_row(booking_id="S%d" % i, segment="WEB", arrival="2025-02-01", nights="1") for i in range(7)]
+        res = self._load(rows, sellable_rooms=None)
+        self.assertEqual(res.hotel.rooms, 7); self.assertIsNotNone(res.inference)
+        self.assertTrue(any("inferred" in n for n in res.report.notes))
+
+    def test_over_capacity_is_a_warning_not_a_stop(self):
+        rows = [_row(booking_id="S%d" % i, segment="WEB", arrival="2025-02-01", nights="1") for i in range(45)]
+        res = self._load(rows)   # sample hotel has 40 rooms
+        self.assertEqual(res.report.warnings["over_capacity_nights"], 1)
+
+    def test_rows_beyond_max_lead_or_max_los_are_kept_whole(self):
+        rows = [_row(booking_id="L", segment="WEB", booked_on="2024-01-01", arrival="2025-02-01", nights="12")]
+        res = self._load(rows)   # max_lead 180, max_los 7
+        self.assertEqual(res.ledger.rooms_on(dt.date(2025, 2, 12)), 1)
+
+    def test_load_stops_on_errors_with_all_of_them_listed(self):
+        rows = [_row(booking_id="B%d" % i, status="bogus") for i in range(3)] + [_row(booking_id="Z", segment="ZZZ")]
+        with self.assertRaises(ingest.IngestError) as cm:
+            self._load(rows)
+        self.assertIn("3 row errors", str(cm.exception)); self.assertIn("ZZZ", str(cm.exception))
+
+    def test_sample_file_loads(self):
+        res = ingest.load(os.path.join(ROOT, "data", "sample-bookings.csv"), os.path.join(ROOT, "data", "sample-hotel.json"))
+        self.assertGreater(res.ledger.n_bookings, 100)
