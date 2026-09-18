@@ -143,12 +143,42 @@ class ExplicitTorontoConfig(unittest.TestCase):
         config.reset_segments()
 
     def test_spelled_out_toronto_matches_quick_golden(self):
+        from pace import calendar as C
+        from pace import config
         from pace import hotelconfig as HC
+        # Move the engine off its defaults first: an apply() that quietly did
+        # nothing would otherwise pass this test, since the fixture spells out
+        # the values that are already active.
+        C.set_seasonality(C.Seasonality({m: 1.0 for m in range(1, 13)},
+                                        {m: "shoulder" for m in range(1, 13)}))
+        config.configure_segments({"CORP": 0.5, "GROUP": 0.4}, {"OTA": 0.30})
         cfg = HC.load_hotel_json(os.path.join(ROOT, "tests", "fixtures", "toronto-hotel.json"))
         HC.apply(cfg)
+        self.assertEqual(config.SEGMENTS["CORP"].rate_multiplier, 0.82)
+        self.assertEqual(config.SEGMENTS["OTA"].commission, 0.17)
         scores = _run(quick=True)["backtest"]["scores"]
         for policy, want in QUICK_REVPAR.items():
             self.assertAlmostEqual(scores[policy]["revpar"], want, delta=TOLERANCE)
+
+    def test_applied_price_factors_reach_the_reference_rate(self):
+        """An applied config must actually reach reference_rate, not just sit
+        in the config object (ADR 0007)."""
+        import dataclasses
+        import datetime as dt
+        from pace import hotelconfig as HC
+        from pace import scenario as S
+        from pace import simulate as SIM
+
+        cfg = HC.load_hotel_json(os.path.join(ROOT, "tests", "fixtures", "toronto-hotel.json"))
+        HC.apply(cfg)
+        d = dt.date(2024, 7, 15)
+        toronto_rate = SIM.reference_rate(S.HOTEL, S.CALENDAR, d, "RETAIL")
+
+        flat_cfg = dataclasses.replace(cfg, price_month_factor={m: 1.0 for m in range(1, 13)})
+        HC.apply(flat_cfg)
+        flat_rate = SIM.reference_rate(S.HOTEL, S.CALENDAR, d, "RETAIL")
+
+        self.assertNotAlmostEqual(toronto_rate, flat_rate)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,12 @@ class LoadHotelJson(unittest.TestCase):
             HC.load_hotel_json(_write(d))
         self.assertIn("price_month_factor", str(cm.exception))
 
+    def test_unknown_key_is_rejected(self):
+        d = dict(TORONTO); d["_derivation"] = {"window": "2015-07-01"}
+        with self.assertRaises(HC.ConfigError) as cm:
+            HC.load_hotel_json(_write(d))
+        self.assertIn("_derivation", str(cm.exception))
+
     def test_apply_returns_a_hotel_and_sets_the_seams(self):
         cfg = HC.load_hotel_json(_write(TORONTO))
         hotel = HC.apply(cfg)

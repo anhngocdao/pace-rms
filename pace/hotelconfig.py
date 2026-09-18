@@ -57,25 +57,15 @@ def _months(raw: dict, name: str) -> dict:
     return out
 
 
-def load_hotel_json(path: str, strict: bool = True) -> HotelConfig:
+def load_hotel_json(path: str) -> HotelConfig:
+    """Load and validate a hotel.json. Every field in REQUIRED is mandatory:
+    a real hotel must not run on Toronto's seasons, events, contract ratios
+    or threshold by falling through to a default (ADR 0007)."""
     with open(path, encoding="utf-8") as fh:
         raw = json.load(fh)
-    if strict:
-        missing = [k for k in REQUIRED if k not in raw]
-        if missing:
-            raise ConfigError("hotel.json is missing: %s" % ", ".join(missing))
-    else:
-        tor = C.toronto_seasonality()
-        defaults = {
-            "price_month_factor": tor.price_month_factor,
-            "demand_season_band": tor.demand_season_band,
-            "segment_rate_ratio": {c: s.rate_multiplier for c, s in config.DEFAULT_SEGMENTS.items()},
-            "segment_commission": {c: s.commission for c, s in config.DEFAULT_SEGMENTS.items()},
-            "events": [], "fx": {}, "detect_groups": True, "rates_include_tax": "unknown",
-            "group_threshold_rooms": 10, "sellout_threshold": 0.97,
-        }
-        for k, v in defaults.items():
-            raw.setdefault(k, v)
+    missing = [k for k in REQUIRED if k not in raw]
+    if missing:
+        raise ConfigError("hotel.json is missing: %s" % ", ".join(missing))
     raw["price_month_factor"] = _months(raw["price_month_factor"], "price_month_factor")
     raw["demand_season_band"] = _months(raw["demand_season_band"], "demand_season_band")
     for code in list(raw["segment_rate_ratio"]) + list(raw["segment_commission"]):
