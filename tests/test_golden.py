@@ -132,5 +132,24 @@ class StdlibOnly(unittest.TestCase):
         self.assertEqual(offenders, [], "third-party imports are not allowed:\n" + "\n".join(offenders))
 
 
+class ExplicitTorontoConfig(unittest.TestCase):
+    """ADR 0007 moves to Accepted only when the configuration path reproduces
+    the golden numbers, not just the default path."""
+
+    def tearDown(self):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
+
+    def test_spelled_out_toronto_matches_quick_golden(self):
+        from pace import hotelconfig as HC
+        cfg = HC.load_hotel_json(os.path.join(ROOT, "tests", "fixtures", "toronto-hotel.json"))
+        HC.apply(cfg)
+        scores = _run(quick=True)["backtest"]["scores"]
+        for policy, want in QUICK_REVPAR.items():
+            self.assertAlmostEqual(scores[policy]["revpar"], want, delta=TOLERANCE)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,5 @@
 # ADR 0007: Hotel facts are configuration, not constants
-Status: Proposed · Date: 2026-09-17
+Status: Accepted · Date: 2026-09-17
 
 ## Context
 The engine reads four things that are facts about a hotel from module constants tuned for the simulated Toronto property: the monthly seasonality table `MONTH_FACTOR` in `pace/calendar.py`, which feeds both `reference_rate` (the denominator of every price ratio, and the ladder prior in `pace/policy.py`) and `season_band`, the estimation cell of pace curves, unconstraining and elasticity; the annual event list `_ANNUAL_EVENTS`, which enters `reference_rate` through the event multiplier; the per-segment `rate_multiplier` and `commission` in `pace/config.py` (CORP 0.82, GROUP 0.70); and the `sellout_threshold` of 0.97 that `unconstrain.py`, `elasticity.py` and `experiment.py` take as a function default to decide which nights were censored. Run unchanged on a resort in the Algarve, the engine would normalise Algarve prices against Toronto's seasons, pool nights into Toronto's demand classes, and price contracts at Toronto's ratios.

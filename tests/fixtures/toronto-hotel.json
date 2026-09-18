@@ -1,0 +1,64 @@
+{
+  "name": "Hotel Aurora",
+  "currency": "CAD",
+  "fx": {},
+  "sellable_rooms": 150,
+  "rates_include_tax": "unknown",
+  "group_threshold_rooms": 10,
+  "detect_groups": true,
+  "rate_floor": 109.0,
+  "rate_ceiling": 469.0,
+  "rate_step": 4.0,
+  "base_rate": 189.0,
+  "variable_cost": 31.0,
+  "max_lead": 180,
+  "max_los": 5,
+  "sellout_threshold": 0.97,
+  "price_month_factor": {
+    "1": 0.72,
+    "2": 0.78,
+    "3": 0.88,
+    "4": 0.96,
+    "5": 1.08,
+    "6": 1.18,
+    "7": 1.22,
+    "8": 1.2,
+    "9": 1.14,
+    "10": 1.02,
+    "11": 0.9,
+    "12": 0.82
+  },
+  "demand_season_band": {
+    "1": "trough",
+    "2": "trough",
+    "3": "trough",
+    "4": "shoulder",
+    "5": "shoulder",
+    "6": "peak",
+    "7": "peak",
+    "8": "peak",
+    "9": "peak",
+    "10": "shoulder",
+    "11": "trough",
+    "12": "trough"
+  },
+  "segment_rate_ratio": {
+    "CORP": 0.82,
+    "GROUP": 0.7
+  },
+  "segment_commission": {
+    "RETAIL": 0.02,
+    "OTA": 0.17,
+    "CORP": 0.0,
+    "GROUP": 0.0
+  },
+  "events": [],
+  "segment_map_order": [
+    "segment"
+  ],
+  "segment_map": {
+    "segment": {
+      "RETAIL": "RETAIL"
+    }
+  }
+}
