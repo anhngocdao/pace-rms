@@ -401,6 +401,38 @@ class Replay(unittest.TestCase):
         self.assertEqual(res.report.warnings["over_capacity_nights"], 0)
         self.assertEqual(res.report.warnings["rooms_walked_off_the_actuals"], 0)
 
+    def test_no_shows_drop_before_the_walk_so_the_count_is_the_settlement_not_the_picture(self):
+        # settle() releases the night's no-shows first and only then walks
+        # whatever is still over the room count. Counted from rooms_on() a
+        # moment earlier, the report charges the hotel for rooms that were
+        # never in the house at midnight: 42 stayed plus 3 no-show on a
+        # 40-room night reads as 5 rooms walked when the ledger walked 2.
+        night = dt.date(2025, 2, 1)
+        rows = [_row(booking_id="S%d" % i, segment="WEB", arrival="2025-02-01", nights="1") for i in range(42)]
+        rows += [_row(booking_id="N%d" % i, segment="WEB", arrival="2025-02-01", nights="1",
+                      status="no_show") for i in range(3)]
+        res = self._load(rows)
+        settled = res.ledger.settled[night]
+        self.assertEqual(settled["walked"], 2)
+        self.assertEqual(settled["rooms_sold"], 40)
+        self.assertEqual(res.report.warnings["rooms_walked_off_the_actuals"], settled["walked"])
+        self.assertEqual(res.report.warnings["over_capacity_nights"], 1)
+
+    def test_no_shows_absorbing_the_whole_excess_leave_nothing_to_report(self):
+        # 39 stayed plus 2 no-show on a 40-room night. Nothing is walked and
+        # every room sold is kept, so a warning here would be telling a hotel
+        # to reconcile an edit that never happened.
+        night = dt.date(2025, 2, 1)
+        rows = [_row(booking_id="S%d" % i, segment="WEB", arrival="2025-02-01", nights="1") for i in range(39)]
+        rows += [_row(booking_id="N%d" % i, segment="WEB", arrival="2025-02-01", nights="1",
+                      status="no_show") for i in range(2)]
+        res = self._load(rows)
+        settled = res.ledger.settled[night]
+        self.assertEqual(settled["walked"], 0)
+        self.assertEqual(settled["rooms_sold"], 39)
+        self.assertEqual(res.report.warnings["over_capacity_nights"], 0)
+        self.assertEqual(res.report.warnings["rooms_walked_off_the_actuals"], 0)
+
     def test_rows_beyond_max_lead_or_max_los_are_kept_whole(self):
         rows = [_row(booking_id="L", segment="WEB", booked_on="2024-01-01", arrival="2025-02-01", nights="12")]
         res = self._load(rows)   # max_lead 180, max_los 7

@@ -119,9 +119,10 @@ separate per-night NONREV count and returns it beside the ledger.
   acceptable header is an error too, with a sentence saying so.
 - Warnings never stop the run and are counted in the report: rate outside
   floor or ceiling (comp rooms, staff rates, long stays), rate <= 0,
-  cancelled without status_date, status_date clamped, occupancy above
-  sellable rooms on any night (`over_capacity_nights`, with the rooms that
-  left counted beside it as `rooms_walked_off_the_actuals`).
+  cancelled without status_date, status_date clamped, and a night that still
+  has more rooms occupying it than `sellable_rooms` once its no-shows have
+  dropped (`over_capacity_nights`, with the rooms actually removed counted
+  beside it as `rooms_walked_off_the_actuals`).
 - `status_date` after `arrival` for a cancellation is clamped to `arrival`
   (late cancellation). `status_date` before `booked_on` is clamped to
   `booked_on`. Both counts are reported.
@@ -138,7 +139,16 @@ overbooking itself. On a real booking log that means the night comes back
 **reduced**: fewer rooms sold and less revenue than the PMS recorded, because
 the engine will not report a hotel as having sold more rooms than it says it
 has. The report counts both the nights this happened on and the number of
-rooms removed, so the size of the edit is visible rather than implied.
+rooms removed, so the size of the edit is visible rather than implied. Both
+numbers are the settlement's own, counted after it ran and not from the
+booked position before it.
+
+No-shows drop first. A night is settled by releasing its no-show arrivals and
+only then walking whatever is still above `sellable_rooms`, which is what a
+front desk does and what the PMS will show. So a night that looks over
+capacity on paper may walk nobody, and it is then not counted here at all:
+41 rooms on the books for a 40-room night, 2 of them no-shows, sells 39 and
+reports nothing.
 
 There are two reasons a night lands here, and they want opposite answers:
 

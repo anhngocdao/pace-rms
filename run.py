@@ -102,7 +102,7 @@ def main(argv):
         print("rooms %d (%s)" % (res.hotel.rooms, "inferred" if res.inference else "from hotel.json"))
         for k, v in sorted(rep.warnings.items()):
             if not k.startswith("_"):
-                print("warning %-28s %d" % (k, v))
+                print("warning %-32s %d" % (k, v))
         for n in rep.notes:
             print("note", n)
         engine = PaceEngine(res.hotel, event_calendar(res.cfg))

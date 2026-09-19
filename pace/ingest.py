@@ -469,16 +469,21 @@ def replay(bookings: List[Booking], hotel: Hotel, first_stay: dt.date, last_stay
         while settled_upto < day and settled_upto < last_stay:
             night = settled_upto + dt.timedelta(days=1)
             if night >= first_stay:
-                held = ledger.rooms_on(night)
-                if held > hotel.rooms:
-                    # On the simulation a walk is a policy consequence. Here it
-                    # edits the hotel's own history: settle() is about to take
-                    # these rooms and their revenue back out of the actuals, so
-                    # the report says how many rooms leave, not only that a
-                    # night was over the stated count (docs/booking-log.md).
+                # Both counts come out of the settlement, never out of the
+                # picture a moment before it: settle() releases the night's
+                # no-shows first and walks whatever is still over the room
+                # count afterwards, so rooms_on(night) read beforehand counts
+                # rooms that were never in the house at midnight and reports a
+                # walk on nights where the no-shows absorbed the whole excess.
+                # On the simulation a walk is a policy consequence; here it
+                # edits the hotel's own history, so the report says how many
+                # rooms left as well as how many nights lost some, and a hotel
+                # can reconcile that number against its PMS
+                # (docs/booking-log.md, "Nights that go over the room count").
+                result = ledger.settle(night)
+                if result["walked"]:
                     rep.warnings["over_capacity_nights"] += 1
-                    rep.warnings["rooms_walked_off_the_actuals"] += held - hotel.rooms
-                ledger.settle(night)
+                    rep.warnings["rooms_walked_off_the_actuals"] += result["walked"]
             settled_upto = night
         day += dt.timedelta(days=1)
     return ledger

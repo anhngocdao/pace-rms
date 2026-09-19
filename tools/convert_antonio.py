@@ -296,6 +296,17 @@ def _gross_nights(out_rows, window=WARMUP, drop_duplicates=False) -> Dict[int, f
     demand means demand, and a comp room and a zero-rate room are the same kind
     of non-demand; excluding one and counting the other was an inconsistency,
     not a rule (settings.json, block added after the download).
+
+    One gap, deliberate and not closable here. TARGET_OF has no entry for the
+    four UNDEFINED_CH_* branches, so their rows always count as demand, even
+    though derive_hotel_json can later map one of them to NONREV by channel
+    majority. That mapping does not exist yet when this runs: the bands are an
+    input to the derived hotel.json, and the segment map is another output of
+    it, so neither can read the other. Reaching it would need the bands
+    recomputed once the map is known, which is a second pass over a
+    pre-registered derivation. It is unreachable on the public dataset, where
+    all four branches are empty at both hotels, and the audit prints them with
+    their zeros so a file where they are not stays visible.
     """
     seen = set()
     gross: Dict[int, float] = defaultdict(float)
