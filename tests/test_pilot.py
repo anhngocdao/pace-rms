@@ -4,11 +4,14 @@ import os
 import random
 import tempfile
 import unittest
+from collections import defaultdict
 
 from pace import hotelconfig as HC
 from pace import ingest
 from pace import pilot
 from pace.elasticity import acceptance as _price_acceptance
+from pace.ledger import Ledger
+from pace.policy import PaceEngine
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_HOTEL = os.path.join(ROOT, "tests", "fixtures", "pilot-hotel.json")
@@ -143,8 +146,21 @@ _WALK = {}
 
 
 def walked():
-    """One walk, built once and shared: it costs about a second."""
+    """One walk, built once and shared: it costs about a second.
+
+    `pace/pipeline.py` loads the real plugins/ directory (a late-announcement
+    signal, brand-floor and charm-pricing rules) into the module-level
+    registry in `pace/plugins.py` and never resets it.  Run this file inside
+    the full suite, after `test_golden.py` has run `pipeline.run()`, and
+    those plugins are still registered when this walk's engine calls
+    recommend(); run this file alone and the registry is empty.  Either is a
+    legitimate way to run one test file, but this walk's numbers cannot
+    depend on which one happened to run first, so plugins are reset to empty
+    before this walk is ever built.
+    """
     if "res" not in _WALK:
+        from pace import plugins as _plugins
+        _plugins.reset()
         path = _csv(history_rows(FIRST_ARRIVAL, NIGHTS))
         res = ingest.load(path, FIXTURE_HOTEL, seed=1)
         cal = HC.event_calendar(res.cfg)
@@ -162,6 +178,66 @@ def walked():
         # the fixture hotel back before handing the cached walk to the next one.
         HC.apply(_WALK["res"].cfg)
     return _WALK["res"], _WALK["walk"]
+
+
+def _replay_controls_at(res, stop_asof, drive_from, warmup_nights=60, refit_every=28):
+    """An independent day loop over the same rows `walked()` used, stopped at
+    one asof, with its own fresh Ledger and PaceEngine.
+
+    This mirrors pilot.walk()'s own mechanics exactly (fit once before the
+    first controls() call, controls before that day's rows arrive, book then
+    cancel then snapshot then settle, observe at the end of the day) so its
+    engine reaches the same state pilot.walk()'s engine reaches at the same
+    asof.  That is what makes it useful as a check: it is the only thing that
+    does not share pilot.walk()'s own filing.  Reading published_rate or
+    solved_on back off the walk's own output and asserting something about
+    it proves nothing about which stay_date it was filed under; a rate and a
+    solve day computed here, independently, by a loop that never touches a
+    WalkRecord, is something a wrong key in the walk's filing has no reason
+    to agree with by accident.
+    """
+    hotel = res.hotel
+    cal = HC.event_calendar(res.cfg)
+    ledger = Ledger(hotel, FIRST_ARRIVAL, FIRST_ARRIVAL + dt.timedelta(days=NIGHTS - 1))
+    engine = PaceEngine(hotel, cal, refit_every=refit_every, warmup_nights=warmup_nights)
+    by_day = defaultdict(list)
+    cancels = defaultdict(list)
+    for b in res.bookings:
+        if b.target in (None, "NONREV") or b.nights == 0:
+            continue
+        by_day[b.booked_on].append(b)
+        if b.status == "cancelled" and b.status_date is not None:
+            cancels[b.status_date].append(b)
+    holds = {}
+    day = min(by_day)
+    settled_upto = FIRST_ARRIVAL - dt.timedelta(days=1)
+    rid = 0
+    ctrl = None
+    while day <= stop_asof:
+        driving = day >= drive_from
+        if driving and engine.last_fit is None:
+            engine.observe(day, ledger)
+        ctrl = engine.controls(day, ledger) if driving else None
+        for b in by_day.get(day, ()):
+            rid += 1
+            hold = ledger.book(day, ingest._Req(rid, b.target, 1, b.arrival, b.nights), b.rate)
+            if b.status == "no_show":
+                hold.no_show = True
+            holds[b.booking_id] = hold
+        for b in cancels.get(day, ()):
+            hold = holds.pop(b.booking_id, None)
+            if hold is not None:
+                ledger.cancel(hold)
+        ledger.snapshot(day, hotel.max_lead)
+        while settled_upto < day and settled_upto < ledger.last_stay:
+            night = settled_upto + dt.timedelta(days=1)
+            if night >= FIRST_ARRIVAL:
+                ledger.settle(night)
+            settled_upto = night
+        if driving:
+            engine.observe(day, ledger)
+        day += dt.timedelta(days=1)
+    return ctrl, engine
 
 
 class LeakGuard(unittest.TestCase):
@@ -254,12 +330,23 @@ class LeakGuard(unittest.TestCase):
             self.assertEqual(res.ledger.settled[d]["rooms_sold"],
                              out.ledger.settled[d]["rooms_sold"], str(d))
 
-    def test_the_guard_rejects_a_forecast_from_a_forecaster_fit_on_the_whole_history(self):
-        """otb equality alone cannot catch a forecaster whose curves were
-        learned on data from after its own asof: rooms_on(d) never depends on
-        which fit produced the curves, only on which ledger and stay_date were
-        asked about.  Build a forecaster fit on the whole walked history (the
-        way the reviewer demonstrated: a walk whose ledger is honest but whose
+    def test_the_fit_recency_assertion_would_reject_a_forecaster_fit_on_the_whole_history(self):
+        """This test is about the shape of the assertion `fit_asof <= asof`,
+        not about pilot.walk()'s own wiring: it hand-builds WalkRecords and
+        asserts on values it just set, so it would stay green even if the
+        line that fills fit_asof inside walk() were deleted.  The wiring
+        itself, i.e. that walk() actually populates fit_asof correctly from
+        the real engine as it runs, is what
+        test_every_forecast_saw_the_snapshot_of_its_own_day exercises, since
+        it reads fit_asof off real WalkRecords that only pilot.walk()
+        produced.
+
+        What this test shows instead: otb equality alone cannot catch a
+        forecaster whose curves were learned on data from after its own
+        asof, because rooms_on(d) never depends on which fit produced the
+        curves, only on which ledger and stay_date were asked about.  Build a
+        forecaster fit on the whole walked history (the way the reviewer
+        demonstrated: a walk whose ledger is honest but whose
         engine.forecaster was fit at the very end, after every record) and
         show the otb check is blind to it while the fit-recency check is not.
         The shared engine is never touched: a separate Forecaster is built
@@ -296,6 +383,96 @@ class LeakGuard(unittest.TestCase):
         self.assertGreater(len(rejected), 100,
                            "the fit-recency guard did not reject records answered by a "
                            "forecaster fit on the whole history, so it is not a guard")
+
+    def test_published_rate_and_solved_on_are_filed_under_the_correct_stay_date(self):
+        """ctrl.rate.get(d) and engine.last_solved.get(d) are both plain dict
+        reads keyed by stay_date.  A wrong key, a neighbouring date read by
+        mistake, still returns a real rate and a real solve day, so nothing
+        the walk's own output says about itself can catch it.  An
+        independently replayed day loop (`_replay_controls_at`) can: it
+        recomputes ctrl fresh, keyed correctly by construction, so it has no
+        reason to share a mistake in the walk's own filing.
+
+        The three stay dates below were picked (from `python3 -c` against
+        `walked()`) because each has a calendar neighbour whose rate genuinely
+        differs at this asof: 2025-03-03 published 152.0 against a neighbour
+        at 150.0; 2025-03-09 published 154.0 against a neighbour at 152.0;
+        2025-03-16 published 154.0 against a neighbour at 152.0.  Filing any
+        of them under d + 1 day instead of d would read a different number,
+        which is what makes this check able to fail rather than pass on a
+        wrong key by coincidence.  A self-check below re-confirms the pair
+        still disagrees before trusting it.
+        """
+        res, out = walked()
+        stop_asof = dt.date(2025, 3, 2)
+        drive_from = SCORE_FIRST - dt.timedelta(days=45)
+        ctrl, engine = _replay_controls_at(res, stop_asof, drive_from, warmup_nights=60)
+
+        cases = [
+            (dt.date(2025, 3, 3), 1, 152.0, 150.0),
+            (dt.date(2025, 3, 9), 7, 154.0, 152.0),
+            (dt.date(2025, 3, 16), 14, 154.0, 152.0),
+        ]
+        checked = 0
+        for stay_date, lead, expected_rate, neighbour_rate in cases:
+            rec = out.records[(stay_date, lead)]
+            self.assertEqual(rec.asof, stop_asof)
+
+            oracle_rate = ctrl.rate[stay_date]
+            oracle_neighbour = ctrl.rate[stay_date + dt.timedelta(days=1)]
+            self.assertNotEqual(oracle_rate, oracle_neighbour,
+                               "%s and its neighbour no longer publish different rates; this "
+                               "pair can no longer catch a wrong key" % stay_date)
+            self.assertEqual(oracle_rate, expected_rate)
+            self.assertEqual(oracle_neighbour, neighbour_rate)
+
+            self.assertEqual(rec.published_rate, oracle_rate,
+                             "the rate filed for %s at lead %d was %s; the independently "
+                             "replayed controls() says it should have been %s"
+                             % (stay_date, lead, rec.published_rate, oracle_rate))
+
+            oracle_solved = engine.last_solved.get(stay_date)
+            oracle_solved_day = oracle_solved[0] if oracle_solved else None
+            self.assertEqual(rec.solved_on, oracle_solved_day,
+                             "the solve day filed for %s at lead %d was %s; the independently "
+                             "replayed engine says it should have been %s"
+                             % (stay_date, lead, rec.solved_on, oracle_solved_day))
+            checked += 1
+        self.assertEqual(checked, len(cases))
+
+    def test_engine_ready_matches_the_engine_s_own_fit_log(self):
+        """engine_ready is supposed to mean not ready before the engine's own
+        first fit and ready from then on.  Check it against
+        engine.fit_log[0], which nothing in a record's own construction
+        controls, rather than assume a constant.
+
+        Every scored record in this fixture's driven window falls on or
+        after the engine's first fit: pilot.walk() forces that fit before the
+        first controls() call of the driven window (its own comment says so),
+        and by the time driving starts here roughly 350 nights have already
+        settled, far more than warmup_nights=60.  So every record below is
+        expected True, and there is no reachable False example in this
+        fixture to also check; a constant True would coincidentally match
+        every one of them too.  What this test adds over a constant is that
+        the expectation is read from engine.fit_log rather than asserted
+        outright, so a hard-wired False (the review's own injected bug) is
+        still caught: it disagrees with what the fit log says every record
+        should be.
+        """
+        res, out = walked()
+        self.assertGreater(len(out.engine.fit_log), 0)
+        first_fit = dt.date.fromisoformat(out.engine.fit_log[0]["asof"])
+        mismatches = 0
+        checked = 0
+        for (d, lead), rec in out.records.items():
+            expected = rec.asof >= first_fit
+            if rec.engine_ready != expected:
+                mismatches += 1
+            checked += 1
+        self.assertEqual(mismatches, 0,
+                         "%d of %d records disagreed with the engine's own fit log about "
+                         "whether it was ready yet" % (mismatches, checked))
+        self.assertGreater(checked, 100)
 
 
 class WalkValidation(unittest.TestCase):
