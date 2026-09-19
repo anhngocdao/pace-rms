@@ -56,6 +56,24 @@ class RowBasics(unittest.TestCase):
         out, _, _ = CA.branch_rows([_arow(hotel="City Hotel"), _arow(hotel="City Hotel")], SETTINGS)
         self.assertEqual([o["booking_id"] for o in out], ["H2-000001", "H2-000002"])
 
+    def test_meal_reaches_the_booking_log(self):
+        out, _, _ = CA.branch_rows([_arow(meal="HB")], SETTINGS)
+        self.assertEqual(out[0]["meal"], "HB")
+        self.assertIn("meal", CA.OUT_COLUMNS)
+
+    def test_meal_is_written_by_the_dict_writer(self):
+        """extrasaction='ignore' drops any key not in OUT_COLUMNS, so a column
+        that is built and not listed is silently absent from the file."""
+        import csv as _csv
+        import io as _io
+        out, _, _ = CA.branch_rows([_arow(meal="SC")], SETTINGS)
+        buf = _io.StringIO()
+        w = _csv.DictWriter(buf, fieldnames=CA.OUT_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(out)
+        back = list(_csv.DictReader(_io.StringIO(buf.getvalue())))
+        self.assertEqual(back[0]["meal"], "SC")
+
 
 class RuleOrder(unittest.TestCase):
     def _branches(self, rows, settings=SETTINGS):

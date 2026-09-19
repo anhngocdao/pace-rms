@@ -45,6 +45,7 @@ class Booking:
     status_date: Optional[dt.date]
     updated_on: Optional[dt.date]
     row: int
+    meal: str = ""
     target: Optional[str] = None
     imputed_cancel: bool = False
 
@@ -267,7 +268,7 @@ def _parse_row(i: int, r: dict, cfg: HotelConfig, rep: Report) -> Optional[Booki
         segment=(r.get("segment") or "").strip(), rate_code=(r.get("rate_code") or "").strip(),
         source=(r.get("source") or "").strip(), room_type=(r.get("room_type") or "").strip(),
         company=(r.get("company") or "").strip(), status=status, status_date=status_date,
-        updated_on=dates["updated_on"], row=i,
+        updated_on=dates["updated_on"], row=i, meal=(r.get("meal") or "").strip(),
     )
 
 

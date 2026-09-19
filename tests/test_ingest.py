@@ -140,6 +140,22 @@ class ReadBookings(unittest.TestCase):
         self.assertEqual(rows[0].booking_id, "B1")
         self.assertEqual(rep.errors[0][1], "rate")
 
+    def test_meal_is_kept_when_the_column_is_there(self):
+        header = HEADER + ["meal"]
+        rows, rep = ingest.read_bookings(_csv([_row() + ["HB"]], header), _cfg())
+        self.assertEqual(rep.errors, [])
+        self.assertEqual(rows[0].meal, "HB")
+
+    def test_meal_is_empty_when_the_column_is_not_there(self):
+        rows, rep = ingest.read_bookings(_csv([_row()]), _cfg())
+        self.assertEqual(rep.errors, [])
+        self.assertEqual(rows[0].meal, "")
+
+    def test_meal_survives_multi_room_expansion(self):
+        header = HEADER + ["meal"]
+        rows, _ = ingest.read_bookings(_csv([_row(rooms="3") + ["FB"]], header), _cfg())
+        self.assertEqual([b.meal for b in rows], ["FB", "FB", "FB"])
+
 
 class MapSegments(unittest.TestCase):
     def _mapped(self, *rows, **over):

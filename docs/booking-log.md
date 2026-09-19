@@ -29,6 +29,7 @@ Optional:
 | rate_code | BAR, PROMO, CORP-xxx and so on; a mapping key |
 | source | channel or agent name; a mapping key |
 | room_type | kept and counted, not used by the engine yet |
+| meal | board code as the PMS spells it (BB, HB, FB, room only, and so on); kept and counted, not used by the engine. A rate that includes board is not comparable with one that does not, so any price comparison has to hold it constant |
 | company | company, travel agent or block code; used to recognise groups |
 | updated_on | YYYY-MM-DD, the PMS "last updated" date; upper bound when a cancel date has to be imputed |
 | rooms | integer >= 1, default 1; rows with rooms > 1 are expanded into one row per room |

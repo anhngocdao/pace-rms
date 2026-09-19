@@ -36,7 +36,7 @@ ALL_BRANCHES = ("COMP", "GROUPS", "OFFLINE_TO_GROUP", "TP_CLUSTER", "ADR0", "DIR
                 "UNDEFINED_CH_DIRECT", "UNDEFINED_CH_CORPORATE", "UNDEFINED_CH_GDS",
                 "UNDEFINED_CH_TATO", "UNDEFINED_FALLBACK")
 OUT_COLUMNS = ["booking_id", "booked_on", "arrival", "nights", "rooms", "rate", "currency", "segment",
-               "rate_code", "source", "room_type", "company", "status", "status_date", "updated_on"]
+               "rate_code", "source", "room_type", "meal", "company", "status", "status_date", "updated_on"]
 
 
 class ConvertStop(RuntimeError):
@@ -148,6 +148,7 @@ def branch_rows(rows: List[dict], settings: dict) -> Tuple[List[dict], Counter, 
             "arrival": arrival.isoformat(), "nights": str(nights), "rooms": "1",
             "rate": r["adr"], "currency": "EUR", "segment": branch, "rate_code": "",
             "source": r["distribution_channel"], "room_type": r["reserved_room_type"],
+            "meal": r["meal"],
             "company": company or agent, "status": status, "status_date": status_date, "updated_on": "",
             "_branch": branch, "_raw": r,
         })
