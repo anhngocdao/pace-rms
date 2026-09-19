@@ -1,5 +1,6 @@
 {
   "name": "Sample Hotel",
+  "city": "Porto",
   "currency": "EUR",
   "fx": {"USD": 0.92},
   "sellable_rooms": 40,
@@ -11,8 +12,10 @@
   "rate_step": 4,
   "base_rate": 140,
   "variable_cost": 18,
+  "walk_cost": 420,
   "max_lead": 180,
   "max_los": 7,
+  "max_overbook_pct": 0.05,
   "sellout_threshold": 0.97,
   "price_month_factor": {
     "1": 0.8, "2": 0.8, "3": 0.9, "4": 1.0, "5": 1.05, "6": 1.15,

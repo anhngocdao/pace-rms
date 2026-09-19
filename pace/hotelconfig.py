@@ -10,11 +10,17 @@ from .calendar import Event, EventCalendar
 from .config import Hotel
 
 REQUIRED = (
-    "name", "currency", "sellable_rooms", "rates_include_tax", "group_threshold_rooms",
+    "name", "city", "currency", "sellable_rooms", "rates_include_tax", "group_threshold_rooms",
     "detect_groups", "rate_floor", "rate_ceiling", "rate_step", "base_rate", "variable_cost",
-    "max_lead", "max_los", "sellout_threshold", "price_month_factor", "demand_season_band",
-    "segment_rate_ratio", "segment_commission", "events", "segment_map_order", "segment_map",
+    "walk_cost", "max_lead", "max_los", "max_overbook_pct", "sellout_threshold",
+    "price_month_factor", "demand_season_band", "segment_rate_ratio", "segment_commission",
+    "events", "segment_map_order", "segment_map",
 )
+
+# base_daily_demand is deliberately not here: it is read by the market
+# generator alone and never by the engine, so an ingested hotel cannot be
+# affected by the simulated hotel's value (ADR 0007).
+CONTRACTED = ("CORP", "GROUP")
 
 
 class ConfigError(ValueError):
@@ -24,6 +30,7 @@ class ConfigError(ValueError):
 @dataclass
 class HotelConfig:
     name: str
+    city: str
     currency: str
     sellable_rooms: Optional[int]
     rates_include_tax: str
@@ -34,8 +41,10 @@ class HotelConfig:
     rate_step: float
     base_rate: float
     variable_cost: float
+    walk_cost: float
     max_lead: int
     max_los: int
+    max_overbook_pct: float
     sellout_threshold: float
     price_month_factor: Dict[int, float]
     demand_season_band: Dict[int, str]
@@ -58,13 +67,30 @@ def _months(raw: dict, name: str) -> dict:
 
 
 def _check_segments(ratio, commission) -> None:
-    """Both tables name segments the engine actually has."""
+    """Both tables name segments the engine actually has, and every contracted
+    segment states its own ratio: an absent CORP or GROUP would otherwise be
+    priced at the simulated hotel's 0.82 and 0.70 without a word (ADR 0007)."""
     for table, name in ((ratio, "segment_rate_ratio"), (commission, "segment_commission")):
         if not isinstance(table, dict):
             raise ConfigError("%s must map segment codes to numbers" % name)
     for code in list(ratio) + list(commission):
         if code not in config.DEFAULT_SEGMENTS:
             raise ConfigError("unknown segment %r in hotel.json" % code)
+    # The values too, and here rather than in configure_segments: that one
+    # rebuilds SEGMENTS entry by entry, so a value it cannot read raises with
+    # some of the table already replaced and the rest of the engine, including
+    # seasonality, already pointed at this hotel.
+    for table, name in ((ratio, "segment_rate_ratio"), (commission, "segment_commission")):
+        for code, value in table.items():
+            try:
+                float(value)
+            except (TypeError, ValueError):
+                raise ConfigError("%s[%r] is %r, which is not a number" % (name, code, value))
+    missing = [c for c in CONTRACTED if c not in ratio]
+    if missing:
+        raise ConfigError("segment_rate_ratio is missing %s; a contracted segment with no ratio of "
+                          "its own would be priced at the simulated hotel's (ADR 0007)"
+                          % ", ".join(missing))
 
 
 def load_hotel_json(path: str) -> HotelConfig:
@@ -103,15 +129,19 @@ def apply(cfg: HotelConfig) -> Hotel:
     _check_segments(cfg.segment_rate_ratio, cfg.segment_commission)
     try:
         seasonality = C.Seasonality(cfg.price_month_factor, cfg.demand_season_band).validate()
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
+        # TypeError as well: a month factor that is a string reaches validate()
+        # as "x" <= 0, and a hotel is owed a sentence rather than a traceback.
         raise ConfigError("seasonality in hotel.json is unusable: %s" % exc)
     try:
         hotel = Hotel(
-            name=cfg.name, currency=cfg.currency, rooms=int(cfg.sellable_rooms),
+            name=cfg.name, city=cfg.city, currency=cfg.currency, rooms=int(cfg.sellable_rooms),
             base_rate=float(cfg.base_rate), rate_floor=float(cfg.rate_floor),
             rate_ceiling=float(cfg.rate_ceiling), rate_step=float(cfg.rate_step),
-            variable_cost=float(cfg.variable_cost), max_lead=int(cfg.max_lead),
-            max_los=int(cfg.max_los), sellout_threshold=float(cfg.sellout_threshold),
+            variable_cost=float(cfg.variable_cost), walk_cost=float(cfg.walk_cost),
+            max_lead=int(cfg.max_lead), max_los=int(cfg.max_los),
+            max_overbook_pct=float(cfg.max_overbook_pct),
+            sellout_threshold=float(cfg.sellout_threshold),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError("hotel.json has a field the engine cannot read: %s" % exc)

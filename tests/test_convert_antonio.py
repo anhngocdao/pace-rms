@@ -1,4 +1,5 @@
 import datetime as dt
+import inspect
 import json
 import os
 import statistics
@@ -11,8 +12,12 @@ from tools import convert_antonio as CA
 from pace import calendar as C
 from pace import config
 from pace import hotelconfig as HC
+from pace import ingest as PI
 
-SETTINGS = {"group_threshold_rooms": 10, "undefined_stop_share": 0.01, "seed": 20250115}
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+SETTINGS = {"group_threshold_rooms": 10, "undefined_stop_share": 0.01, "seed": 20250115,
+            "_added_after_the_download": {"walk_cost_share": 3.0, "max_overbook_pct": 0.05}}
 
 
 def _arow(**kw):
@@ -286,12 +291,22 @@ class Basket(unittest.TestCase):
 class MaxLeadFloor(unittest.TestCase):
     def _rows(self):
         rows = []
-        for m in range(7, 13):
-            rows += [_arow(arrival_date_year="2015", arrival_date_month=list(CA.MONTHS)[m - 1],
-                           adr=str(100 + m)) for _ in range(20)]
-        for m in range(1, 7):
-            rows += [_arow(arrival_date_year="2016", arrival_date_month=list(CA.MONTHS)[m - 1],
-                           adr=str(100 + m)) for _ in range(20)]
+        for year, months in (("2015", range(7, 13)), ("2016", range(1, 7))):
+            for m in months:
+                name = list(CA.MONTHS)[m - 1]
+                rows += [_arow(arrival_date_year=year, arrival_date_month=name,
+                               adr=str(100 + m)) for _ in range(20)]
+                # Contract and group business every month, because
+                # derive_hotel_json now refuses to write a segment_rate_ratio
+                # with CORP or GROUP missing from it. This fixture is about
+                # max_lead, and every row here carries the same lead time, so
+                # the extra rows cannot change what it measures.
+                rows += [_arow(arrival_date_year=year, arrival_date_month=name,
+                               market_segment="Corporate", distribution_channel="Corporate",
+                               adr=str(round((100 + m) * 0.8))) for _ in range(12)]
+                rows += [_arow(arrival_date_year=year, arrival_date_month=name,
+                               market_segment="Groups", distribution_channel="TA/TO",
+                               adr=str(round((100 + m) * 0.6))) for _ in range(12)]
         out, _, _ = CA.branch_rows(rows, SETTINGS)
         return out
 
@@ -346,6 +361,79 @@ class Bands(unittest.TestCase):
         out, _, _ = CA.branch_rows(rows, SETTINGS)
         _, _, gross_by_month = CA.demand_season_band(out)
         self.assertEqual(gross_by_month[1], 0)
+
+    def test_every_nonrev_branch_is_out_of_gross_demand_not_only_comp(self):
+        # COMP and ADR0 both map to NONREV, so gross demand counts neither.
+        # The old rule named COMP alone and let ADR0 through, which put a
+        # month's comp rooms and its zero-rate rooms on opposite sides of a
+        # line that means the same thing on both (settings.json records the
+        # change, and its direction, under the post-download block).
+        rows = [_arow(arrival_date_year="2015", arrival_date_month="August") for _ in range(4)]
+        rows += [_arow(arrival_date_year="2016", arrival_date_month="January",
+                       market_segment="Complementary", adr="0") for _ in range(30)]
+        rows += [_arow(arrival_date_year="2016", arrival_date_month="February", adr="0") for _ in range(30)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        branches = Counter(o["_branch"] for o in out)
+        self.assertEqual(branches["COMP"], 30)
+        self.assertEqual(branches["ADR0"], 30)
+        self.assertEqual(CA.TARGET_OF["COMP"], "NONREV")
+        self.assertEqual(CA.TARGET_OF["ADR0"], "NONREV")
+        _, _, gross_by_month = CA.demand_season_band(out)
+        self.assertEqual(gross_by_month[1], 0)
+        self.assertEqual(gross_by_month[2], 0)
+
+
+class PreRegisteredValuesMatchTheSettingsFile(unittest.TestCase):
+    """data/antonio/settings.json was committed before hotels.csv was
+    downloaded, and it is the authority on every number in it. Some of those
+    numbers are also written as literals in the converter and in pace/ingest.py,
+    where the derivation reads better with them in it. This is the binding
+    between the two: a literal that drifts from the pre-registration fails here
+    rather than leaving a reader to guess which of the two was decided first."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, "data", "antonio", "settings.json"), encoding="utf-8") as fh:
+            cls.settings = json.load(fh)
+
+    def test_basket_trim_percentiles(self):
+        self.assertEqual(list(CA.BASKET_TRIM_PERCENTILES), self.settings["basket_trim_percentiles"])
+
+    def test_excluded_weeks(self):
+        as_text = [[a.isoformat(), b.isoformat()] for a, b in CA.EXCLUDED_WEEKS]
+        self.assertEqual(as_text, self.settings["excluded_weeks"])
+
+    def test_warmup_window(self):
+        self.assertEqual([d.isoformat() for d in CA.WARMUP], self.settings["warmup_window"])
+
+    def test_demand_band_split(self):
+        self.assertEqual(list(CA.DEMAND_BAND_SPLIT), self.settings["demand_band_split"])
+        self.assertEqual(sum(CA.DEMAND_BAND_SPLIT), 12)
+
+    def test_rate_step_ladder_and_its_one_euro_floor(self):
+        self.assertEqual(CA.RATE_STEP_CHOICES[0], self.settings["rate_step_min"])
+        self.assertEqual(min(CA.RATE_STEP_CHOICES), self.settings["rate_step_min"])
+        # The ladder length itself is section 9's "(ceiling minus floor) over
+        # 90", the rung count Toronto's own ladder has.
+        self.assertEqual(CA.RATE_STEP_LADDER_RUNGS, 90.0)
+
+    def test_the_seed_pace_ingest_defaults_to(self):
+        self.assertEqual(PI.DEFAULT_SEED, self.settings["seed"])
+        self.assertEqual(inspect.signature(PI.load).parameters["seed"].default,
+                         self.settings["seed"])
+
+    def test_the_settings_the_converter_reads_at_runtime_are_all_there(self):
+        # Everything the converter looks up by name must exist in the file, so
+        # a get() with a default can never quietly stand in for a registered
+        # number that was renamed or dropped.
+        for key in ("group_threshold_rooms", "undefined_stop_share", "bar_corr_threshold",
+                    "min_basket_rows", "min_ratio_rows", "floor_ceiling_widen", "sellout_threshold",
+                    "ota_commission_main", "variable_cost_low_share"):
+            self.assertIn(key, self.settings)
+        post = self.settings["_added_after_the_download"]
+        for key in ("walk_cost_share", "max_overbook_pct"):
+            self.assertIn(key, post)
+        self.assertIn("AFTER THE DOWNLOAD", post["_label"])
 
 
 class Ratios(unittest.TestCase):
@@ -422,6 +510,33 @@ class Ratios(unittest.TestCase):
         self.assertAlmostEqual(ratios["CORP"], 0.85, places=3)
 
 
+class RatioIsNeverPartial(unittest.TestCase):
+    """CORP and GROUP both get a measured ratio or the conversion stops. A
+    hotel.json with one of them missing loads on an older engine and prices
+    that segment at the simulated hotel's own ratio, silently (ADR 0007)."""
+
+    def _corp_only(self):
+        rows = []
+        for m in ("July", "August", "September"):
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=m, adr="200") for _ in range(35)]
+            rows += [_arow(arrival_date_year="2015", arrival_date_month=m, market_segment="Corporate",
+                           adr="160") for _ in range(35)]
+        out, _, _ = CA.branch_rows(rows, SETTINGS)
+        return out
+
+    def test_a_hotel_with_no_group_business_stops_instead_of_writing_a_hole(self):
+        settings = dict(SETTINGS, min_basket_rows=30, min_ratio_rows=30, floor_ceiling_widen=0.10,
+                        sellout_threshold=0.95, ota_commission_main=0.15, variable_cost_low_share=0.35,
+                        bar_corr_threshold=0.6)
+        ratios, _, _ = CA.segment_rate_ratio(self._corp_only(), settings)
+        self.assertIn("CORP", ratios)
+        self.assertNotIn("GROUP", ratios)
+        with self.assertRaises(CA.ConvertStop) as cm:
+            CA.derive_hotel_json(self._corp_only(), "H1", settings)
+        self.assertIn("GROUP", str(cm.exception))
+        self.assertIn("min_ratio_rows", str(cm.exception))
+
+
 class BarTest(unittest.TestCase):
     def _rows(self, contract_step):
         rows = []
@@ -472,6 +587,14 @@ class BarTest(unittest.TestCase):
                 rows.append(_arow(arrival_date_year="2015", arrival_date_month=list(CA.MONTHS)[m - 1],
                                   arrival_date_day_of_month=str(d), arrival_date_week_number=str(week),
                                   market_segment="Offline TA/TO", customer_type="Transient", adr=str(to)))
+            # Group rooms too, so derive_hotel_json below can write a complete
+            # segment_rate_ratio; the BAR verdict this test is about reads only
+            # the BAR and Offline TA/TO transient baskets, never these.
+            for _ in range(2):
+                rows.append(_arow(arrival_date_year="2015", arrival_date_month=list(CA.MONTHS)[m - 1],
+                                  arrival_date_day_of_month=str(d), arrival_date_week_number=str(week),
+                                  market_segment="Groups", distribution_channel="TA/TO",
+                                  adr=str(round(bar * 0.6, 2))))
         out, _, _ = CA.branch_rows(rows, SETTINGS)
         return out
 
@@ -529,8 +652,12 @@ class DerivedHotelJsonIsLoadable(unittest.TestCase):
                 for k in range(2):
                     rows.append(self._make_row(year, mnum, day, market_segment="Offline TA/TO", customer_type="Transient",
                                                 distribution_channel="TA/TO", adr=str(base + 1), adults="2"))
-            rows.append(self._make_row(year, mnum, 15, market_segment="Groups", distribution_channel="TA/TO",
-                                        adr=str(round(base * 0.55)), adults="2"))
+            # Ten group rooms a month, not one: a derived hotel.json without a
+            # GROUP ratio is now refused by the converter and by the loader, so
+            # a fixture that means to round trip has to clear the ratio gate.
+            for k in range(10):
+                rows.append(self._make_row(year, mnum, 15, market_segment="Groups", distribution_channel="TA/TO",
+                                            adr=str(round(base * 0.55)), adults="2"))
             rows.append(self._make_row(year, mnum, 20, market_segment="Complementary",
                                         distribution_channel="Direct", adr="0"))
         return rows
@@ -562,3 +689,60 @@ class DerivedHotelJsonIsLoadable(unittest.TestCase):
             self.assertIsNone(cfg.sellable_rooms)
             with self.assertRaises(HC.ConfigError):
                 HC.apply(cfg)  # sellable_rooms is still null at this stage
+
+
+class AuditPrintsEveryBranch(unittest.TestCase):
+    """The branch list in the audit is the only place a reader can see that a
+    rule ran. Printing only the branches that caught rows makes a rule that
+    found nothing look exactly like a rule that was never wired in, which is
+    the live case: the four undefined-channel branches are empty at both
+    hotels of the public dataset, and the Transient-Party branch was too until
+    a capitalisation bug was found."""
+
+    def _derived_and_audit(self, rows):
+        settings = dict(SETTINGS, bar_corr_threshold=0.6, min_basket_rows=5, min_ratio_rows=5,
+                        floor_ceiling_widen=0.10, sellout_threshold=0.95, ota_commission_main=0.15,
+                        variable_cost_low_share=0.35)
+        out, counts, _ = CA.branch_rows(rows, settings)
+        derived = CA.derive_hotel_json(out, "H1", settings)
+        return counts, CA.audit(out, "H1", settings, derived)
+
+    def _rows(self):
+        rows = []
+        for year, months in (("2015", range(7, 13)), ("2016", range(1, 7))):
+            for m in months:
+                name = list(CA.MONTHS)[m - 1]
+                rows += [_arow(arrival_date_year=year, arrival_date_month=name,
+                               adr=str(100 + m)) for _ in range(10)]
+                rows += [_arow(arrival_date_year=year, arrival_date_month=name,
+                               market_segment="Corporate", distribution_channel="Corporate",
+                               adr=str(round((100 + m) * 0.8))) for _ in range(6)]
+                rows += [_arow(arrival_date_year=year, arrival_date_month=name,
+                               market_segment="Groups", distribution_channel="TA/TO",
+                               adr=str(round((100 + m) * 0.6))) for _ in range(6)]
+        return rows
+
+    def test_a_branch_that_caught_nothing_is_printed_with_its_zero(self):
+        counts, text = self._derived_and_audit(self._rows())
+        self.assertEqual(counts["TP_CLUSTER"], 0)
+        self.assertEqual(counts["UNDEFINED_CH_GDS"], 0)
+        for branch in CA.ALL_BRANCHES:
+            self.assertIn("- %s: %d" % (branch, counts.get(branch, 0)), text)
+
+    def test_every_branch_the_rules_produce_is_in_all_branches(self):
+        # The zero lines are only honest while ALL_BRANCHES keeps up with the
+        # rules, so a branch the rules can emit and the list does not name is
+        # itself the failure.
+        rows = self._rows()
+        rows += [_arow(market_segment="Complementary", adr="0"),
+                 _arow(market_segment="Undefined", distribution_channel="GDS"),
+                 _arow(market_segment="Undefined", distribution_channel="Nowhere"),
+                 _arow(market_segment="Aviation", distribution_channel="Corporate"),
+                 _arow(market_segment="Offline TA/TO", customer_type="Contract"),
+                 _arow(market_segment="Online TA", distribution_channel="TA/TO"),
+                 _arow(market_segment="Offline TA/TO", customer_type="Group"),
+                 _arow(adr="0", reservation_status="No-Show")]
+        counts, _ = self._derived_and_audit(rows)
+        self.assertEqual([b for b in counts if b not in CA.ALL_BRANCHES], [])
+        self.assertTrue(set(counts) < set(CA.ALL_BRANCHES),
+                        "fixture should leave at least one branch empty")

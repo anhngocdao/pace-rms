@@ -21,9 +21,20 @@ MONTHS = {m: i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June", "July", "August",
      "September", "October", "November", "December"], start=1)}
 HOTEL_CODE = {"Resort Hotel": "H1", "City Hotel": "H2"}
+# Antonio, de Almeida and Nunes: H1 is the resort in the Algarve, H2 the city
+# hotel in Lisbon. Neither is in the file; both come from the paper.
+HOTEL_NAME = {"H1": "H1 Resort Hotel, Algarve", "H2": "H2 City Hotel, Lisbon"}
+HOTEL_CITY = {"H1": "Algarve", "H2": "Lisbon"}
 GROUP_BRANCHES = ("GROUPS", "OFFLINE_TO_GROUP", "TP_CLUSTER")
 CHANNEL_BRANCH = {"Direct": "UNDEFINED_CH_DIRECT", "Corporate": "UNDEFINED_CH_CORPORATE",
                   "GDS": "UNDEFINED_CH_GDS", "TA/TO": "UNDEFINED_CH_TATO"}
+# Every branch the rules can produce, in the order the rules are tried. The
+# audit prints all of them with their counts, zeros included: a rule that ran
+# and caught nothing has to look different from a rule that was never wired in.
+ALL_BRANCHES = ("COMP", "GROUPS", "OFFLINE_TO_GROUP", "TP_CLUSTER", "ADR0", "DIRECT", "ONLINE_TA",
+                "CORPORATE", "AVIATION", "OFFLINE_TO_CONTRACT", "OFFLINE_TO_TRANSIENT",
+                "UNDEFINED_CH_DIRECT", "UNDEFINED_CH_CORPORATE", "UNDEFINED_CH_GDS",
+                "UNDEFINED_CH_TATO", "UNDEFINED_FALLBACK")
 OUT_COLUMNS = ["booking_id", "booked_on", "arrival", "nights", "rooms", "rate", "currency", "segment",
                "rate_code", "source", "room_type", "company", "status", "status_date", "updated_on"]
 
@@ -151,9 +162,19 @@ def branch_rows(rows: List[dict], settings: dict) -> Tuple[List[dict], Counter, 
     return out, counts, notes
 
 
+# Every constant from here to RATE_STEP_CHOICES is pre-registered in
+# data/antonio/settings.json, committed before hotels.csv was downloaded. It is
+# written out here rather than read at runtime because a derivation reads better
+# with its numbers in it; the file stays the authority, and
+# tests/test_convert_antonio.py's PreRegisteredValuesMatchTheSettingsFile fails
+# the moment one of these drifts from the value that was registered.
 WARMUP = (dt.date(2015, 7, 1), dt.date(2016, 6, 30))
 EXCLUDED_WEEKS = [(dt.date(2016, 3, 21), dt.date(2016, 3, 27)),   # Easter week 2016
                   (dt.date(2015, 12, 24), dt.date(2016, 1, 1))]
+BASKET_TRIM_PERCENTILES = (0.01, 0.99)   # settings.json basket_trim_percentiles
+DEMAND_BAND_SPLIT = (4, 3, 5)            # settings.json demand_band_split
+RATE_STEP_LADDER_RUNGS = 90.0            # spec section 9: (ceiling - floor) over 90
+RATE_STEP_CHOICES = (1.0, 2.0, 5.0)      # the first is settings.json rate_step_min
 BAR_BRANCHES = {"DIRECT", "ONLINE_TA"}
 CORP_BRANCHES = {"CORPORATE", "AVIATION", "OFFLINE_TO_CONTRACT", "OFFLINE_TO_TRANSIENT"}
 TARGET_OF = {"COMP": "NONREV", "ADR0": "NONREV", "GROUPS": "GROUP", "OFFLINE_TO_GROUP": "GROUP",
@@ -189,7 +210,8 @@ def basket(out_rows, branches: set, window=WARMUP, settings=None, min_rows=None,
     if not cand:
         return [], False
     rates = [float(o["rate"]) for o in cand]
-    lo, hi = _percentile(rates, 0.01), _percentile(rates, 0.99)
+    lo, hi = (_percentile(rates, BASKET_TRIM_PERCENTILES[0]),
+              _percentile(rates, BASKET_TRIM_PERCENTILES[1]))
     cand = [o for o in cand if lo <= float(o["rate"]) <= hi]
     room = Counter(o["room_type"] for o in cand).most_common(1)[0][0]
     meal = Counter(o["_raw"]["meal"] for o in cand).most_common(1)[0][0]
@@ -260,18 +282,25 @@ def floor_ceiling(out_rows, settings) -> Tuple[float, float]:
 
 
 def rate_step(floor: float, ceiling: float) -> float:
-    raw = (ceiling - floor) / 90.0
-    for step in (1.0, 2.0, 5.0):
+    raw = (ceiling - floor) / RATE_STEP_LADDER_RUNGS
+    for step in RATE_STEP_CHOICES:
         if raw <= step * 1.5:
             return step
-    return 5.0
+    return RATE_STEP_CHOICES[-1]
 
 
 def _gross_nights(out_rows, window=WARMUP, drop_duplicates=False) -> Dict[int, float]:
+    """Room nights of demand per month: stayed, cancelled and no_show alike.
+
+    Every branch that maps to NONREV is out, COMP and ADR0 together. Gross
+    demand means demand, and a comp room and a zero-rate room are the same kind
+    of non-demand; excluding one and counting the other was an inconsistency,
+    not a rule (settings.json, block added after the download).
+    """
     seen = set()
     gross: Dict[int, float] = defaultdict(float)
     for o in out_rows:
-        if not _in_window(o, window) or o["_branch"] == "COMP":
+        if not _in_window(o, window) or TARGET_OF.get(o["_branch"]) == "NONREV":
             continue
         if o["_raw"]["deposit_type"] == "Non Refund":
             continue
@@ -287,8 +316,11 @@ def _gross_nights(out_rows, window=WARMUP, drop_duplicates=False) -> Dict[int, f
 
 
 def _rank_bands(by_month: Dict[int, float]) -> Dict[int, str]:
+    peak, shoulder, _trough = DEMAND_BAND_SPLIT
     order = sorted(range(1, 13), key=lambda m: (-by_month.get(m, 0.0), m))
-    return {**{m: "peak" for m in order[:4]}, **{m: "shoulder" for m in order[4:7]}, **{m: "trough" for m in order[7:]}}
+    return {**{m: "peak" for m in order[:peak]},
+            **{m: "shoulder" for m in order[peak:peak + shoulder]},
+            **{m: "trough" for m in order[peak + shoulder:]}}
 
 
 def demand_season_band(out_rows, window=WARMUP):
@@ -433,6 +465,17 @@ def derive_hotel_json(out_rows, hotel_code: str, settings: dict) -> dict:
     floor, ceiling = floor_ceiling(out_rows, settings)
     bands_gross, bands_occ, gross = demand_season_band(out_rows)
     ratios, per_origin, by_band = segment_rate_ratio(out_rows, settings)
+    absent = [t for t in ("CORP", "GROUP") if t not in ratios]
+    if absent:
+        # A hotel.json with a hole where a contract ratio should be is worse
+        # than no hotel.json: the engine would price that segment at whatever
+        # the last hotel configured left behind (ADR 0007). No ratio was
+        # measured, none may be invented, so the conversion stops here.
+        raise ConvertStop("%s: no origin of %s had a month with at least min_ratio_rows (%d) rows on "
+                          "both the contract and the public-rate side, so segment_rate_ratio would be "
+                          "written without %s; lower the gate or widen the window by hand, and say so"
+                          % (hotel_code, " and ".join(absent), int(settings.get("min_ratio_rows", 30)),
+                             " and ".join(absent)))
     verdict = bar_test(out_rows, settings)
     warm = [o for o in out_rows if _in_window(o, WARMUP)]
     leads = [int(o["_raw"]["lead_time"]) for o in warm]
@@ -447,14 +490,19 @@ def derive_hotel_json(out_rows, hotel_code: str, settings: dict) -> dict:
     seg_map["OFFLINE_TO_TRANSIENT"] = "OTA" if verdict["verdict"] == "OTA" else "CORP"
     for ch, branch in CHANNEL_BRANCH.items():
         seg_map[branch] = majority.get(ch, "RETAIL")
+    post = settings["_added_after_the_download"]
     return {
-        "name": {"H1": "H1 Resort Hotel, Algarve", "H2": "H2 City Hotel, Lisbon"}[hotel_code],
+        "name": HOTEL_NAME[hotel_code], "city": HOTEL_CITY[hotel_code],
         "currency": "EUR", "fx": {}, "sellable_rooms": None, "rates_include_tax": "unknown",
         "group_threshold_rooms": int(settings["group_threshold_rooms"]), "detect_groups": False,
         "rate_floor": floor, "rate_ceiling": ceiling, "rate_step": rate_step(floor, ceiling),
         "base_rate": round(br, 2),
         "variable_cost": round(br * float(settings["variable_cost_low_share"]), 2),
+        # Neither of these two is in booking history; both are settings, and
+        # settings.json says in one line each why they are what they are.
+        "walk_cost": round(br * float(post["walk_cost_share"]), 2),
         "max_lead": max_lead, "max_los": max(1, int(_percentile(nights, 0.99))) if nights else 7,
+        "max_overbook_pct": float(post["max_overbook_pct"]),
         "sellout_threshold": float(settings["sellout_threshold"]),
         "price_month_factor": {str(m): round(f, 4) for m, f in factors.items()},
         "demand_season_band": {str(m): b for m, b in bands_gross.items()},
@@ -490,8 +538,15 @@ def _to_booking(o: dict, row_no: int) -> PI.Booking:
 def audit(out_rows, hotel_code: str, settings: dict, derived: dict) -> str:
     raw = [o["_raw"] for o in out_rows]
     counts = Counter(o["_branch"] for o in out_rows)
-    lines = ["# Audit %s" % hotel_code, "", "## Rows per rule branch", ""]
-    lines += ["- %s: %d" % (b, n) for b, n in counts.most_common()]
+    lines = ["# Audit %s" % hotel_code, "", "## Rows per rule branch", "",
+             "Every branch the rules can produce, in the order they are tried, zeros included: "
+             "a rule that ran and found nothing has to read differently from a rule that never "
+             "ran at all.", ""]
+    lines += ["- %s: %d" % (b, counts.get(b, 0)) for b in ALL_BRANCHES]
+    stray = sorted(b for b in counts if b not in ALL_BRANCHES)
+    if stray:
+        lines += ["- branches not in ALL_BRANCHES, so this list has fallen behind the rules: %s"
+                  % ", ".join("%s %d" % (b, counts[b]) for b in stray)]
     adr0 = Counter((o["_raw"]["market_segment"], o["status"]) for o in out_rows if float(o["rate"]) == 0)
     lines += ["", "## adr = 0 rows by market segment and status", ""] + ["- %s / %s: %d" % (k[0], k[1], n) for k, n in adr0.most_common()]
     cross: Dict[str, Counter] = defaultdict(Counter)

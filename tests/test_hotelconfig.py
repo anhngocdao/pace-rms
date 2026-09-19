@@ -39,11 +39,12 @@ class SegmentSeam(unittest.TestCase):
 
 
 TORONTO = {
-    "name": "Hotel Aurora", "currency": "CAD", "fx": {},
+    "name": "Hotel Aurora", "city": "Toronto", "currency": "CAD", "fx": {},
     "sellable_rooms": 150, "rates_include_tax": "unknown",
     "group_threshold_rooms": 10, "detect_groups": True,
     "rate_floor": 109.0, "rate_ceiling": 469.0, "rate_step": 4.0, "base_rate": 189.0,
-    "variable_cost": 31.0, "max_lead": 180, "max_los": 5, "sellout_threshold": 0.97,
+    "variable_cost": 31.0, "walk_cost": 620.0, "max_lead": 180, "max_los": 5,
+    "max_overbook_pct": 0.06, "sellout_threshold": 0.97,
     "price_month_factor": {str(m): f for m, f in C.MONTH_FACTOR.items()},
     "demand_season_band": {str(m): b for m, b in C.toronto_seasonality().demand_season_band.items()},
     "segment_rate_ratio": {"CORP": 0.82, "GROUP": 0.70},
@@ -131,6 +132,44 @@ class ApplyIsAllOrNothing(unittest.TestCase):
     def test_an_unreadable_number_leaves_seasonality_untouched(self):
         self._refused(sellable_rooms="forty",
                       price_month_factor={str(m): 2.0 for m in range(1, 13)})
+
+    def _refused_after_load(self, **attrs):
+        """A config that reached apply() with a bad field set on it directly.
+        pace/ingest.py writes sellable_rooms onto a loaded config, so a
+        HotelConfig can differ from the file it came from by the time it gets
+        here, and apply() is the last place to notice."""
+        before = self._engine_state()
+        cfg = HC.load_hotel_json(_write(dict(TORONTO, price_month_factor={str(m): 2.0 for m in range(1, 13)})))
+        for k, v in attrs.items():
+            setattr(cfg, k, v)
+        with self.assertRaises(HC.ConfigError):
+            HC.apply(cfg)
+        self.assertEqual(self._engine_state(), before)
+
+    def test_a_ratio_that_is_not_a_number_leaves_seasonality_untouched(self):
+        # configure_segments is the last thing apply() does, so a value it
+        # cannot read used to raise with this hotel's seasons already live and
+        # the segment table half rebuilt, and with a bare ValueError that
+        # run.py does not catch.
+        self._refused_after_load(segment_rate_ratio={"CORP": "high", "GROUP": 0.70})
+
+    def test_a_commission_that_is_not_a_number_leaves_seasonality_untouched(self):
+        self._refused_after_load(segment_commission={"RETAIL": "two percent", "OTA": 0.17,
+                                                     "CORP": 0.0, "GROUP": 0.0})
+
+    def test_the_loader_refuses_a_ratio_that_is_not_a_number_before_apply_sees_it(self):
+        d = dict(TORONTO, segment_rate_ratio={"CORP": "high", "GROUP": 0.70})
+        with self.assertRaises(HC.ConfigError) as cm:
+            HC.load_hotel_json(_write(d))
+        self.assertIn("segment_rate_ratio", str(cm.exception))
+        self.assertIn("not a number", str(cm.exception))
+
+    def test_a_month_factor_that_is_not_a_number_is_a_config_error_not_a_traceback(self):
+        d = dict(TORONTO, price_month_factor={str(m): ("x" if m == 3 else 2.0) for m in range(1, 13)})
+        cfg = HC.load_hotel_json(_write(d))
+        with self.assertRaises(HC.ConfigError) as cm:
+            HC.apply(cfg)
+        self.assertIn("seasonality", str(cm.exception))
 
     def test_the_active_seasonality_is_not_the_config_object(self):
         cfg = HC.load_hotel_json(_write(TORONTO))
