@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from collections import defaultdict
 
+from pace import baselines
 from pace import hotelconfig as HC
 from pace import ingest
 from pace import pilot
@@ -642,3 +643,99 @@ class Windows(unittest.TestCase):
         hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))   # max_lead 40
         with self.assertRaises(pilot.PilotError):
             pilot.marks_for("H1", settings, hotel)
+
+
+def _settled_row(d, rooms):
+    return {"date": d, "rooms_sold": rooms, "revenue": 0.0, "walked": 0, "walk_cost": 0.0,
+            "adr": 0.0, "occupancy": 0.0, "revpar": 0.0, "mix": {}, "denied_observable": 0}
+
+
+def _seed(led, d, per_lead, final):
+    for lead, otb in per_lead.items():
+        led.snapshots[d][lead] = otb
+    led.settled[d] = _settled_row(d, final)
+
+
+class Baselines(unittest.TestCase):
+    """Hand-built snapshots with answers worked out by hand."""
+
+    NIGHT = dt.date(2025, 6, 4)          # a Wednesday
+    LEAD = 30
+
+    def _ledger(self):
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))
+        # first_stay is set to the tenth trailing reference's own date (d-98),
+        # not an arbitrary early date. Because STLY_BACK (364) is a multiple
+        # of 7, the same-time-last-year night seeded below is always
+        # weekday-aligned with NIGHT, so a looser first_stay (e.g. 2024-01-01)
+        # would leave it reachable by reference_nights' backward search and it
+        # would silently stand in for a deleted trailing week, which is
+        # exactly the "thinner estimator" outcome
+        # test_a_short_window_gives_none_rather_than_a_thinner_estimator
+        # exists to rule out. Bounding the ledger here means removing one of
+        # the ten trailing weeks leaves genuinely nothing earlier to search.
+        led = Ledger(hotel, self.NIGHT - dt.timedelta(days=98), dt.date(2025, 12, 31))
+        for k in range(5, 15):           # the ten Wednesdays from d-35 back to d-98
+            n = self.NIGHT - dt.timedelta(days=7 * k)
+            _seed(led, n, {self.LEAD: 10}, 16)
+        _seed(led, self.NIGHT - dt.timedelta(days=baselines.STLY_BACK), {self.LEAD: 10}, 16)
+        led.snapshots[self.NIGHT][self.LEAD] = 12
+        led.settled[self.NIGHT] = _settled_row(self.NIGHT, 20)
+        return led
+
+    def tearDown(self):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
+
+    def test_reference_nights_are_ten_same_weekday_nights_already_finished(self):
+        led = self._ledger()
+        refs = baselines.reference_nights(led, self.NIGHT, self.LEAD)
+        self.assertEqual(len(refs), 10)
+        self.assertEqual(refs[0], self.NIGHT - dt.timedelta(days=35))
+        self.assertEqual(refs[-1], self.NIGHT - dt.timedelta(days=98))
+        self.assertTrue(all(n.weekday() == self.NIGHT.weekday() for n in refs))
+
+    def test_a_night_that_had_not_finished_on_the_forecast_day_is_not_used(self):
+        led = self._ledger()
+        leaky = self.NIGHT - dt.timedelta(days=28)      # two days after asof
+        _seed(led, leaky, {self.LEAD: 10}, 16)
+        refs = baselines.reference_nights(led, self.NIGHT, self.LEAD)
+        self.assertNotIn(leaky, refs)
+        self.assertEqual(len(refs), 10)
+
+    def test_additive_pickup(self):
+        led = self._ledger()
+        self.assertAlmostEqual(baselines.additive_pickup(led, self.NIGHT, self.LEAD), 18.0)
+
+    def test_multiplicative_pickup(self):
+        led = self._ledger()
+        self.assertAlmostEqual(baselines.multiplicative_pickup(led, self.NIGHT, self.LEAD), 19.2)
+
+    def test_same_time_last_year_additive(self):
+        led = self._ledger()
+        self.assertAlmostEqual(baselines.stly_additive(led, self.NIGHT, self.LEAD), 18.0)
+
+    def test_the_average_is_of_the_two_additive_forms(self):
+        led = self._ledger()
+        out = baselines.all_baselines(led, self.NIGHT, self.LEAD)
+        self.assertAlmostEqual(out["average"], 18.0)
+        self.assertEqual(sorted(out), sorted(baselines.ORDER))
+
+    def test_a_short_window_gives_none_rather_than_a_thinner_estimator(self):
+        led = self._ledger()
+        del led.settled[self.NIGHT - dt.timedelta(days=98)]
+        out = baselines.all_baselines(led, self.NIGHT, self.LEAD)
+        self.assertIsNone(out["pickup_add"])
+        self.assertIsNone(out["pickup_mult"])
+        self.assertIsNone(out["average"])
+        self.assertIsNotNone(out["stly_add"])
+
+    def test_no_last_year_gives_none(self):
+        led = self._ledger()
+        del led.settled[self.NIGHT - dt.timedelta(days=baselines.STLY_BACK)]
+        out = baselines.all_baselines(led, self.NIGHT, self.LEAD)
+        self.assertIsNone(out["stly_add"])
+        self.assertIsNone(out["average"])
+        self.assertIsNotNone(out["pickup_add"])
