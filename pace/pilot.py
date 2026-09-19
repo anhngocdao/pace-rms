@@ -198,11 +198,19 @@ def walk(bookings: List[Booking], hotel: Hotel, cal: EventCalendar,
 
 
 FULL_NIGHT_NOTE = (
-    "A night counted here was full in the house and below the sell-out threshold "
-    "in the ledger, so the unconstrainer read it as an uncensored observation and "
-    "learned a demand that is too low. It is a count of how much censoring the "
-    "engine cannot see, not a correction, and the room count it is measured "
-    "against is itself inferred from the busiest observed night.")
+    "Two counts of a night the ledger could not see as full, and only one "
+    "supports a claim about the unconstrainer. full_but_invisible reads the "
+    "settled figure: the honest count of nights that were full in the "
+    "house while the rooms actually sold, after no-shows and any walk, "
+    "fell short of the sell-out threshold. full_but_uncensored_by_snapshot "
+    "reads the lead-0 snapshot instead, the same figure "
+    "pace/unconstrain.py's own censoring test reads, so it is the count of "
+    "nights the unconstrainer itself treated as an uncensored observation "
+    "and so learned a demand that is too low from. The two disagree on "
+    "nights whose no-shows or walked rooms are resolved between the "
+    "snapshot and the settlement. Neither count is a correction to the "
+    "engine's forecast, and the room count both are measured against is "
+    "itself inferred from the busiest observed night.")
 
 
 def percentile(values: Sequence[float], p: float) -> float:
@@ -262,21 +270,47 @@ def capacity_on(hotel: Hotel, nonrev: List[Booking], night: dt.date,
 
 def full_night_gap(bookings: List[Booking], ledger: Ledger, hotel: Hotel,
                    first: dt.date, last: dt.date) -> dict:
-    """Nights that were physically full while the ledger cannot see them as full."""
+    """Nights that were physically full while the ledger cannot see them as full.
+
+    `[first, last]` is a window over settled nights; the caller decides what
+    it is (the trimmed stay window, or a narrower scoring window inside it),
+    and the two counts below are shares of whichever one was passed, never
+    an unlabelled "share" that leaves the denominator to be guessed.
+
+    Two counts of "cannot see", because two ledger reads disagree about
+    which nights that is. `full_but_invisible` compares the settled figure,
+    `ledger.settled[d]["rooms_sold"]`, the honest record of what was
+    actually sold, against the sell-out cut; it is the primary count.
+    `full_but_uncensored_by_snapshot` compares the lead-0 snapshot instead,
+    `ledger.snapshots[d][0]`, which is the figure pace/unconstrain.py's own
+    censoring test reads (`final = snaps.get(0)`), so it is the count that
+    actually corresponds to what the unconstrainer treats as uncensored.
+    The two differ on nights whose no-shows or walked rooms are resolved
+    between the snapshot (taken before that night's settlement) and the
+    settlement itself; a night with no lead-0 snapshot at all is left out of
+    the second count, the same way class_demand() skips it entirely rather
+    than guessing which side of the cut it belongs on.
+    """
     occ = ingest.physical_occupancy(bookings)
     cut = hotel.rooms * hotel.sellout_threshold
     nights = [d for d in ledger.settled if first <= d <= last]
     physically_full = 0
-    invisible = 0
+    invisible_settled = 0
+    invisible_snapshot = 0
     for d in nights:
         if occ.get(d, 0) < cut:
             continue
         physically_full += 1
         if ledger.settled[d]["rooms_sold"] < cut:
-            invisible += 1
+            invisible_settled += 1
+        snap0 = ledger.snapshots.get(d, {}).get(0)
+        if snap0 is not None and snap0 < cut:
+            invisible_snapshot += 1
     return {"nights": len(nights), "physically_full": physically_full,
-            "full_but_invisible": invisible,
-            "share": (invisible / len(nights)) if nights else 0.0,
+            "full_but_invisible": invisible_settled,
+            "full_but_uncensored_by_snapshot": invisible_snapshot,
+            "share_of_nights": (invisible_settled / len(nights)) if nights else 0.0,
+            "share_of_full_nights": (invisible_settled / physically_full) if physically_full else 0.0,
             "threshold_rooms": round(cut, 2), "rooms": hotel.rooms}
 
 

@@ -582,16 +582,32 @@ class Windows(unittest.TestCase):
 
     def test_a_night_full_only_thanks_to_a_comp_room_is_invisible_to_the_ledger(self):
         # 20 rooms, sell-out threshold 0.97, so the ledger needs 20 rooms sold
-        # to call the night full.  19 sold plus one comp is full in the house.
+        # to call the night full.  19 sold plus one comp is full in the house
+        # but reads short in the ledger.  02-03 is a third night, full and
+        # sold out on its own with no comp room at all, so it must count
+        # toward physically_full without also counting toward
+        # full_but_invisible: without this night, a gap() that always set
+        # full_but_invisible equal to physically_full (an unconditional
+        # "true" in place of the settled comparison) would still pass, since
+        # the only physically full night in the original fixture happened to
+        # also be the only invisible one.  On the real data the split is 153
+        # physically full against 49 invisible, so this comparison is the
+        # function's central discrimination.
         rows = [_row(booking_id="S%d" % i, arrival="2024-02-01", nights="1") for i in range(19)]
         rows += [_row(booking_id="C1", segment="COMP", rate="0", arrival="2024-02-01", nights="1")]
         rows += [_row(booking_id="T%d" % i, arrival="2024-02-02", nights="1") for i in range(4)]
+        rows += [_row(booking_id="V%d" % i, arrival="2024-02-03", nights="1") for i in range(20)]
         res = self._bookings(rows)
         gap = pilot.full_night_gap(res.bookings, res.ledger, res.hotel,
-                                   dt.date(2024, 2, 1), dt.date(2024, 2, 2))
-        self.assertEqual(gap["physically_full"], 1)
+                                   dt.date(2024, 2, 1), dt.date(2024, 2, 3))
+        self.assertEqual(gap["nights"], 3)
+        self.assertEqual(gap["physically_full"], 2)
         self.assertEqual(gap["full_but_invisible"], 1)
-        self.assertEqual(gap["nights"], 2)
+        # No no-shows and no walk in this fixture, so the lead-0 snapshot and
+        # the settled figure agree on both full nights: the snapshot-based
+        # count lands on the same night as the settled-based one here, even
+        # though the two reads can disagree on real data.
+        self.assertEqual(gap["full_but_uncensored_by_snapshot"], 1)
 
     def test_the_deep_mark_is_h1_only(self):
         # Fixed from the brief: the fixture hotel's max_lead is 40, so 90 and
@@ -605,6 +621,21 @@ class Windows(unittest.TestCase):
         hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))
         self.assertNotIn(120, pilot.marks_for("H2", settings, hotel))
         self.assertIn(30, pilot.marks_for("H2", settings, hotel))
+
+    def test_the_h1_only_mark_survives_for_h1(self):
+        # test_the_deep_mark_is_h1_only only checks that an h1-only mark is
+        # absent for H2; nothing asserted that H1 itself still gets it.  A
+        # filter with its boolean flipped (`and` in place of `or`) would
+        # leave that test green while silently dropping the h1-only mark
+        # from H1 too, which would drop table 1's deepest mark on the
+        # flagship hotel without any test noticing.  40 is used here instead
+        # of 120 because it sits exactly at the fixture hotel's max_lead (a
+        # mark is refused only strictly past it), so it survives for H1
+        # without tripping that guard, where 120 would.
+        settings = {"lead_marks": [40, 30, 14, 7], "lead_marks_h1_only": [40]}
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))
+        self.assertIn(40, pilot.marks_for("H1", settings, hotel))
+        self.assertNotIn(40, pilot.marks_for("H2", settings, hotel))
 
     def test_a_mark_deeper_than_max_lead_is_refused(self):
         settings = {"lead_marks": [120, 90], "lead_marks_h1_only": []}
