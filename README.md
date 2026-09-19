@@ -120,7 +120,7 @@ pace/
   network.py       bid prices for (room type, night) cells, from an LP dual
   networkeval.py   whether the network control earns anything, measured
 plugins/           extension examples, loaded automatically
-tests/             175 checks, including the golden backtest numbers
+tests/             205 checks, including the golden backtest numbers
 ```
 
 ## Commands
@@ -135,7 +135,7 @@ python3 run.py network            score the network bid price against the nightl
 python3 run.py bench              where the time goes, and how it scales
 python3 run.py dashboard          rebuild the HTML from out/run.json
 python3 run.py ingest bookings.csv hotel.json   # a real booking log into the ledger
-python3 run.py test               175 checks, about 50 seconds
+python3 run.py test               205 checks, about 50 seconds
 ```
 
 Everything the dashboard shows is read from `out/run.json`, so the numbers on

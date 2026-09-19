@@ -375,6 +375,32 @@ class Replay(unittest.TestCase):
         res = self._load(rows)   # sample hotel has 40 rooms
         self.assertEqual(res.report.warnings["over_capacity_nights"], 1)
 
+    def test_the_rooms_walked_out_of_the_actuals_are_counted_not_only_the_night(self):
+        # settle() removes the excess rooms and their revenue from the night.
+        # On a real booking log that edits the hotel's own history, so the size
+        # of the edit has to be visible: five rooms left this night, and one
+        # night over capacity does not say that on its own.
+        rows = [_row(booking_id="S%d" % i, segment="WEB", arrival="2025-02-01", nights="1") for i in range(45)]
+        res = self._load(rows)   # sample hotel has 40 rooms
+        self.assertEqual(res.report.warnings["over_capacity_nights"], 1)
+        self.assertEqual(res.report.warnings["rooms_walked_off_the_actuals"], 5)
+        settled = res.ledger.settled[dt.date(2025, 2, 1)]
+        self.assertEqual(settled["walked"], 5)
+        self.assertEqual(settled["rooms_sold"], 40)
+
+    def test_two_over_capacity_nights_add_their_rooms_together(self):
+        rows = [_row(booking_id="A%d" % i, segment="WEB", arrival="2025-02-01", nights="1") for i in range(42)]
+        rows += [_row(booking_id="B%d" % i, segment="WEB", arrival="2025-02-05", nights="1") for i in range(43)]
+        res = self._load(rows)
+        self.assertEqual(res.report.warnings["over_capacity_nights"], 2)
+        self.assertEqual(res.report.warnings["rooms_walked_off_the_actuals"], 5)
+
+    def test_a_night_inside_the_room_count_walks_nothing_and_says_nothing(self):
+        rows = [_row(booking_id="S%d" % i, segment="WEB", arrival="2025-02-01", nights="1") for i in range(40)]
+        res = self._load(rows)
+        self.assertEqual(res.report.warnings["over_capacity_nights"], 0)
+        self.assertEqual(res.report.warnings["rooms_walked_off_the_actuals"], 0)
+
     def test_rows_beyond_max_lead_or_max_los_are_kept_whole(self):
         rows = [_row(booking_id="L", segment="WEB", booked_on="2024-01-01", arrival="2025-02-01", nights="12")]
         res = self._load(rows)   # max_lead 180, max_los 7
@@ -389,3 +415,74 @@ class Replay(unittest.TestCase):
     def test_sample_file_loads(self):
         res = ingest.load(os.path.join(ROOT, "data", "sample-bookings.csv"), os.path.join(ROOT, "data", "sample-hotel.json"))
         self.assertGreater(res.ledger.n_bookings, 100)
+
+    def test_a_valid_file_with_no_booking_rows_is_an_ingest_error_with_a_sentence(self):
+        # A header this reader accepts and nothing under it used to reach
+        # min() on an empty sequence, which is exactly the stack trace the
+        # rest of this path exists to keep away from a hotel.
+        with self.assertRaises(ingest.IngestError) as cm:
+            self._load([])
+        message = str(cm.exception)
+        self.assertIn("no booking rows", message)
+        self.assertIn("no history to replay", message)
+        self.assertNotIn("min()", message)
+
+
+class BookingIdRules(unittest.TestCase):
+    def test_an_empty_booking_id_is_reported_as_empty_not_as_a_duplicate(self):
+        rows = [_row(booking_id=""), _row(booking_id="", arrival="2025-03-01")]
+        _, rep = ingest.read_bookings(_csv(rows), _cfg())
+        self.assertEqual(len(rep.errors), 2)
+        for _row_no, column, message in rep.errors:
+            self.assertEqual(column, "booking_id")
+            self.assertIn("empty", message)
+            self.assertNotIn("duplicate", message)
+
+    def test_a_real_duplicate_still_says_duplicate(self):
+        rows = [_row(booking_id="B1"), _row(booking_id="B1", arrival="2025-03-01")]
+        _, rep = ingest.read_bookings(_csv(rows), _cfg())
+        self.assertEqual(len(rep.errors), 1)
+        self.assertIn("duplicate", rep.errors[0][2])
+
+
+class BookingLogDocExample(unittest.TestCase):
+    """docs/booking-log.md is the file that goes to a hotel. Its hotel.json
+    example is the first thing a hotel copies, so it has to be the whole file
+    and it has to load: an example short of the required fields costs the
+    hotel a round trip to be told about eleven missing keys."""
+
+    def _json_blocks(self):
+        with open(os.path.join(ROOT, "docs", "booking-log.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        blocks, rest = [], text
+        while "```json\n" in rest:
+            rest = rest.split("```json\n", 1)[1]
+            body, rest = rest.split("```", 1)
+            blocks.append(body)
+        return blocks
+
+    def test_the_example_is_the_sample_hotel_file_itself(self):
+        blocks = self._json_blocks()
+        self.assertEqual(len(blocks), 1)
+        with open(os.path.join(ROOT, "data", "sample-hotel.json"), encoding="utf-8") as fh:
+            sample = fh.read()
+        self.assertEqual(blocks[0].strip(), sample.strip())
+
+    def test_the_example_loads_through_the_real_loader(self):
+        import json as _json
+        raw = _json.loads(self._json_blocks()[0])
+        for key in HC.REQUIRED:
+            self.assertIn(key, raw, "the documented example is missing %s" % key)
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as fh:
+            _json.dump(raw, fh)
+        cfg = HC.load_hotel_json(path)
+        self.assertEqual(len(cfg.price_month_factor), 12)
+        self.assertIn("CORP", cfg.segment_rate_ratio)
+        self.assertIn("GROUP", cfg.segment_rate_ratio)
+
+    def test_the_document_says_what_happens_to_an_over_capacity_night(self):
+        with open(os.path.join(ROOT, "docs", "booking-log.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("rooms_walked_off_the_actuals", text)
+        self.assertIn("### Nights that go over the room count", text)

@@ -35,24 +35,63 @@ Optional:
 
 `hotel.json`:
 
+This is the whole file, not a sketch of it. Every key below is required on the
+ingest path, and the loader stops with a list of what is missing rather than
+falling back to another hotel's seasons, contract ratios or walk cost (ADR
+0007). It is `data/sample-hotel.json` in this repository, so it can be copied
+and edited rather than typed. Change the numbers and the tables, keep the keys.
+
 ```json
 {
-  "name": "H1 Resort",
+  "name": "Sample Hotel",
+  "city": "Porto",
   "currency": "EUR",
   "fx": {"USD": 0.92},
-  "sellable_rooms": null,
-  "rates_include_tax": "unknown",
-  "group_threshold_rooms": 10,
+  "sellable_rooms": 40,
+  "rates_include_tax": "no",
+  "group_threshold_rooms": 5,
   "detect_groups": true,
-  "rate_floor": 40, "rate_ceiling": 600,
+  "rate_floor": 60,
+  "rate_ceiling": 400,
+  "rate_step": 4,
+  "base_rate": 140,
+  "variable_cost": 18,
+  "walk_cost": 420,
+  "max_lead": 180,
+  "max_los": 7,
+  "max_overbook_pct": 0.05,
+  "sellout_threshold": 0.97,
+  "price_month_factor": {
+    "1": 0.8, "2": 0.8, "3": 0.9, "4": 1.0, "5": 1.05, "6": 1.15,
+    "7": 1.25, "8": 1.25, "9": 1.1, "10": 1.0, "11": 0.85, "12": 0.85
+  },
+  "demand_season_band": {
+    "1": "trough", "2": "trough", "3": "trough", "4": "shoulder", "5": "shoulder",
+    "6": "peak", "7": "peak", "8": "peak", "9": "peak", "10": "shoulder", "11": "trough", "12": "trough"
+  },
+  "segment_rate_ratio": {"CORP": 0.8, "GROUP": 0.7},
+  "segment_commission": {"RETAIL": 0.0, "OTA": 0.15, "CORP": 0.0, "GROUP": 0.0},
+  "events": [],
   "segment_map_order": ["segment", "rate_code", "source"],
   "segment_map": {
-    "segment":   {"Direct": "RETAIL", "Online TA": "OTA"},
-    "rate_code": {"BAR": "RETAIL", "CORP-*": "CORP"},
-    "source":    {"Booking.com": "OTA", "Walk-in": "RETAIL"}
+    "segment": {"WEB": "RETAIL", "PHONE": "RETAIL", "BOOKING": "OTA", "EXPEDIA": "OTA",
+                "CORP": "CORP", "GROUP": "GROUP", "COMP": "NONREV", "HOUSE": "NONREV"},
+    "rate_code": {"BAR": "RETAIL", "CORP-*": "CORP", "TO-*": "CORP"},
+    "source": {"Walk-in": "RETAIL", "Agoda": "OTA"}
   }
 }
 ```
+
+Two of these deserve a word. `walk_cost` is what it costs to relocate one guest
+whose room was sold twice: a room bought elsewhere at short notice, the
+transport there, and the goodwill afterwards. The engine reads it for every
+overbooking decision, so a wrong currency or a placeholder here is felt on
+every night. `max_overbook_pct` is the cap on that authorisation, as a share of
+`sellable_rooms`. Neither can be read out of booking history, so both are
+stated here or the file does not load.
+
+`sellable_rooms` may be `null`, and only that one field may be: the ingest then
+infers it (see below). Everything else must carry a real value.
 
 Mapping rules:
 
@@ -75,14 +114,44 @@ separate per-night NONREV count and returns it beside the ledger.
 
 - Errors are collected, up to 50, then the run stops with a list of row
   numbers and columns. It never stops at the first bad row.
+- A `booking_id` that is empty is an error in its own right, not a duplicate
+  of the previous empty one. A file with no booking rows at all under an
+  acceptable header is an error too, with a sentence saying so.
 - Warnings never stop the run and are counted in the report: rate outside
   floor or ceiling (comp rooms, staff rates, long stays), rate <= 0,
   cancelled without status_date, status_date clamped, occupancy above
-  sellable rooms on any night (duplicate rows or overbooking).
+  sellable rooms on any night (`over_capacity_nights`, with the rooms that
+  left counted beside it as `rooms_walked_off_the_actuals`).
 - `status_date` after `arrival` for a cancellation is clamped to `arrival`
   (late cancellation). `status_date` before `booked_on` is clamped to
   `booked_on`. Both counts are reported.
 - `stayed` needs no `status_date`; `nights` is nights actually stayed.
+
+### Nights that go over the room count
+
+Read this before sending a file, because it changes numbers you will recognise.
+
+When the rooms occupying a night exceed `sellable_rooms`, the ledger walks the
+excess: it takes those rooms and their revenue back out of that night, cheapest
+rate first, exactly as it would have done had the engine authorised the
+overbooking itself. On a real booking log that means the night comes back
+**reduced**: fewer rooms sold and less revenue than the PMS recorded, because
+the engine will not report a hotel as having sold more rooms than it says it
+has. The report counts both the nights this happened on and the number of
+rooms removed, so the size of the edit is visible rather than implied.
+
+There are two reasons a night lands here, and they want opposite answers:
+
+- `sellable_rooms` is too low. A hotel that sells 182 rooms on its best night
+  and states 180 should state 182, or state the number it really sells. This
+  is the common case, and the fix is the number, not the data.
+- The hotel genuinely overbooked and walked guests, or the export carries
+  duplicate rows. Then the reduction is telling the truth about the rooms and
+  the warning count is what to reconcile against the PMS.
+
+If neither is true and the actuals must come through untouched, raise
+`sellable_rooms` to the highest occupancy in the file. Nothing else in the
+ingest changes a number the hotel sent.
 
 ### Cancelled rows without a cancel date
 
