@@ -1,3 +1,4 @@
+import collections
 import csv
 import datetime as dt
 import os
@@ -10,6 +11,7 @@ from pace import baselines
 from pace import hotelconfig as HC
 from pace import ingest
 from pace import pilot
+from pace import score as S
 from pace.elasticity import acceptance as _price_acceptance
 from pace.ledger import Ledger
 from pace.policy import PaceEngine
@@ -774,3 +776,152 @@ class Baselines(unittest.TestCase):
         self.assertIsNone(out["stly_add"])
         self.assertIsNone(out["average"])
         self.assertIsNotNone(out["pickup_add"])
+
+
+class Scoring(unittest.TestCase):
+    def tearDown(self):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
+
+    def test_cell_statistics_on_hand_numbers(self):
+        # capacity 20 throughout; two forecasts above it, both clamped to 20.
+        raw = [25.0, 18.0, 30.0, 12.0]
+        clamped = [20.0, 18.0, 20.0, 12.0]
+        act = [20.0, 16.0, 19.0, 14.0]
+        cap = [20.0, 20.0, 20.0, 20.0]
+        out = S.cell(raw, clamped, act, cap)
+        self.assertEqual(out["n"], 4)
+        self.assertAlmostEqual(out["mae"], (0 + 2 + 1 + 2) / 4.0)
+        self.assertAlmostEqual(out["bias"], (0 + 2 + 1 - 2) / 4.0)
+        self.assertAlmostEqual(out["clamp_share"], 0.5)
+        self.assertAlmostEqual(out["mae_share"], 1.25 / 20.0)
+
+    def test_an_empty_cell_says_none_rather_than_zero(self):
+        out = S.cell([], [], [], [])
+        self.assertEqual(out["n"], 0)
+        self.assertIsNone(out["mae"])
+        self.assertIsNone(out["clamp_share"])
+
+    def test_season_cut_is_four_four_four_by_warm_up_occupancy(self):
+        _res, out = walked()
+        cut = S.season_cut(out.ledger, FIRST_ARRIVAL, SCORE_FIRST - dt.timedelta(days=1))
+        self.assertEqual(sorted(cut), list(range(1, 13)))
+        counts = collections.Counter(cut.values())
+        self.assertEqual((counts["high"], counts["shoulder"], counts["low"]), (4, 4, 4))
+
+    def test_event_windows(self):
+        self.assertEqual(S.event_of(dt.date(2017, 4, 14)), "Easter")
+        self.assertEqual(S.event_of(dt.date(2016, 12, 31)), "Christmas and New Year")
+        self.assertEqual(S.event_of(dt.date(2017, 5, 14)), "none")
+
+    def test_a_night_one_method_cannot_forecast_is_dropped_from_every_method(self):
+        """The design's rule: every table compares only nights on which every
+        method produced a forecast, and prints that count."""
+        res, out = walked()
+        table = S.score(out, res.hotel, res.bookings, res.nonrev, TEST_MARKS,
+                        SCORE_FIRST, SCORE_LAST, FIRST_ARRIVAL,
+                        SCORE_FIRST - dt.timedelta(days=1))
+        for lead in table["leads"] + [table["late_lead"]]:
+            ns = set(c["n"] for c in table["overall"][lead]["methods"].values())
+            self.assertEqual(len(ns), 1, "lead %s scored different methods on different nights" % lead)
+            self.assertEqual(table["overall"][lead]["n"], ns.pop())
+
+    def test_the_full_night_cut_counts_a_night_full_only_thanks_to_a_comp_room(self):
+        """Fixed from the brief: as written this test called `walked()`, whose
+        demand model caps each night's target at `min(19, base + noise)` with
+        base at most 15 (weekday and month bonuses), and the scoring window
+        (2025-02-01 to 2025-04-30) is neither Friday/Saturday-heavy nor July or
+        August, so the fixture's own physical occupancy inside the scored
+        window tops out at 8 rooms against a 20-room house (checked directly:
+        `ingest.physical_occupancy(res.bookings)` over that window peaks at 8,
+        the sellout cut is 20*0.97=19.4). The one deliberate overbooked night
+        the fixture does carry sits at 2024-08-08, entirely outside both the
+        warm-up and scoring windows. So `walked()` cannot produce a single
+        night classified "full" in this table at any lead, and the original
+        test could only ever fail on `assertIn("full", ...)` for a reason that
+        has nothing to do with whether the cut reads physical occupancy or the
+        settled figure -- the situation named in the test's own name never
+        occurs in that fixture.
+
+        Replaced with a hand-built ledger and booking list, the same technique
+        the `Baselines` class already uses for its own hand-worked numbers,
+        scoped to exactly the mechanism this test is named for: two nights,
+        one made full only by a comp room (19 revenue-bearing stays plus one
+        COMP stay, physical occupancy 20 against capacity 20, while the
+        ledger's own settled `rooms_sold` -- the figure the table scores
+        against -- is seeded at 19, under the cut on its own), the other left
+        with no bookings at all so its physical occupancy is 0 and it sorts
+        into not_full. Both nights carry the ten trailing same-weekday
+        references and the same-time-last-year reference every baseline
+        needs, seeded the same way `Baselines._ledger()` seeds them, or
+        `score()`'s own rule (every method must produce a forecast) would
+        drop the night from every cut before the full/not_full split is ever
+        reached.
+        """
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))    # 20 rooms, sellout 0.97 -> full at 19.4
+        lead = 30
+        full_night = dt.date(2025, 3, 5)          # a Wednesday inside the scoring window
+        plain_night = full_night + dt.timedelta(days=7)
+        led = Ledger(hotel, dt.date(2023, 1, 1), dt.date(2025, 12, 31))
+        for k in range(1, 17):                    # covers both nights' ten trailing weeks with room
+            n = full_night - dt.timedelta(weeks=k)
+            _seed(led, n, {lead: 10}, 16)
+        for night in (full_night, plain_night):
+            stly = night - dt.timedelta(days=baselines.STLY_BACK)
+            self.assertEqual(stly.weekday(), night.weekday())
+            _seed(led, stly, {lead: 10}, 16)
+        _seed(led, full_night, {lead: 12}, 19)    # settled 19: under the 20-room cut on its own
+        _seed(led, plain_night, {lead: 8}, 12)
+
+        def _stay(bid, arrival, segment, target):
+            return ingest.Booking(booking_id=bid, booked_on=arrival - dt.timedelta(days=60),
+                                  arrival=arrival, nights=1, rooms=1, rate=100.0, currency="EUR",
+                                  segment=segment, rate_code="", source="", room_type="STD",
+                                  company="", status="stayed", status_date=None, updated_on=None,
+                                  row=0, target=target)
+
+        bookings = [_stay("R%d" % i, full_night, "WEB", "RETAIL") for i in range(19)]
+        comp = _stay("C1", full_night, "COMP", "NONREV")
+        bookings.append(comp)                     # 19 + 1 comp = 20 physical, only "full" with it
+        nonrev = [comp]
+
+        class _Walk:
+            pass
+        walk_result = _Walk()
+        walk_result.ledger = led
+        walk_result.records = {
+            (full_night, lead): pilot.WalkRecord(stay_date=full_night, lead=lead,
+                                                 asof=full_night - dt.timedelta(days=lead),
+                                                 otb=12, forecast=18.0),
+            (plain_night, lead): pilot.WalkRecord(stay_date=plain_night, lead=lead,
+                                                  asof=plain_night - dt.timedelta(days=lead),
+                                                  otb=8, forecast=11.0),
+        }
+
+        table = S.score(walk_result, hotel, bookings, nonrev, [lead],
+                        full_night, plain_night,
+                        full_night - dt.timedelta(days=365), full_night - dt.timedelta(days=1))
+        self.assertIn("full", table["cuts"]["full"])
+        self.assertIn("not_full", table["cuts"]["full"])
+        self.assertEqual(table["cuts"]["full"]["full"][str(lead)]["n"], 1)
+        self.assertEqual(table["cuts"]["full"]["not_full"][str(lead)]["n"], 1)
+
+    def test_the_headline_names_a_single_baseline_when_one_beats_the_average(self):
+        res, out = walked()
+        table = S.score(out, res.hotel, res.bookings, res.nonrev, TEST_MARKS,
+                        SCORE_FIRST, SCORE_LAST, FIRST_ARRIVAL,
+                        SCORE_FIRST - dt.timedelta(days=1))
+        for lead, head in table["headline"].items():
+            if head["best_single"] is not None:
+                self.assertLess(head["best_single_mae"], head["average_mae"])
+
+    def test_every_note_is_carried(self):
+        res, out = walked()
+        table = S.score(out, res.hotel, res.bookings, res.nonrev, TEST_MARKS,
+                        SCORE_FIRST, SCORE_LAST, FIRST_ARRIVAL,
+                        SCORE_FIRST - dt.timedelta(days=1))
+        text = " ".join(table["notes"])
+        self.assertIn("not evidence of revenue", text)
+        self.assertIn("cannot forecast a decline", text)
