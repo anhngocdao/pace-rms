@@ -684,3 +684,101 @@ the engine's favour" checkable rather than promised.
 | `rate_step` | (ceiling minus floor) over 90, rounded to 1, 2 or 5 EUR, minimum 1 EUR |
 | Lead marks | 120 (H1 only, if `max_lead` allows), 90, 60, 30, 14, 7; lead 1 separate |
 | Rate comparison windows for table 2 | mark 60: leads 75 to 45; mark 30: 40 to 21; mark 14: 21 to 7; mark 7: 10 to 4 |
+
+## 10. What the audit found
+
+Added 19 September 2026, after the dataset was downloaded and converted. Every
+number here is measured, not recalled. Section 8 listed five things the design
+rested on that were recollections rather than facts; all five are now checked,
+and all five held.
+
+### The five recollections, checked
+
+| Recollection | What the data says |
+|---|---|
+| Most duplicated rows are rooms of one group | H1 has 2,325 distinct duplicated rows covering 6,092 extra copies, and 2,033 of them share an agent or a company with another row on the same arrival. H2 has 5,846 distinct, 25,902 extra copies, 5,565 sharing. Held. |
+| Aviation is a few hundred rows, under one room a night | 237 rows in total, all at H2, spread over 113 nights of a window more than 790 nights long. Not a standing block, so CORP is the right target. Held. |
+| Non Refund bookings cancel almost entirely | 12,868 such rows, 12,828 cancelled, 99.7 percent. Held, and the reason for excluding them from gross demand stands. |
+| Mean lead time near three months | 104 days across both hotels. Median lead is 57 days at H1 and 74 at H2. Held. |
+| One negative rate and one in the thousands | Exactly one of each: the lowest rate is -6.38 and the highest 5,400. Held, and it is why every price statistic is a median inside a trimmed basket. |
+
+The open question about tax and board has an answer too, though a partial one.
+Half board sits above bed and breakfast by a wide, steady margin at both
+hotels: 94.25 against 66.00 at H1, and 114.40 against 100.00 at H2. The rate
+therefore appears to include board. Nothing in the data speaks to tax, so the
+report keeps saying so.
+
+### What the data broke
+
+One defect survived every fixture and was found in the first minutes on the
+real file. The dataset spells the customer type `Transient-Party` with a
+capital P; the converter looked for `Transient-party`. All 25,124 such rows
+skipped the clustering rule, and the branch that rule feeds held zero rows at
+both hotels. Comparisons are now case-insensitive and whitespace-tolerant, for
+this field and for the two beside it, because a schema at version 0 must not be
+brittle about a vendor's capitalisation. The branch now holds 497 rows at H1
+and 6,241 at H2. This is the clearest argument in the project for why a pilot
+on real data comes before any claim about one.
+
+### The two hotels, as the converter sees them
+
+| | H1, Algarve resort | H2, Lisbon city |
+|---|---|---|
+| Rows | 40,060 | 79,330 |
+| Ledger bookings, cancellations | 39,402 and 10,796 | 78,333 and 32,123 |
+| Sellable rooms, inferred | 187, with 29 nights within 2 percent and yearly maxima 185, 187, 185 | 226, with 109 nights within 2 percent and yearly maxima 223, 226, 226 |
+| Base rate, floor, ceiling, step | 72.79, 32.02, 189.09, 2 | 92.14, 56.41, 166.10, 1 |
+| Peak months by price factor | August 1.84, July 1.58, June 1.50 | September 1.24, May 1.20, June 1.16 |
+| Trough by price factor | January, March, November, December, all 0.66 | July 0.70 |
+| Contract ratio, CORP and GROUP | 0.63 and 0.99 | 0.74 and 0.77 |
+| Offline agent transient, BAR test | contracted, residual correlation 0.11 by month and 0.31 by fortnight | contracted, 0.38 and 0.47 |
+
+The two seasonality curves come out of one piece of code and disagree with each
+other exactly as the two property types should. The resort peaks in August and
+sits on a flat winter floor of 48 EUR, which is why four of its months share a
+factor to four decimal places. The city hotel peaks in September and May and is
+cheapest in July, which is what a business house does when its corporate demand
+goes on holiday.
+
+Three results are worth stating plainly because they contradict what the
+simulated hotel assumes:
+
+- Groups at the resort pay 0.99 of the public rate, against the simulated
+  hotel's 0.70, and in the low season they pay 1.375 of it. A contracted rate
+  does not have to be a discount when the public rate is on the floor.
+- The offline agent transient cell is contracted at both hotels, under both
+  demeanings, so it maps to CORP. The design defaulted to that and the data
+  agrees, which is worth knowing because the alternative would have moved tens
+  of thousands of rows into a segment that floats with the public rate.
+- Fourteen percent of H1's rows and nine percent of H2's fall outside the rate
+  band derived from the first twelve months. The band is frozen on purpose, so
+  the pilot's rate table will be truncated at one end and has to say so.
+
+### Changes made after the download, and therefore not pre-registered
+
+The file that pre-registers the settings was committed eight minutes before the
+data arrived, so the ordering holds. Three things changed afterwards and are
+recorded in a separate, labelled block inside that file so a reader can tell
+them apart:
+
+- `walk_cost_share`, set to 3.0 of the base rate. A walk cost cannot be derived
+  from booking history, and the field had been falling through to the simulated
+  hotel's 620 in its own currency, which the engine reads on every overbooking
+  decision.
+- `max_overbook_pct`, set to 0.05, for the same reason.
+- The gross-demand rule was made consistent: rows whose mapped target is
+  non-revenue are excluded, where before one such branch was excluded and the
+  other was not. It moves 131 room nights of 67,251 at H1 and 254 of 72,313 at
+  H2, and changes no band label at either hotel.
+
+### What is still not known
+
+Nothing has been scored. No forecast has been compared with an outcome, no
+recommended rate with a realised one, and no unconstraining estimate with a
+known answer. Those are the pilot, specified in section 5, and they need the
+window trimming in section 4 applied through `ingest.load`, which nothing calls
+yet. The room counts at both hotels are inferred, so every night that reads as
+full reads that way against a number this project computed, and the diagnostic
+that would show how often a night was physically full while the ledger could
+not see it is specified and not yet built.
+
