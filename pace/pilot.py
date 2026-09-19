@@ -195,3 +195,98 @@ def walk(bookings: List[Booking], hotel: Hotel, cal: EventCalendar,
 
     return WalkResult(ledger=ledger, engine=engine, records=records, days=days,
                       seconds=time.time() - started, report=rep)
+
+
+FULL_NIGHT_NOTE = (
+    "A night counted here was full in the house and below the sell-out threshold "
+    "in the ledger, so the unconstrainer read it as an uncensored observation and "
+    "learned a demand that is too low. It is a count of how much censoring the "
+    "engine cannot see, not a correction, and the room count it is measured "
+    "against is itself inferred from the busiest observed night.")
+
+
+def percentile(values: Sequence[float], p: float) -> float:
+    """Linear interpolation between order statistics.
+
+    The same formula as tools/convert_antonio.py `_percentile`, repeated rather
+    than imported because pace/ must not depend on tools/: a hotel running the
+    ingest has the package and not the converter.
+    """
+    s = sorted(values)
+    if not s:
+        return 0.0
+    k = (len(s) - 1) * p
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def hotel_code(cfg) -> str:
+    """H1 out of "H1 Resort Hotel, Algarve", for file names and the 120 mark."""
+    head = (getattr(cfg, "name", "") or "").split()
+    return head[0].upper() if head else "HOTEL"
+
+
+def stay_window(bookings: List[Booking], last_cap: dt.date) -> Tuple[dt.date, dt.date]:
+    """The stay window the ledger is built over (design, section 4).
+
+    Guests who arrived before the export opened and were still in house are not
+    in the file, so its first nights are short by an unknown number of rooms.
+    Trim the front by the 99th percentile of length of stay: 14 nights at H1 and
+    9 at H2 on the public dataset. The back is capped because the export stops.
+    """
+    rows = [b for b in bookings if b.target not in (None, "NONREV") and b.nights > 0]
+    if not rows:
+        raise PilotError("no booking row reaches the ledger, so there is no stay window to take; "
+                         "check the segment map and that the export covers real stays")
+    trim = int(percentile([float(b.nights) for b in rows], 0.99))
+    first = min(b.arrival for b in rows) + dt.timedelta(days=trim)
+    last = min(max(b.departure for b in rows) - dt.timedelta(days=1), last_cap)
+    if last <= first:
+        raise PilotError("the stay window is empty after trimming %d nights off the front: "
+                         "first stay %s, last stay %s" % (trim, first, last))
+    return first, last
+
+
+def capacity_on(hotel: Hotel, nonrev: List[Booking], night: dt.date,
+                asof: Optional[dt.date] = None) -> int:
+    """Rooms that could still be sold on `night`, as known on `asof`.
+
+    Table 1 clamps to this before scoring, because on a full night a forecast
+    above capacity is not wrong. The comp rooms come off because they are not
+    for sale, and only the ones entered on or before `asof`, or every method is
+    handed a room count that was not knowable on the day it forecast.
+    """
+    return max(0, hotel.rooms - ingest.nonrev_on(nonrev, night, asof))
+
+
+def full_night_gap(bookings: List[Booking], ledger: Ledger, hotel: Hotel,
+                   first: dt.date, last: dt.date) -> dict:
+    """Nights that were physically full while the ledger cannot see them as full."""
+    occ = ingest.physical_occupancy(bookings)
+    cut = hotel.rooms * hotel.sellout_threshold
+    nights = [d for d in ledger.settled if first <= d <= last]
+    physically_full = 0
+    invisible = 0
+    for d in nights:
+        if occ.get(d, 0) < cut:
+            continue
+        physically_full += 1
+        if ledger.settled[d]["rooms_sold"] < cut:
+            invisible += 1
+    return {"nights": len(nights), "physically_full": physically_full,
+            "full_but_invisible": invisible,
+            "share": (invisible / len(nights)) if nights else 0.0,
+            "threshold_rooms": round(cut, 2), "rooms": hotel.rooms}
+
+
+def marks_for(code: str, settings: dict, hotel: Hotel) -> Tuple[int, ...]:
+    """Lead marks for this hotel, from the pre-registered list."""
+    only_first = set(int(m) for m in settings.get("lead_marks_h1_only", ()))
+    marks = [int(m) for m in settings["lead_marks"]]
+    out = [m for m in marks if m not in only_first or code.upper() == "H1"]
+    deep = [m for m in out if m > hotel.max_lead]
+    if deep:
+        raise PilotError("lead marks %s are deeper than the hotel's max_lead of %d, so no "
+                         "snapshot exists at them" % (deep, hotel.max_lead))
+    return tuple(sorted(out, reverse=True))

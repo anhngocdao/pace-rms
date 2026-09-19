@@ -514,3 +514,100 @@ class WalkValidation(unittest.TestCase):
                        first_stay=FIRST_ARRIVAL, last_stay=FIRST_ARRIVAL + dt.timedelta(days=10),
                        score_first=FIRST_ARRIVAL + dt.timedelta(days=5), score_last=FIRST_ARRIVAL,
                        marks=(1,), drive_from=FIRST_ARRIVAL)
+
+
+class Windows(unittest.TestCase):
+    def tearDown(self):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
+
+    def _bookings(self, rows):
+        res = ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
+        return res
+
+    def test_the_front_is_trimmed_by_the_longest_stays(self):
+        # Fixed from the brief: with `range(99)` background rows the single
+        # 6-night outlier was swamped (100 values, 99 of them 1s), so the
+        # 99th percentile landed at 1.05 (int 1) instead of pulling the trim
+        # toward the outlier, and `first` came out one day off arrival, not
+        # five.  Nine background rows plus the outlier (ten total) gives
+        # percentile 5.55 (int 5), matching the trim asserted below; checked
+        # against pace.pilot.percentile directly before changing this.  A
+        # late, unrelated one-night booking (arrival in June) is added so the
+        # back of the window, taken from the longest real departure, lands
+        # far past the trimmed front instead of colliding with it the way it
+        # did when every row arrived on the same day as the outlier.
+        rows = [_row(booking_id="A%d" % i, arrival="2024-01-01", nights="1") for i in range(9)]
+        rows += [_row(booking_id="L", arrival="2024-01-01", nights="6")]
+        rows += [_row(booking_id="Z", arrival="2024-06-01", nights="1")]
+        res = self._bookings(rows)
+        first, _last = pilot.stay_window(res.bookings, dt.date(2024, 12, 31))
+        self.assertEqual(first, dt.date(2024, 1, 1) + dt.timedelta(days=5))
+
+    def test_the_back_is_capped_by_the_export(self):
+        # Fixed from the brief: ten bookings all arriving on 2024-01-10 gave a
+        # natural last of 2024-01-10 (departure minus one day), which is
+        # before the trimmed first of 2024-01-11 (the 99th percentile of ten
+        # equal 1-night stays still trims 1 day off the single arrival day),
+        # so stay_window raised PilotError on an empty window before the cap
+        # could be observed at all.  Spreading the ten arrivals over ten
+        # different days keeps the natural last well past the trimmed front,
+        # so last_cap is what actually decides `last`.
+        rows = [_row(booking_id="A%d" % i,
+                     arrival=(dt.date(2024, 1, 1) + dt.timedelta(days=i)).isoformat(),
+                     nights="1") for i in range(10)]
+        res = self._bookings(rows)
+        _first, last = pilot.stay_window(res.bookings, dt.date(2024, 1, 5))
+        self.assertEqual(last, dt.date(2024, 1, 5))
+
+    def test_a_log_with_nothing_in_the_ledger_is_refused_in_a_sentence(self):
+        rows = [_row(booking_id="C%d" % i, segment="COMP", rate="0") for i in range(3)]
+        res = self._bookings(rows)
+        with self.assertRaises(pilot.PilotError):
+            pilot.stay_window(res.bookings, dt.date(2024, 12, 31))
+
+    def test_capacity_ignores_a_comp_room_entered_after_the_forecast_day(self):
+        rows = [_row(booking_id="S%d" % i, arrival="2024-02-01", nights="1") for i in range(5)]
+        rows += [_row(booking_id="C1", segment="COMP", rate="0", booked_on="2024-01-05",
+                      arrival="2024-02-01", nights="1"),
+                 _row(booking_id="C2", segment="COMP", rate="0", booked_on="2024-01-31",
+                      arrival="2024-02-01", nights="1")]
+        res = self._bookings(rows)
+        night = dt.date(2024, 2, 1)
+        self.assertEqual(pilot.capacity_on(res.hotel, res.nonrev, night, dt.date(2024, 1, 10)), 19)
+        self.assertEqual(pilot.capacity_on(res.hotel, res.nonrev, night, dt.date(2024, 2, 1)), 18)
+        self.assertEqual(pilot.capacity_on(res.hotel, res.nonrev, night), 18)
+
+    def test_a_night_full_only_thanks_to_a_comp_room_is_invisible_to_the_ledger(self):
+        # 20 rooms, sell-out threshold 0.97, so the ledger needs 20 rooms sold
+        # to call the night full.  19 sold plus one comp is full in the house.
+        rows = [_row(booking_id="S%d" % i, arrival="2024-02-01", nights="1") for i in range(19)]
+        rows += [_row(booking_id="C1", segment="COMP", rate="0", arrival="2024-02-01", nights="1")]
+        rows += [_row(booking_id="T%d" % i, arrival="2024-02-02", nights="1") for i in range(4)]
+        res = self._bookings(rows)
+        gap = pilot.full_night_gap(res.bookings, res.ledger, res.hotel,
+                                   dt.date(2024, 2, 1), dt.date(2024, 2, 2))
+        self.assertEqual(gap["physically_full"], 1)
+        self.assertEqual(gap["full_but_invisible"], 1)
+        self.assertEqual(gap["nights"], 2)
+
+    def test_the_deep_mark_is_h1_only(self):
+        # Fixed from the brief: the fixture hotel's max_lead is 40, so 90 and
+        # 60 from the original [120, 90, 60, 30, 14, 7] were both too deep for
+        # H2 regardless of the h1-only filter, and marks_for("H2", ...) raised
+        # PilotError before the h1-only exclusion itself could be observed.
+        # Dropping 90 and 60 isolates the behaviour this test names: 120 is
+        # missing from H2's marks because it is h1-only, not because it is
+        # too deep.
+        settings = {"lead_marks": [120, 30, 14, 7], "lead_marks_h1_only": [120]}
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))
+        self.assertNotIn(120, pilot.marks_for("H2", settings, hotel))
+        self.assertIn(30, pilot.marks_for("H2", settings, hotel))
+
+    def test_a_mark_deeper_than_max_lead_is_refused(self):
+        settings = {"lead_marks": [120, 90], "lead_marks_h1_only": []}
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))   # max_lead 40
+        with self.assertRaises(pilot.PilotError):
+            pilot.marks_for("H1", settings, hotel)
