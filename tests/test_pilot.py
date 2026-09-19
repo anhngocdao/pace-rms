@@ -8,6 +8,7 @@ import unittest
 from pace import hotelconfig as HC
 from pace import ingest
 from pace import pilot
+from pace.elasticity import acceptance as _price_acceptance
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_HOTEL = os.path.join(ROOT, "tests", "fixtures", "pilot-hotel.json")
@@ -34,28 +35,99 @@ def _row(**kw):
     return [base[h] for h in HEADER]
 
 
+def _keep_probability(ratio, k=2.2):
+    """Share of a night's price-elastic demand that still books at `ratio`
+    times the reference rate, using the same logistic choice curve
+    `pace/elasticity.py` fits.  Used to give the synthetic rate a genuine
+    negative relationship with volume: without it every row's rate is noise
+    uncorrelated with how many rooms sold, `fit_segment` shrinks every
+    segment's k to the grid floor, and the engine has no reason ever to
+    publish anything but the top ladder rung.
+    """
+    return min(1.0, _price_acceptance(k, ratio) / 2.0)
+
+
 def history_rows(first_arrival, nights_count, seed=3):
-    """A synthetic year with a real pace curve behind it.
+    """A synthetic year and a bit with a real pace curve behind it, and every
+    hazard the walk has to survive on real history.
 
     Friday and Saturday run fuller, July and August run fuller again, and lead
     times spread from 35 days to 1, so the on the books at lead 30 is a long
     way below the final and a leak is visible rather than plausible.
+
+    Each night draws its own price regime for the price-elastic segments
+    (RETAIL and OTA, booked here as WEB and BOOKING): a night priced above
+    reference keeps fewer of its candidate rows, a night priced below keeps
+    more, and the row's own rate is set from that same regime.  That is what
+    gives `pace/elasticity.py`'s fit something real to recover, which is what
+    lets the published rate move off the ladder's top rung instead of pinning
+    there for lack of any signal that higher rates cost volume.
+
+    A meaningful share of the demand cancels, roughly half of that on the same
+    day it was booked, which is exactly the booking a cancel-before-book day
+    order keeps by mistake.  A smaller share no-shows, walking out of the
+    ledger only at settlement.  A few rows are non-revenue (comped) and a few
+    more are zero-night day use; both are filtered out of the ledger entirely,
+    the same way `pace/ingest.py` filters them.  About a fifth of the
+    survivors stay more than one night.  One night, well clear of the scoring
+    window and its drive-in, gets a deliberate extra push of stayed bookings
+    so the busiest night in the house goes over the fixture hotel's twenty
+    rooms and `Ledger.settle`'s walk branch actually runs.
     """
     rng = random.Random(seed)
     rows = []
     n = 0
     for k in range(nights_count):
         d = first_arrival + dt.timedelta(days=k)
-        target = 9 + (4 if d.weekday() in (4, 5) else 0) + (3 if d.month in (7, 8) else 0)
-        target = max(3, min(19, target + rng.randint(-2, 2)))
+        target = 6 + (5 if d.weekday() in (4, 5) else 0) + (4 if d.month in (7, 8) else 0)
+        target = max(2, min(19, target + rng.randint(-3, 3)))
+        # Reference for RETAIL/OTA is base_rate (120) times a flat month
+        # factor of 1.0 everywhere in this fixture, so 120 is the ratio's
+        # own denominator here.
+        ratio_d = rng.choice([0.75, 0.85, 1.0, 1.0, 1.15, 1.3])
         for _ in range(target):
-            n += 1
             lead = rng.choice([1, 2, 3, 5, 7, 10, 14, 18, 21, 25, 30, 33, 35])
-            rows.append(_row(booking_id="S%05d" % n,
-                             segment=rng.choice(["WEB", "WEB", "BOOKING", "CORP"]),
-                             booked_on=(d - dt.timedelta(days=lead)).isoformat(),
-                             arrival=d.isoformat(), nights="1",
-                             rate="%.2f" % (100.0 + rng.randint(0, 70))))
+            booked_on = d - dt.timedelta(days=lead)
+            segment = rng.choice(["WEB", "WEB", "BOOKING", "CORP"])
+            if segment in ("WEB", "BOOKING"):
+                if rng.random() > _keep_probability(ratio_d):
+                    continue                                     # priced out at this night's regime
+                rate = "%.2f" % max(1.0, ratio_d * 120.0 + rng.uniform(-6, 6))
+            else:
+                rate = "%.2f" % (96.0 + rng.uniform(-6, 6))       # CORP: its own contracted ratio, 0.8x
+            n += 1
+            nights = "1"
+            if k < nights_count - 3 and rng.random() < 0.18:
+                nights = str(rng.choice([2, 3]))
+            roll = rng.random()
+            kw = dict(booking_id="S%05d" % n, segment=segment, booked_on=booked_on.isoformat(),
+                     arrival=d.isoformat(), nights=nights, rate=rate)
+            if roll < 0.03:
+                kw.update(segment="COMP")                       # non-revenue: never reaches the ledger
+            elif roll < 0.06:
+                kw.update(nights="0")                            # day use: never reaches the ledger
+            elif roll < 0.10:
+                kw.update(status="no_show")
+            elif roll < 0.22:
+                kw.update(status="cancelled", status_date=booked_on.isoformat())     # same-day cancel
+            elif roll < 0.32:
+                gap = rng.randint(1, max(1, lead - 1))
+                kw.update(status="cancelled", status_date=(booked_on + dt.timedelta(days=gap)).isoformat())
+            rows.append(_row(**kw))
+
+    # One deliberate spike, far from the scoring window, so the busiest night
+    # of the whole history overbooks the house.  Unfiltered by the price
+    # regime above: guaranteed stayed business, deliberately larger than any
+    # plausible baseline night so the over-capacity margin survives whatever
+    # the random background demand does on this particular night.
+    spike_day = first_arrival + dt.timedelta(days=220)
+    for _ in range(26):
+        n += 1
+        lead = rng.choice([1, 2, 3, 5])
+        rows.append(_row(booking_id="S%05d" % n, segment=rng.choice(["WEB", "BOOKING"]),
+                         booked_on=(spike_day - dt.timedelta(days=lead)).isoformat(),
+                         arrival=spike_day.isoformat(), nights="1",
+                         rate="%.2f" % (100.0 + rng.randint(0, 70))))
     return rows
 
 
@@ -111,8 +183,32 @@ class LeakGuard(unittest.TestCase):
                              "forecast for %s at lead %d saw %s on the books, snapshot says %s"
                              % (d, lead, rec.forecast_otb, rec.otb))
             self.assertEqual(rec.otb, out.ledger.otb_at(d, lead))
+            # otb equality alone cannot see a forecaster whose curves were
+            # learned on data from after asof: rooms_on/otb never depend on
+            # which fit produced them.  fit_asof does: it is read from the
+            # engine's own fit log, not from the walk's bookkeeping, so it
+            # has to have happened on or before the day it is answering for.
+            self.assertIsNotNone(rec.fit_asof,
+                                 "forecast for %s at lead %d has no fit behind it at all"
+                                 % (d, lead))
+            self.assertLessEqual(rec.fit_asof, rec.asof,
+                                 "forecast for %s at lead %d was answered by a fit taken on %s, "
+                                 "after its own asof of %s" % (d, lead, rec.fit_asof, rec.asof))
+            if rec.solved_on is not None:
+                self.assertLessEqual(rec.solved_on, rec.asof,
+                                     "the rate for %s was filed as solved on %s, after its own "
+                                     "asof of %s" % (d, rec.solved_on, rec.asof))
             checked += 1
         self.assertGreater(checked, 100)
+
+    def test_the_published_rate_moves(self):
+        """Every record publishing the same rate would hide a bug in which
+        date's rate gets filed onto a record: a constant can't distinguish a
+        swapped date from a correct one."""
+        _res, out = walked()
+        rates = set(rec.published_rate for rec in out.records.values()
+                   if rec.published_rate is not None)
+        self.assertGreater(len(rates), 1, "every record published the same rate: %r" % rates)
 
     def test_the_guard_is_not_vacuous(self):
         """If every night finished where it stood, the guard would pass on a leak."""
@@ -157,3 +253,87 @@ class LeakGuard(unittest.TestCase):
         for d in sorted(res.ledger.settled):
             self.assertEqual(res.ledger.settled[d]["rooms_sold"],
                              out.ledger.settled[d]["rooms_sold"], str(d))
+
+    def test_the_guard_rejects_a_forecast_from_a_forecaster_fit_on_the_whole_history(self):
+        """otb equality alone cannot catch a forecaster whose curves were
+        learned on data from after its own asof: rooms_on(d) never depends on
+        which fit produced the curves, only on which ledger and stay_date were
+        asked about.  Build a forecaster fit on the whole walked history (the
+        way the reviewer demonstrated: a walk whose ledger is honest but whose
+        engine.forecaster was fit at the very end, after every record) and
+        show the otb check is blind to it while the fit-recency check is not.
+        The shared engine is never touched: a separate Forecaster is built
+        from the same building blocks PaceEngine._fit uses, so this test
+        cannot corrupt the cached walk for the tests that run after it."""
+        res, out = walked()
+        from pace.otb import build_pace_curves
+        from pace.elasticity import fit_all
+        from pace.unconstrain import class_demand
+        from pace.forecast import Forecaster
+
+        final_asof = out.ledger.last_stay + dt.timedelta(days=1)
+        completed = [d for d in out.ledger.settled if d < final_asof]
+        curves = build_pace_curves(out.ledger, completed, max_lead=res.hotel.max_lead)
+        response = fit_all(out.ledger, res.hotel, out.engine.cal, completed, None)
+        demand = class_demand(out.ledger, completed, res.hotel, out.engine.cal, response)
+        future_forecaster = Forecaster(res.hotel, out.engine.cal, curves, demand, response)
+
+        naive = {}
+        for (d, lead), rec in out.records.items():
+            if rec.forecast is None:
+                continue
+            fc = future_forecaster.forecast(out.ledger, d, rec.asof)
+            naive[(d, lead)] = pilot.WalkRecord(
+                stay_date=d, lead=lead, asof=rec.asof, otb=rec.otb,
+                forecast_otb=fc.otb, forecast=fc.expected_bookings, fit_asof=final_asof)
+
+        otb_blind = sum(1 for rec in naive.values() if rec.forecast_otb == rec.otb)
+        self.assertGreater(otb_blind, 100,
+                           "otb should still agree: rooms_on never depends on which fit "
+                           "produced the curves, so the otb check alone cannot see this leak")
+
+        rejected = [k for k, rec in naive.items() if rec.fit_asof > rec.asof]
+        self.assertGreater(len(rejected), 100,
+                           "the fit-recency guard did not reject records answered by a "
+                           "forecaster fit on the whole history, so it is not a guard")
+
+
+class WalkValidation(unittest.TestCase):
+    """walk() refuses a configuration it cannot answer honestly instead of
+    quietly handing back a record built on a None or a rate that predates
+    anything the caller asked for."""
+
+    def setUp(self):
+        cfg = HC.load_hotel_json(FIXTURE_HOTEL)
+        self.hotel = HC.apply(cfg)
+        self.cal = HC.event_calendar(cfg)
+
+    def tearDown(self):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
+
+    def test_a_lead_mark_deeper_than_max_lead_is_refused(self):
+        """A mark past max_lead leaves ledger.snapshot with nothing to answer
+        with: otb_at would come back None instead of a number, and the guard
+        would fail on a comparison against None instead of a sentence."""
+        with self.assertRaises(pilot.PilotError):
+            pilot.walk([], self.hotel, self.cal,
+                       first_stay=FIRST_ARRIVAL, last_stay=FIRST_ARRIVAL + dt.timedelta(days=10),
+                       score_first=FIRST_ARRIVAL, score_last=FIRST_ARRIVAL + dt.timedelta(days=10),
+                       marks=(self.hotel.max_lead + 1,), drive_from=FIRST_ARRIVAL)
+
+    def test_a_drive_date_after_the_scoring_window_is_refused(self):
+        with self.assertRaises(pilot.PilotError):
+            pilot.walk([], self.hotel, self.cal,
+                       first_stay=FIRST_ARRIVAL, last_stay=FIRST_ARRIVAL + dt.timedelta(days=10),
+                       score_first=FIRST_ARRIVAL, score_last=FIRST_ARRIVAL + dt.timedelta(days=5),
+                       marks=(1,), drive_from=FIRST_ARRIVAL + dt.timedelta(days=6))
+
+    def test_a_backwards_scoring_window_is_refused(self):
+        with self.assertRaises(pilot.PilotError):
+            pilot.walk([], self.hotel, self.cal,
+                       first_stay=FIRST_ARRIVAL, last_stay=FIRST_ARRIVAL + dt.timedelta(days=10),
+                       score_first=FIRST_ARRIVAL + dt.timedelta(days=5), score_last=FIRST_ARRIVAL,
+                       marks=(1,), drive_from=FIRST_ARRIVAL)

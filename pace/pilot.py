@@ -29,7 +29,7 @@ from . import ingest
 from .calendar import EventCalendar
 from .config import Hotel
 from .ingest import Booking, Report
-from .ledger import Ledger
+from .ledger import Hold, Ledger
 from .policy import PaceEngine
 
 # Pre-registered in data/antonio/settings.json, section 9 of the design.
@@ -57,12 +57,19 @@ class WalkRecord:
     stay_date: dt.date
     lead: int
     asof: dt.date
-    otb: int
+    otb: Optional[int]
     forecast_otb: Optional[int] = None
     forecast: Optional[float] = None
     published_rate: Optional[float] = None
     solved_on: Optional[dt.date] = None
     engine_ready: bool = False
+    # The day of the fit behind the forecaster that answered this record, read
+    # from the engine's own fit log rather than from the walk's bookkeeping.
+    # otb equality alone cannot catch a forecaster whose curves were learned
+    # on data from after asof: rooms_on/otb never depend on which fit
+    # produced the curves, only on which ledger and stay_date were asked
+    # about.  This field is what lets the guard see that second leak.
+    fit_asof: Optional[dt.date] = None
 
 
 @dataclass
@@ -75,6 +82,15 @@ class WalkResult:
     report: Optional[Report] = None
 
 
+def _last_fit_asof(engine: PaceEngine) -> Optional[dt.date]:
+    """The day of the fit behind the engine's current forecaster, read from
+    the engine's own fit log so the guard checks the engine's state rather
+    than trusting the walk's own idea of when it last fit."""
+    if not engine.fit_log:
+        return None
+    return dt.date.fromisoformat(engine.fit_log[-1]["asof"])
+
+
 def walk(bookings: List[Booking], hotel: Hotel, cal: EventCalendar,
          first_stay: dt.date, last_stay: dt.date,
          score_first: dt.date, score_last: dt.date,
@@ -82,6 +98,20 @@ def walk(bookings: List[Booking], hotel: Hotel, cal: EventCalendar,
          warmup_nights: int = 150, refit_every: int = 28,
          rep: Optional[Report] = None, progress: Optional[int] = None) -> WalkResult:
     """Replay the log day by day, driving the engine from `drive_from`."""
+    if score_first > score_last:
+        raise PilotError("score_first %s is after score_last %s; the scoring window is "
+                         "empty or backwards" % (score_first, score_last))
+    if drive_from > score_last:
+        raise PilotError("drive_from %s is after the scoring window closes on %s; the "
+                         "engine would never be driven while there is still anything to "
+                         "score" % (drive_from, score_last))
+    all_marks = tuple(sorted(set(tuple(marks) + (LATE_MARK,)), reverse=True))
+    too_deep = [m for m in all_marks if m > hotel.max_lead]
+    if too_deep:
+        raise PilotError("lead mark(s) %s exceed the hotel's max_lead of %d; "
+                         "ledger.snapshot only keeps that many days of history, so "
+                         "otb_at would come back None instead of a number" % (too_deep, hotel.max_lead))
+
     rep = ingest.Report() if rep is None else rep
     ledger = Ledger(hotel, first_stay, last_stay)
     engine = PaceEngine(hotel, cal, refit_every=refit_every, warmup_nights=warmup_nights)
@@ -95,8 +125,7 @@ def walk(bookings: List[Booking], hotel: Hotel, cal: EventCalendar,
         if b.status == "cancelled" and b.status_date is not None:
             cancels[b.status_date].append(b)
 
-    all_marks = tuple(sorted(set(tuple(marks) + (LATE_MARK,)), reverse=True))
-    holds: Dict[str, object] = {}
+    holds: Dict[str, Hold] = {}
     records: Dict[Tuple[dt.date, int], WalkRecord] = {}
     day = min(by_day) if by_day else first_stay
     settled_upto = first_stay - dt.timedelta(days=1)
@@ -143,6 +172,7 @@ def walk(bookings: List[Booking], hotel: Hotel, cal: EventCalendar,
                     published_rate=(ctrl.rate.get(d) if ctrl is not None else None),
                     solved_on=(solved[0] if solved else None),
                     engine_ready=engine.ready,
+                    fit_asof=(_last_fit_asof(engine) if fc is not None else None),
                 )
 
         while settled_upto < day and settled_upto < last_stay:
