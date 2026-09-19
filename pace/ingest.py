@@ -18,6 +18,9 @@ from .ledger import Hold, Ledger
 STATUSES = ("booked", "in_house", "stayed", "cancelled", "no_show")
 TARGETS = ("RETAIL", "OTA", "CORP", "GROUP", "NONREV")
 MAX_ERRORS = 50
+# Pre-registered in data/antonio/settings.json as "seed" and repeated here so
+# load() has a default; tests/test_convert_antonio.py binds the two together.
+DEFAULT_SEED = 20250115
 
 
 class IngestError(ValueError):
@@ -108,6 +111,12 @@ def read_bookings(path: str, cfg: HotelConfig) -> Tuple[List[Booking], Report]:
             i = reader.line_num
             b = _parse_row(i, r, cfg, rep)
             if b is None:
+                continue
+            if not b.booking_id:
+                # Without this an empty id is reported as a duplicate of the
+                # empty string, which sends a hotel looking for a second row
+                # that does not exist instead of at the blank cell it has.
+                rep.error(i, "booking_id", "empty; every row needs an id of its own")
                 continue
             if b.booking_id in seen_ids:
                 rep.error(i, "booking_id", "duplicate booking_id")
@@ -460,8 +469,15 @@ def replay(bookings: List[Booking], hotel: Hotel, first_stay: dt.date, last_stay
         while settled_upto < day and settled_upto < last_stay:
             night = settled_upto + dt.timedelta(days=1)
             if night >= first_stay:
-                if ledger.rooms_on(night) > hotel.rooms:
+                held = ledger.rooms_on(night)
+                if held > hotel.rooms:
+                    # On the simulation a walk is a policy consequence. Here it
+                    # edits the hotel's own history: settle() is about to take
+                    # these rooms and their revenue back out of the actuals, so
+                    # the report says how many rooms leave, not only that a
+                    # night was over the stated count (docs/booking-log.md).
                     rep.warnings["over_capacity_nights"] += 1
+                    rep.warnings["rooms_walked_off_the_actuals"] += held - hotel.rooms
                 ledger.settle(night)
             settled_upto = night
         day += dt.timedelta(days=1)
@@ -481,7 +497,7 @@ class IngestResult:
     last_stay: dt.date
 
 
-def load(csv_path: str, hotel_json_path: str, seed: int = 20250115,
+def load(csv_path: str, hotel_json_path: str, seed: int = DEFAULT_SEED,
          first_stay: Optional[dt.date] = None, last_stay: Optional[dt.date] = None) -> IngestResult:
     """Read, map, group, impute and replay a booking log in one call, failing
     before any global config is applied when the file has errors."""
@@ -491,6 +507,15 @@ def load(csv_path: str, hotel_json_path: str, seed: int = 20250115,
     detect_groups(bookings, cfg, rep)
     impute_cancel_dates(bookings, rep, seed)
     rep.fail_if_errors()
+    if not bookings:
+        # A header the reader accepts with nothing under it is a valid file and
+        # an empty history. Said here in a sentence, because the alternative is
+        # min() on an empty sequence out of the stay-window line below, which is
+        # the stack trace this path exists to keep away from a hotel.
+        raise IngestError(
+            "%s has a header this reader accepts and no booking rows under it, so there is "
+            "no history to replay, no stay window to take from it and no room count to infer; "
+            "check the export covered the dates you asked for" % csv_path)
     inference = None
     if cfg.sellable_rooms is None:
         inference = infer_sellable_rooms(bookings)
