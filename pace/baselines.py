@@ -65,32 +65,34 @@ def reference_nights(ledger: Ledger, d: dt.date, lead: int,
 
 
 def additive_pickup(ledger: Ledger, d: dt.date, lead: int,
-                    refs: Optional[List[dt.date]] = None) -> Optional[float]:
+                    refs: Optional[List[dt.date]] = None,
+                    weeks: int = WINDOW) -> Optional[float]:
     """Rooms on the books now, plus the rooms that normally still come in."""
     otb = ledger.otb_at(d, lead)
-    refs = reference_nights(ledger, d, lead) if refs is None else refs
-    if otb is None or len(refs) < WINDOW:
+    refs = reference_nights(ledger, d, lead, weeks) if refs is None else refs
+    if otb is None or len(refs) < weeks:
         return None
     return otb + fmean([actual(ledger, n) - ledger.otb_at(n, lead) for n in refs])
 
 
 def multiplicative_pickup(ledger: Ledger, d: dt.date, lead: int,
-                          refs: Optional[List[dt.date]] = None) -> Optional[float]:
+                          refs: Optional[List[dt.date]] = None,
+                          weeks: int = WINDOW) -> Optional[float]:
     """Rooms on the books now, divided by the share normally sold by this lead.
 
     Expected to explode at long leads, where the denominator is small. Kept
     because it is the form most hotels use.
     """
     otb = ledger.otb_at(d, lead)
-    refs = reference_nights(ledger, d, lead) if refs is None else refs
-    if otb is None or len(refs) < WINDOW:
+    refs = reference_nights(ledger, d, lead, weeks) if refs is None else refs
+    if otb is None or len(refs) < weeks:
         return None
     shares = []
     for n in refs:
         final = actual(ledger, n)
         if final and final > 0:
             shares.append(ledger.otb_at(n, lead) / final)
-    if len(shares) < WINDOW:
+    if len(shares) < weeks:
         return None
     share = fmean(shares)
     if share <= 0:
@@ -124,10 +126,10 @@ def average_pickup_and_stly(add: Optional[float], stly: Optional[float]) -> Opti
 def all_baselines(ledger: Ledger, d: dt.date, lead: int,
                   weeks: int = WINDOW) -> Dict[str, Optional[float]]:
     refs = reference_nights(ledger, d, lead, weeks)
-    add = additive_pickup(ledger, d, lead, refs)
+    add = additive_pickup(ledger, d, lead, refs, weeks)
     return {
         "pickup_add": add,
-        "pickup_mult": multiplicative_pickup(ledger, d, lead, refs),
+        "pickup_mult": multiplicative_pickup(ledger, d, lead, refs, weeks),
         "stly_add": stly_additive(ledger, d, lead),
         "average": average_pickup_and_stly(add, stly_additive(ledger, d, lead)),
     }

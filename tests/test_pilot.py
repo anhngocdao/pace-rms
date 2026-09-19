@@ -678,7 +678,16 @@ class Baselines(unittest.TestCase):
         for k in range(5, 15):           # the ten Wednesdays from d-35 back to d-98
             n = self.NIGHT - dt.timedelta(days=7 * k)
             _seed(led, n, {self.LEAD: 10}, 16)
-        _seed(led, self.NIGHT - dt.timedelta(days=baselines.STLY_BACK), {self.LEAD: 10}, 16)
+        stly_night = self.NIGHT - dt.timedelta(days=baselines.STLY_BACK)
+        # Pin the design's actual reason for choosing 364 over 365: it is a
+        # multiple of seven, so the same-time-last-year night always falls on
+        # the same weekday as the night being forecast. Without this, changing
+        # STLY_BACK to 365 would leave every test in this class green while
+        # quietly breaking the alignment the design relies on.
+        self.assertEqual(stly_night.weekday(), self.NIGHT.weekday(),
+                         "STLY_BACK no longer lands on the same weekday as the forecast "
+                         "night; that alignment is the whole reason 364 was chosen over 365")
+        _seed(led, stly_night, {self.LEAD: 10}, 16)
         led.snapshots[self.NIGHT][self.LEAD] = 12
         led.settled[self.NIGHT] = _settled_row(self.NIGHT, 20)
         return led
@@ -703,6 +712,32 @@ class Baselines(unittest.TestCase):
         _seed(led, leaky, {self.LEAD: 10}, 16)
         refs = baselines.reference_nights(led, self.NIGHT, self.LEAD)
         self.assertNotIn(leaky, refs)
+        self.assertEqual(len(refs), 10)
+
+    def test_a_night_exactly_at_the_forecast_day_is_not_used(self):
+        """References step in whole weeks, so a candidate lands exactly on
+        asof (= d - lead) only when lead is itself a multiple of seven; two
+        of the pre-registered lead marks, 7 and 14, are. asof is the day the
+        snapshot at this lead was frozen for the night being forecast, one
+        day before that night's own settlement, so a reference sitting
+        exactly on asof has not finished on the forecast day and must be
+        excluded by a strict `n < asof`, not `n <= asof`.
+        `test_a_night_that_had_not_finished_on_the_forecast_day_is_not_used`
+        cannot catch that boundary: its leaky night sits two days after
+        asof, never on it, because its lead (30) is not a multiple of seven.
+        On the real H1 file, mutating the comparison to `<=` moves additive
+        pickup on 414 of 427 scoring nights at lead 7 and 417 of 427 at lead
+        14 (see the fix report for both outputs).
+        """
+        lead = 28    # a multiple of seven, so asof itself lands on a weekly step
+        led = self._ledger()
+        for k in range(5, 15):      # the ten same-weekday nights already finished by asof
+            n = self.NIGHT - dt.timedelta(days=7 * k)
+            _seed(led, n, {lead: 10}, 16)
+        boundary = self.NIGHT - dt.timedelta(days=lead)     # exactly asof
+        _seed(led, boundary, {lead: 10}, 16)
+        refs = baselines.reference_nights(led, self.NIGHT, lead)
+        self.assertNotIn(boundary, refs)
         self.assertEqual(len(refs), 10)
 
     def test_additive_pickup(self):
