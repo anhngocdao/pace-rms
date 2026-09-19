@@ -127,10 +127,11 @@ class RateExperiment:
 
 def experimental_rows(ledger, hotel: Hotel, cal, completed, code: str,
                       experiment: RateExperiment,
-                      sellout_threshold: float = 0.97) -> List[Tuple[tuple, float, float, float]]:
+                      sellout_threshold: Optional[float] = None) -> List[Tuple[tuple, float, float, float]]:
     """(class, assigned arm, realised rate ratio, log rooms) per usable night."""
     from .simulate import reference_rate
 
+    sellout_threshold = hotel.sellout_threshold if sellout_threshold is None else sellout_threshold
     rows = []
     for d in completed:
         if not experiment.covers(d):

@@ -182,3 +182,11 @@ Point three is what makes the price normalisation and the segment pace curves
 possible. Point four is what makes unconstraining better than a guess. If the
 real system does not log denials the engine still runs, it simply learns less
 about the nights that matter most.
+
+The concrete way to do this is a booking log in the shape of
+`docs/booking-log.md`, read by `pace/ingest.py`. Write a converter from your
+PMS export to that shape; `tools/convert_antonio.py` is the worked example
+for a public dataset, including how the hotel's own seasonality, contract
+ratios and sell-out threshold are derived and written to `hotel.json`
+(ADR 0007). Complimentary and house-use rooms stay outside the ledger and
+are reported beside it, because the engine has no capacity block yet.

@@ -134,6 +134,25 @@ SEGMENT_ORDER = ("CORP", "GROUP", "RETAIL", "OTA")
 # already contracted when the event is announced, so they barely move.
 EVENT_SENSITIVITY = {"RETAIL": 1.00, "OTA": 1.10, "CORP": 0.35, "GROUP": 0.15}
 
+DEFAULT_SEGMENTS: Dict[str, Segment] = dict(SEGMENTS)
+
+
+def configure_segments(rate_ratios: Dict[str, float], commissions: Dict[str, float]) -> None:
+    """Replace per-segment contract ratios and commissions in place (ADR 0007).
+
+    SEGMENTS is imported by name in several modules, so it must stay the same
+    dict object; entries are swapped, the dict is not rebound."""
+    import dataclasses
+    for code, ratio in rate_ratios.items():
+        SEGMENTS[code] = dataclasses.replace(SEGMENTS[code], rate_multiplier=float(ratio))
+    for code, com in commissions.items():
+        SEGMENTS[code] = dataclasses.replace(SEGMENTS[code], commission=float(com))
+
+
+def reset_segments() -> None:
+    SEGMENTS.clear()
+    SEGMENTS.update(DEFAULT_SEGMENTS)
+
 
 @dataclass(frozen=True)
 class Hotel:
@@ -151,6 +170,7 @@ class Hotel:
     max_los: int = 5
     max_lead: int = 180
     max_overbook_pct: float = 0.06
+    sellout_threshold: float = 0.97  # share of rooms sold that marks a night censored
 
     def rate_ladder(self):
         """The discrete set of public rates the engine may quote."""
