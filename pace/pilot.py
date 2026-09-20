@@ -20,11 +20,15 @@ alternative: ledger.holds keeps only the bookings that survived, so at lead 90
 on one H1 night only 123 of the 154 rooms then on the books still exist.
 """
 import datetime as dt
+import hashlib
+import json
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import hotelconfig as HC
 from . import ingest
 from .calendar import EventCalendar
 from .config import Hotel
@@ -324,3 +328,129 @@ def marks_for(code: str, settings: dict, hotel: Hotel) -> Tuple[int, ...]:
         raise PilotError("lead marks %s are deeper than the hotel's max_lead of %d, so no "
                          "snapshot exists at them" % (deep, hotel.max_lead))
     return tuple(sorted(out, reverse=True))
+
+
+PREREG_COMMIT = "d23024c2b135e0a4af3dd5d4723b7c3fe604d618"
+PREREG_SHA256 = "f59937ba6b768fab3f4eb5707ce5579ef15f99c7ccf16d4d957e7255c8e94a2b"
+
+NO_LIFT_NOTE = (
+    "No number in this report is a revenue lift. History records only what sold "
+    "at the rate that was charged, so nothing here can say what the hotel would "
+    "have earned under the engine's rates. Where the engine forecasts better, it "
+    "forecasts better; that is the claim, and it is the whole claim.")
+
+_CLAIMED = {"hotel": None}
+
+
+def claim_process(name: str) -> None:
+    """One hotel per process.
+
+    hotelconfig.apply rebinds the module-level seasonality and mutates the
+    shared SEGMENTS dict in place, so loading a second hotel rewrites the first
+    one's engine: H1 sets CORP 0.6275 and GROUP 0.9949, H2 sets 0.7391 and
+    0.7653.  Refusing here is cheaper than a report whose H1 tables were built
+    with H2's contract ratios, because that report would look fine.
+    """
+    held = _CLAIMED["hotel"]
+    if held is not None and held != name:
+        raise PilotError(
+            "this process already ran %s. hotelconfig.apply rebinds the engine's "
+            "seasonality and rewrites its segment table in place, so %s has to run "
+            "in a process of its own: run the command again for it, then join the "
+            "two JSON files with run.py pilot-report." % (held, name))
+    _CLAIMED["hotel"] = name
+
+
+def _release_for_tests() -> None:
+    """Only the test suite calls this.  A real run is one hotel and then exits."""
+    _CLAIMED["hotel"] = None
+
+
+def settings_digest(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: str,
+            score_first: dt.date = SCORE_FIRST, score_last: dt.date = SCORE_LAST,
+            warmup_end: dt.date = WARMUP_END, progress: Optional[int] = None) -> dict:
+    """Ingest, walk, score table 1, write the payload.  One hotel, one process."""
+    # Imported here, not at the top: score imports pilot for capacity_on and
+    # LATE_MARK, so a top-level import either way round is a cycle.
+    from . import score as scoring
+    claim_process(os.path.basename(hotel_json_path))
+    with open(settings_path, encoding="utf-8") as fh:
+        settings = json.load(fh)
+    digest = settings_digest(settings_path)
+
+    res = ingest.load(csv_path, hotel_json_path,
+                      seed=int(settings.get("seed", ingest.DEFAULT_SEED)))
+    code = hotel_code(res.cfg)
+    first_stay, last_stay = stay_window(res.bookings, score_last)
+    if first_stay > score_first:
+        raise PilotError("the stay window starts at %s, after the scoring window opens at %s; "
+                         "there is no warm-up to fit on" % (first_stay, score_first))
+    marks = marks_for(code, settings, res.hotel)
+    drive_from = score_first - dt.timedelta(days=DRIVE_LEAD)
+    cal = HC.event_calendar(res.cfg)
+
+    out = walk(res.bookings, res.hotel, cal, first_stay, last_stay,
+               score_first, score_last, marks, drive_from, progress=progress)
+    gap = full_night_gap(res.bookings, out.ledger, res.hotel, first_stay, last_stay)
+    table1 = scoring.score(out, res.hotel, res.bookings, res.nonrev, marks,
+                           score_first, score_last, first_stay, warmup_end)
+
+    inf = res.inference
+    payload = {
+        "hotel": {
+            "code": code, "name": res.cfg.name, "city": res.cfg.city,
+            "currency": res.cfg.currency, "rooms": res.hotel.rooms,
+            "rooms_inferred": inf is not None,
+            "peak_night": inf.peak_night.isoformat() if inf and inf.peak_night else None,
+            "nights_within_2pct": inf.nights_within_2pct if inf else None,
+            "second_highest": inf.second_highest if inf else None,
+            "per_year_max": {str(k): v for k, v in (inf.per_year_max if inf else {}).items()},
+            "rates_include_tax": res.cfg.rates_include_tax,
+            "base_rate": res.hotel.base_rate, "rate_floor": res.hotel.rate_floor,
+            "rate_ceiling": res.hotel.rate_ceiling, "rate_step": res.hotel.rate_step,
+            "top_rung": res.hotel.rate_ladder()[-1],
+            "max_lead": res.hotel.max_lead, "max_los": res.hotel.max_los,
+            "sellout_threshold": res.hotel.sellout_threshold,
+            "variable_cost": res.hotel.variable_cost, "walk_cost": res.hotel.walk_cost,
+            "demand_season_band": {str(k): v for k, v in res.cfg.demand_season_band.items()},
+            "segment_rate_ratio": dict(res.cfg.segment_rate_ratio),
+        },
+        "windows": {
+            "first_stay": first_stay.isoformat(), "last_stay": last_stay.isoformat(),
+            "warmup_end": warmup_end.isoformat(),
+            "score_first": score_first.isoformat(), "score_last": score_last.isoformat(),
+            "drive_from": drive_from.isoformat(),
+            "trim_nights": (first_stay - min(b.arrival for b in res.bookings)).days,
+            "scoring_nights": (score_last - score_first).days + 1,
+        },
+        "prereg": {"commit": PREREG_COMMIT, "settings_sha256": digest,
+                   "settings_path": settings_path,
+                   "sha256_matches_the_recorded_one": digest == PREREG_SHA256},
+        "walk": {"days": out.days, "seconds": round(out.seconds, 1),
+                 "fits": len(out.engine.fit_log), "records": len(out.records),
+                 "marks": [int(m) for m in marks], "solves": out.engine.solves},
+        "ingest": {
+            "rows": len(res.bookings), "bookings": out.ledger.n_bookings,
+            "cancels": out.ledger.n_cancels, "nonrev_rows": len(res.nonrev),
+            "warnings": {k: v for k, v in out.report.warnings.items() if not k.startswith("_")},
+            "notes": list(res.report.notes),
+        },
+        "full_night_gap": gap,
+        "table1": table1,
+        # Table 2 is written by the rate check and table 3 by the holdout.  A
+        # None here means that table was not run, which is what --quick leaves.
+        "table2": None,
+        "table3": None,
+        "notes": [NO_LIFT_NOTE, FULL_NIGHT_NOTE],
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "pilot-%s.json" % code.lower())
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+    payload["_json_path"] = path
+    return payload

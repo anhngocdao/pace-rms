@@ -1,6 +1,7 @@
 import collections
 import csv
 import datetime as dt
+import json
 import os
 import random
 import tempfile
@@ -1225,3 +1226,58 @@ class Scoring(unittest.TestCase):
         # the suite green. This phrase is unique to it (BASELINE_NOTE and
         # LEAD1_NOTE do not contain it).
         self.assertIn("nothing in this table prices a night", text)
+
+
+class OneHotelPerProcess(unittest.TestCase):
+    """hotelconfig.apply rewrites module-level state, so two hotels in one
+    process means the second one's engine answers for the first one's."""
+
+    def tearDown(self):
+        pilot._release_for_tests()
+
+    def test_a_second_hotel_in_the_same_process_is_refused_in_a_sentence(self):
+        pilot.claim_process("h1-hotel.json")
+        pilot.claim_process("h1-hotel.json")          # the same one is fine
+        with self.assertRaises(pilot.PilotError) as ctx:
+            pilot.claim_process("h2-hotel.json")
+        self.assertIn("process of its own", str(ctx.exception))
+
+
+class PreRegistration(unittest.TestCase):
+    def test_the_pre_registered_settings_file_has_not_moved(self):
+        """The whole point of pre-registration is that it is checkable."""
+        path = os.path.join(ROOT, "data", "antonio", "settings.json")
+        self.assertEqual(pilot.settings_digest(path), pilot.PREREG_SHA256)
+
+
+class RunOne(unittest.TestCase):
+    def tearDown(self):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
+        pilot._release_for_tests()
+
+    def test_a_whole_run_writes_a_payload_that_survives_json(self):
+        rows = history_rows(FIRST_ARRIVAL, NIGHTS)
+        csv_path = _csv(rows)
+        out_dir = tempfile.mkdtemp()
+        settings_path = os.path.join(out_dir, "settings.json")
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump({"seed": 1, "lead_marks": [30, 14, 7], "lead_marks_h1_only": []}, fh)
+        payload = pilot.run_one(csv_path, FIXTURE_HOTEL, settings_path, out_dir,
+                                score_first=SCORE_FIRST, score_last=SCORE_LAST,
+                                warmup_end=SCORE_FIRST - dt.timedelta(days=1))
+        written = os.path.join(out_dir, "pilot-%s.json" % payload["hotel"]["code"].lower())
+        self.assertTrue(os.path.exists(written))
+        with open(written, encoding="utf-8") as fh:
+            back = json.load(fh)
+        self.assertEqual(back["hotel"]["rooms"], 20)
+        self.assertEqual(back["table2"], None)
+        self.assertEqual(back["table3"], None)
+        self.assertGreater(back["table1"]["overall"]["30"]["n"], 20)
+        self.assertGreater(back["walk"]["days"], 450)
+        self.assertEqual(back["prereg"]["commit"], pilot.PREREG_COMMIT)
+        self.assertIn("full_night_gap", back)
+        self.assertIn("no number in this report is a revenue lift",
+                      " ".join(back["notes"]).lower())

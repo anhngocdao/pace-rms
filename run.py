@@ -10,6 +10,8 @@
   python3 run.py network     score the network bid price against the nightly one
   python3 run.py bench       where the time goes, and how it scales
   python3 run.py ingest      replay a real booking log into the ledger
+  python3 run.py pilot data/antonio/h1-bookings.csv data/antonio/h1-hotel.json
+                             score the engine on a real booking log
   python3 run.py test        run the checks
 """
 
@@ -110,6 +112,47 @@ def main(argv):
         print("engine fitted:", engine.ready)
         return 0
 
+    if cmd == "pilot":
+        if len(args) < 2:
+            print("usage: python3 run.py pilot <bookings.csv> <hotel.json> "
+                  "[--out out/] [--settings data/antonio/settings.json] [--quick]")
+            return 1
+        from pace import ingest
+        from pace import pilot
+        from pace.hotelconfig import ConfigError
+        out_dir = _opt(args, "--out", os.path.join(HERE, "out"))
+        settings = _opt(args, "--settings", os.path.join(HERE, "data", "antonio", "settings.json"))
+        first, last = pilot.SCORE_FIRST, pilot.SCORE_LAST
+        if "--quick" in args:
+            # Two months of scoring, so the wiring can be checked in a minute.
+            last = first + dt.timedelta(days=61)
+        try:
+            payload = pilot.run_one(args[0], args[1], settings, out_dir,
+                                    score_first=first, score_last=last, progress=90)
+        except (ingest.IngestError, ConfigError, pilot.PilotError) as exc:
+            print(exc)
+            return 1
+        h = payload["hotel"]
+        w = payload["walk"]
+        print("\n%s (%s), %d rooms%s" % (h["name"], h["code"], h["rooms"],
+                                         ", inferred" if h["rooms_inferred"] else ""))
+        print("walked %d days in %.1f s, %d fits, %d forecasts recorded"
+              % (w["days"], w["seconds"], w["fits"], w["records"]))
+        gap = payload["full_night_gap"]
+        print("nights physically full %d, of them invisible to the ledger %d of %d nights"
+              % (gap["physically_full"], gap["full_but_invisible"], gap["nights"]))
+        for lead in payload["table1"]["leads"] + [payload["table1"]["late_lead"]]:
+            block = payload["table1"]["overall"][lead]
+            m = block["methods"]
+            if m["engine"]["mae"] is None:
+                print("  lead %-4s no night scored" % lead)
+                continue
+            print("  lead %-4s n=%-4d engine MAE %6.2f (clamped %4.0f%%), average %6.2f"
+                  % (lead, block["n"], m["engine"]["mae"], 100 * m["engine"]["clamp_share"],
+                     m["average"]["mae"]))
+        print("\n   wrote %s" % payload["_json_path"])
+        return 0
+
     if cmd == "test":
         import unittest
         loader = unittest.TestLoader()
@@ -119,6 +162,11 @@ def main(argv):
 
     print(__doc__)
     return 1
+
+
+def _opt(args, name, default):
+    """--name value, or the default.  Kept tiny on purpose: run.py is a switchboard."""
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
 
 
 def _summary(payload):
