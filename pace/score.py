@@ -9,9 +9,12 @@ scoring nights at H1 and 220 of 427 at H2.
 
 Forecasts are clamped to capacity before scoring, because on a full night a
 forecast above capacity is not wrong, and the share that hit the clamp is
-printed beside the error, because at H1 lead 120 the mean absolute error is
-38.5 rooms raw and 16.4 clamped with 50.4 percent of forecasts above capacity.
-A method rescued by the clamp has to be visible as one.
+printed beside the error, because at H1 lead 120 the engine's mean absolute
+error is 37.2 rooms raw and 16.6 clamped, with 48.9 percent of its forecasts
+above capacity. Those three figures are measured over the 415 nights every
+method forecasts, the population this table reports; on the wider 427 nights
+the engine alone forecasts they are 39.0, 16.3 and 50.4 percent. A method
+rescued by the clamp has to be visible as one.
 
 Lead 1 is on its own line and measures late cancellations and no-shows, which
 is an overbooking question and not a demand question.
@@ -19,7 +22,7 @@ is an overbooking question and not a demand question.
 import datetime as dt
 from collections import defaultdict
 from statistics import fmean
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from . import baselines
 from . import ingest

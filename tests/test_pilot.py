@@ -658,6 +658,18 @@ def _seed(led, d, per_lead, final):
     led.settled[d] = _settled_row(d, final)
 
 
+def _bare_walk(ledger, records):
+    """A `WalkResult`-alike carrying only what `score()` reads (`.ledger` and
+    `.records`), so a scoring scenario can be hand-built precisely instead of
+    driving a real `pilot.walk()`."""
+    class _Walk:
+        pass
+    w = _Walk()
+    w.ledger = ledger
+    w.records = records
+    return w
+
+
 class Baselines(unittest.TestCase):
     """Hand-built snapshots with answers worked out by hand."""
 
@@ -804,12 +816,140 @@ class Scoring(unittest.TestCase):
         self.assertIsNone(out["mae"])
         self.assertIsNone(out["clamp_share"])
 
+    def _resolvable_baseline_ledger(self, hotel, d, lead, ref_final=16.0, ref_otb=10.0):
+        """A ledger where every baseline resolves for night `d` at `lead`:
+        ten trailing same-weekday references and a same-time-last-year night,
+        seeded generically (their own values are never asserted on by the
+        clamp tests, which only care that the night is scored at all)."""
+        led = Ledger(hotel, d - dt.timedelta(days=400), d + dt.timedelta(days=30))
+        for k in range(1, 18):
+            n = d - dt.timedelta(weeks=k)
+            _seed(led, n, {lead: ref_otb}, ref_final)
+        stly = d - dt.timedelta(days=baselines.STLY_BACK)
+        self.assertEqual(stly.weekday(), d.weekday())
+        _seed(led, stly, {lead: ref_otb}, ref_final)
+        return led
+
+    def test_the_forecast_is_clamped_before_scoring_not_the_raw_value(self):
+        """Review finding 1 (clamp deletion survives): a night whose raw
+        engine forecast exceeds capacity must be scored against the clamped
+        value, and must still be scored at all (not silently dropped)."""
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))     # 20 rooms -> capacity 20
+        lead = 30
+        d = dt.date(2025, 3, 5)
+        led = self._resolvable_baseline_ledger(hotel, d, lead)
+        _seed(led, d, {lead: 12}, 15.0)                          # settled actual 15, under capacity
+        walk_result = _bare_walk(led, {
+            (d, lead): pilot.WalkRecord(stay_date=d, lead=lead,
+                                        asof=d - dt.timedelta(days=lead),
+                                        otb=12, forecast=30.0),   # raw forecast well over capacity
+        })
+        table = S.score(walk_result, hotel, [], [], [lead], d, d,
+                        d - dt.timedelta(days=365), d - dt.timedelta(days=1))
+        engine = table["overall"][str(lead)]["methods"]["engine"]
+        # Clamped forecast is min(30, 20) = 20; error against actual 15 is 5.
+        # Scoring the raw 30 instead would give an error of 15; silently
+        # dropping the night (because its raw forecast exceeded capacity)
+        # would leave n at 0 and mae at None. Both survive the full suite
+        # today, per the review; this pins the one correct answer instead.
+        self.assertEqual(engine["n"], 1)
+        self.assertAlmostEqual(engine["mae"], 5.0)
+        self.assertAlmostEqual(engine["bias"], 5.0)
+        self.assertAlmostEqual(engine["clamp_share"], 1.0)
+
+    def test_the_actual_is_never_clamped_even_when_it_exceeds_capacity(self):
+        """Review finding 1 (clamping the actual too survives): the clamp
+        applies to a forecast, never to what actually happened. Built with a
+        settled actual above capacity -- artificial (a real settled ledger
+        never exceeds `hotel.rooms`, since `Ledger.settle` walks the excess
+        off first), but the point of this test is to isolate the accumulator
+        rule in `score()`'s `_add`, not to model a real night."""
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))     # 20 rooms -> capacity 20
+        lead = 30
+        d = dt.date(2025, 3, 5)
+        led = self._resolvable_baseline_ledger(hotel, d, lead)
+        _seed(led, d, {lead: 14}, 25.0)                          # settled actual 25, ABOVE capacity
+        walk_result = _bare_walk(led, {
+            (d, lead): pilot.WalkRecord(stay_date=d, lead=lead,
+                                        asof=d - dt.timedelta(days=lead),
+                                        otb=14, forecast=18.0),   # forecast itself is under capacity
+        })
+        table = S.score(walk_result, hotel, [], [], [lead], d, d,
+                        d - dt.timedelta(days=365), d - dt.timedelta(days=1))
+        engine = table["overall"][str(lead)]["methods"]["engine"]
+        # Forecast 18 is not clamped (under capacity 20); error against the
+        # true actual 25 is -7. Clamping the actual too would give
+        # min(25, 20) = 20 and an error of -2 instead.
+        self.assertEqual(engine["n"], 1)
+        self.assertAlmostEqual(engine["mae"], 7.0)
+        self.assertAlmostEqual(engine["bias"], -7.0)
+        self.assertAlmostEqual(engine["clamp_share"], 0.0)
+
     def test_season_cut_is_four_four_four_by_warm_up_occupancy(self):
         _res, out = walked()
         cut = S.season_cut(out.ledger, FIRST_ARRIVAL, SCORE_FIRST - dt.timedelta(days=1))
         self.assertEqual(sorted(cut), list(range(1, 13)))
         counts = collections.Counter(cut.values())
         self.assertEqual((counts["high"], counts["shoulder"], counts["low"]), (4, 4, 4))
+
+    def test_season_cut_ignores_settled_data_outside_the_warm_up_window(self):
+        """Review finding 4 (the window guard's removal survives): a night
+        outside `[first, last]` must never move a month's ranking. Twelve
+        in-window nights give month `m` a mean of exactly `m`; two outliers
+        sit outside the window and would flip June (mean 6, "shoulder") and
+        January (mean 1, "low") to the top of the ranking if the window
+        check were ever dropped in favour of an unconditional true."""
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))
+        led = Ledger(hotel, dt.date(2023, 1, 1), dt.date(2025, 12, 31))
+        first, last = dt.date(2024, 1, 1), dt.date(2024, 12, 31)
+        for m in range(1, 13):
+            d = dt.date(2024, m, 15)
+            led.settled[d] = _settled_row(d, float(m))
+        led.settled[dt.date(2023, 6, 15)] = _settled_row(dt.date(2023, 6, 15), 999.0)
+        led.settled[dt.date(2025, 1, 15)] = _settled_row(dt.date(2025, 1, 15), 999.0)
+
+        cut = S.season_cut(led, first, last)
+        self.assertEqual(cut[6], "shoulder")
+        self.assertEqual(cut[1], "low")
+        counts = collections.Counter(cut.values())
+        self.assertEqual((counts["high"], counts["shoulder"], counts["low"]), (4, 4, 4))
+
+    def test_a_night_is_filed_under_its_own_season_not_its_forecast_days(self):
+        """Review finding 4 (filing by the forecast day survives): the cut
+        must key off the stay night's own month, never the asof (forecast)
+        day's month. March is given an outlying high warm-up mean and
+        February an outlying low one; a night on 2025-03-15 forecast 30 days
+        out (asof 2025-02-13) can only land under "high" if it is filed by
+        its own month rather than the day the forecast was made."""
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))
+        lead = 30
+        d = dt.date(2025, 3, 15)
+        led = self._resolvable_baseline_ledger(hotel, d, lead)
+        _seed(led, d, {lead: 12}, 15.0)
+
+        warm_first, warm_last = dt.date(2020, 1, 1), dt.date(2020, 12, 31)
+        for m in range(1, 13):
+            wd = dt.date(2020, m, 15)
+            if m == 3:
+                rooms = 1000.0                # March: an outlying high mean
+            elif m == 2:
+                rooms = 1.0                   # February: an outlying low mean
+            else:
+                rooms = float(10 + m)         # filler, strictly between the two
+            led.settled[wd] = _settled_row(wd, rooms)
+
+        walk_result = _bare_walk(led, {
+            (d, lead): pilot.WalkRecord(stay_date=d, lead=lead,
+                                        asof=d - dt.timedelta(days=lead),
+                                        otb=12, forecast=15.0),
+        })
+        table = S.score(walk_result, hotel, [], [], [lead], d, d, warm_first, warm_last)
+
+        self.assertEqual(table["season_of_month"]["3"], "high")
+        self.assertEqual(table["season_of_month"]["2"], "low")
+        self.assertIn("high", table["cuts"]["season"])
+        self.assertNotIn("low", table["cuts"]["season"])
+        self.assertEqual(table["cuts"]["season"]["high"][str(lead)]["n"], 1)
 
     def test_event_windows(self):
         self.assertEqual(S.event_of(dt.date(2017, 4, 14)), "Easter")
@@ -827,6 +967,69 @@ class Scoring(unittest.TestCase):
             ns = set(c["n"] for c in table["overall"][lead]["methods"].values())
             self.assertEqual(len(ns), 1, "lead %s scored different methods on different nights" % lead)
             self.assertEqual(table["overall"][lead]["n"], ns.pop())
+
+    def test_a_night_one_baseline_cannot_forecast_is_excluded_not_zero_filled(self):
+        """Review finding 2: `cell()` takes its count from the actual list,
+        the same list every method reads, so "every method agrees on n" is
+        true no matter what gets put in that list -- it cannot fail even if
+        a night with no real forecast is kept and a missing value is
+        substituted with zero. This test instead checks the population
+        against a hand-derived ground truth: two nights with every baseline
+        resolving (n should be 2), plus a third whose same-time-last-year
+        reference is deliberately left unseeded so `stly_add` (and therefore
+        `average`) is `None` for it, with an engine forecast so large that
+        including it under any substitution would be unmistakable in the
+        aggregate.
+        """
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))     # 20 rooms -> capacity 20
+        lead = 30
+        good1 = dt.date(2025, 3, 5)
+        good2 = good1 + dt.timedelta(days=7)
+        bad = good2 + dt.timedelta(days=7)
+        led = Ledger(hotel, good1 - dt.timedelta(days=400), bad + dt.timedelta(days=30))
+        for k in range(1, 26):
+            n = bad - dt.timedelta(weeks=k)
+            _seed(led, n, {lead: 10.0}, 16.0)
+        for night in (good1, good2):                # bad's own stly night is left unseeded on purpose
+            stly = night - dt.timedelta(days=baselines.STLY_BACK)
+            self.assertEqual(stly.weekday(), night.weekday())
+            _seed(led, stly, {lead: 10.0}, 16.0)
+        _seed(led, good1, {lead: 15}, 15.0)
+        _seed(led, good2, {lead: 16}, 14.0)
+        _seed(led, bad, {lead: 11}, 10.0)            # otb/actual exist; only stly_add is missing
+
+        walk_result = _bare_walk(led, {
+            (good1, lead): pilot.WalkRecord(stay_date=good1, lead=lead,
+                                            asof=good1 - dt.timedelta(days=lead),
+                                            otb=15, forecast=18.0),
+            (good2, lead): pilot.WalkRecord(stay_date=good2, lead=lead,
+                                            asof=good2 - dt.timedelta(days=lead),
+                                            otb=16, forecast=12.0),
+            (bad, lead): pilot.WalkRecord(stay_date=bad, lead=lead,
+                                          asof=bad - dt.timedelta(days=lead),
+                                          otb=11, forecast=100.0),
+        })
+        # Confirm the scenario is what it claims to be before trusting the
+        # assertions below: `bad` really is missing exactly the baselines
+        # that depend on the same-time-last-year night, and nothing else.
+        bl = baselines.all_baselines(led, bad, lead)
+        self.assertIsNone(bl["stly_add"])
+        self.assertIsNone(bl["average"])
+        self.assertIsNotNone(bl["pickup_add"])
+        self.assertIsNotNone(bl["pickup_mult"])
+
+        table = S.score(walk_result, hotel, [], [], [lead], good1, bad,
+                        good1 - dt.timedelta(days=365), good1 - dt.timedelta(days=1))
+        engine = table["overall"][str(lead)]["methods"]["engine"]
+        # Correct: only good1 (engine error 18-15=3) and good2 (12-14=-2)
+        # are scored. mae = mean(3, 2) = 2.5, bias = mean(3, -2) = 0.5. If
+        # `bad` leaked in with its forecast merely clamped (min(100, 20) =
+        # 20, error 10), the population would be 3 and the mean would jump
+        # to (3 + 2 + 10) / 3 = 5.0 -- unmistakably different either way.
+        self.assertEqual(table["overall"][str(lead)]["n"], 2)
+        self.assertEqual(engine["n"], 2)
+        self.assertAlmostEqual(engine["mae"], 2.5)
+        self.assertAlmostEqual(engine["bias"], 0.5)
 
     def test_the_full_night_cut_counts_a_night_full_only_thanks_to_a_comp_room(self):
         """Fixed from the brief: as written this test called `walked()`, whose
@@ -917,6 +1120,98 @@ class Scoring(unittest.TestCase):
             if head["best_single"] is not None:
                 self.assertLess(head["best_single_mae"], head["average_mae"])
 
+    def test_the_headline_names_the_best_single_baseline_not_the_worst(self):
+        """Review finding 3: the existing headline test only checks the
+        positive case (when a name is given, it does beat the average), so
+        naming the worst baseline instead of the best, or naming one that
+        loses to the average, both survive undetected. Built so the three
+        singles rank distinctly -- pickup_mult 0.2 off, pickup_add 1 off,
+        stly_add 3 off -- and the best of them (pickup_mult) beats the
+        average (1 off), so both a min/max flip and a missing beats-check
+        would be caught: a max flip would name stly_add instead."""
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))     # 20 rooms -> capacity 20
+        lead = 30
+        d = dt.date(2025, 3, 5)
+        led = Ledger(hotel, d - dt.timedelta(days=400), d + dt.timedelta(days=30))
+        for k in range(1, 18):
+            n = d - dt.timedelta(weeks=k)
+            _seed(led, n, {lead: 10.0}, 16.0)                    # otb 10, final 16 for every ref
+        stly = d - dt.timedelta(days=baselines.STLY_BACK)
+        self.assertEqual(stly.weekday(), d.weekday())
+        _seed(led, stly, {lead: 10.0}, 20.0)                     # last year: otb 10, final 20
+        _seed(led, d, {lead: 12}, 19.0)                          # this year: otb 12, actual 19
+
+        # Hand-worked: pickup_add = 12 + (16-10) = 18 (err 1); pickup_mult =
+        # 12 * 16/10 = 19.2 (err 0.2); stly_add = 20 + (12-10) = 22 (err 3);
+        # average = mean(18, 22) = 20 (err 1). Confirm before trusting the
+        # headline assertions below.
+        bl = baselines.all_baselines(led, d, lead)
+        self.assertAlmostEqual(bl["pickup_add"], 18.0)
+        self.assertAlmostEqual(bl["pickup_mult"], 19.2)
+        self.assertAlmostEqual(bl["stly_add"], 22.0)
+        self.assertAlmostEqual(bl["average"], 20.0)
+
+        walk_result = _bare_walk(led, {
+            (d, lead): pilot.WalkRecord(stay_date=d, lead=lead,
+                                        asof=d - dt.timedelta(days=lead),
+                                        otb=12, forecast=25.0),  # clamped to 20, err 1
+        })
+        table = S.score(walk_result, hotel, [], [], [lead], d, d,
+                        d - dt.timedelta(days=365), d - dt.timedelta(days=1))
+        head = table["headline"][str(lead)]
+        self.assertEqual(head["best_single"], "pickup_mult")
+        self.assertAlmostEqual(head["best_single_mae"], 0.2)
+
+    def test_the_headline_says_none_when_every_single_baseline_loses_to_the_average(self):
+        """Review finding 3, the negative case the existing test never
+        exercises: when every single baseline's own error is worse than the
+        average's, `best_single` must be `None`, not the least-bad loser.
+        Built so the average lands exactly on the actual (err 0) while every
+        single is off by 5 or more."""
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))     # 20 rooms -> capacity 20
+        lead = 30
+        d = dt.date(2025, 3, 5)
+        led = Ledger(hotel, d - dt.timedelta(days=400), d + dt.timedelta(days=30))
+        for k in range(1, 18):
+            n = d - dt.timedelta(weeks=k)
+            _seed(led, n, {lead: 10.0}, 14.0)                    # otb 10, final 14 for every ref
+        stly = d - dt.timedelta(days=baselines.STLY_BACK)
+        self.assertEqual(stly.weekday(), d.weekday())
+        _seed(led, stly, {lead: 10.0}, 24.0)                     # last year: otb 10, final 24
+        _seed(led, d, {lead: 6}, 15.0)                           # this year: otb 6, actual 15
+
+        # Hand-worked: pickup_add = 6 + (14-10) = 10 (err 5); pickup_mult =
+        # 6 * 14/10 = 8.4 (err 6.6); stly_add = 24 + (6-10) = 20 (err 5);
+        # average = mean(10, 20) = 15 = the actual exactly (err 0).
+        bl = baselines.all_baselines(led, d, lead)
+        self.assertAlmostEqual(bl["pickup_add"], 10.0)
+        self.assertAlmostEqual(bl["pickup_mult"], 8.4)
+        self.assertAlmostEqual(bl["stly_add"], 20.0)
+        self.assertAlmostEqual(bl["average"], 15.0)
+
+        walk_result = _bare_walk(led, {
+            (d, lead): pilot.WalkRecord(stay_date=d, lead=lead,
+                                        asof=d - dt.timedelta(days=lead),
+                                        otb=6, forecast=17.0),
+        })
+        table = S.score(walk_result, hotel, [], [], [lead], d, d,
+                        d - dt.timedelta(days=365), d - dt.timedelta(days=1))
+        head = table["headline"][str(lead)]
+        self.assertIsNone(head["best_single"])
+        self.assertIsNone(head["best_single_mae"])
+
+    def test_lead_1_is_the_late_lead_not_folded_into_the_ordinary_leads(self):
+        """Review finding 5: folding lead 1 into the ordinary leads (so it
+        would print as a demand lead rather than the late-cancellation line
+        the design's own rule requires) survives the whole suite today."""
+        res, out = walked()
+        table = S.score(out, res.hotel, res.bookings, res.nonrev, TEST_MARKS,
+                        SCORE_FIRST, SCORE_LAST, FIRST_ARRIVAL,
+                        SCORE_FIRST - dt.timedelta(days=1))
+        self.assertEqual(table["late_lead"], "1")
+        self.assertEqual(table["leads"], [str(m) for m in TEST_MARKS])
+        self.assertNotIn(table["late_lead"], table["leads"])
+
     def test_every_note_is_carried(self):
         res, out = walked()
         table = S.score(out, res.hotel, res.bookings, res.nonrev, TEST_MARKS,
@@ -925,3 +1220,8 @@ class Scoring(unittest.TestCase):
         text = " ".join(table["notes"])
         self.assertIn("not evidence of revenue", text)
         self.assertIn("cannot forecast a decline", text)
+        # Review "two smaller things": table 1's own no-revenue sentence was
+        # not asserted on by anything, so emptying TABLE1_NOTE entirely kept
+        # the suite green. This phrase is unique to it (BASELINE_NOTE and
+        # LEAD1_NOTE do not contain it).
+        self.assertIn("nothing in this table prices a night", text)
