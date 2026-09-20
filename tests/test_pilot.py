@@ -2006,6 +2006,48 @@ class Switchboard(unittest.TestCase):
         self.assertNotIn("Traceback", text)
 
 
+def _rows_with_a_deliberate_near_tie_at_the_top(rows):
+    """Raise two nights to a near-tie at the top of physical occupancy.
+
+    The synthetic history peaks on a lone night, so `nights_within_2pct` is
+    genuinely 1 and `second_highest` sits far below the peak.  Both fields
+    then pass with the trivial answer hard-wired, and no assertion written
+    against that fixture can tell a real answer from a guessed one: a bound
+    like `>= 1` or `<= rooms` is satisfied by the wrong value as readily as
+    by the right one.
+
+    The plateau is built at 100, 99, 99, 98 and 98 rooms, far above anything
+    the synthetic history reaches, and that scale is the point: "within 2
+    percent" of 100 is 98, so all five nights count and none of them ties the
+    peak, and the true answers are 5 and 99 against a room count of 100.  Five
+    rather than two, because a single-scenario assertion is passed by any
+    constant that happens to equal the right answer, and 1 and 2 are the two
+    constants someone would reach for.  At the fixture hotel's
+    own scale the two fields cannot be separated at all, because 2 percent of
+    twenty rooms is less than one room and "within 2 percent" collapses into
+    "equal", which would force `second_highest` to equal `rooms` and put the
+    two checks in contradiction.  A hundred-room plateau on a twenty-room
+    fixture is artificial; isolating `infer_sellable_rooms`'s arithmetic is
+    what the fixture is for, and the room count is the thing under test.
+    """
+    occ = collections.Counter()
+    for r in _as_dicts(rows):
+        if r["status"] not in ("stayed", "in_house") or int(r["nights"]) < 1:
+            continue
+        arrival = dt.date.fromisoformat(r["arrival"])
+        for k in range(int(r["nights"])):
+            occ[arrival + dt.timedelta(days=k)] += int(r["rooms"])
+    extra = []
+    for offset, target in ((200, 100), (201, 99), (202, 99), (203, 98), (204, 98)):
+        night = FIRST_ARRIVAL + dt.timedelta(days=offset)
+        assert occ[night] < target, (night, occ[night], target)
+        for i in range(target - occ[night]):
+            extra.append(_row(booking_id="TIE%d-%d" % (offset, i),
+                              booked_on=(night - dt.timedelta(days=30)).isoformat(),
+                              arrival=night.isoformat(), nights="1"))
+    return rows + extra
+
+
 def _hotel_without_a_room_count(out_dir):
     """The fixture hotel with sellable_rooms left null, which is what an
     export from a PMS that does not state the room count looks like."""
@@ -2030,7 +2072,7 @@ class RunOneWhenTheRoomCountIsInferred(unittest.TestCase):
     def setUpClass(cls):
         from pace import plugins as _plugins
         _plugins.reset()
-        cls.rows = _payload_rows()
+        cls.rows = _rows_with_a_deliberate_near_tie_at_the_top(_payload_rows())
         cls.out_dir = tempfile.mkdtemp()
         cls.payload = pilot.run_one(
             _csv(cls.rows), _hotel_without_a_room_count(cls.out_dir),
@@ -2046,11 +2088,11 @@ class RunOneWhenTheRoomCountIsInferred(unittest.TestCase):
         config.reset_segments()
         pilot._release_for_tests()
 
-    def _peak_occupancy(self):
-        """The busiest night in the file, counted here rather than read back
-        out of the payload: `infer_sellable_rooms` takes the room count from
-        the peak of physical occupancy, so this is the same number arrived at
-        by a different road."""
+    def _occupancy(self):
+        """Physical occupancy per night, counted here rather than read back out
+        of the payload: `infer_sellable_rooms` derives every field in the
+        inference block from this one map, so rebuilding it is the same
+        arithmetic arrived at by a different road."""
         occ = collections.Counter()
         for r in _as_dicts(self.rows):
             if r["status"] not in ("stayed", "in_house") or int(r["nights"]) < 1:
@@ -2058,18 +2100,31 @@ class RunOneWhenTheRoomCountIsInferred(unittest.TestCase):
             arrival = dt.date.fromisoformat(r["arrival"])
             for k in range(int(r["nights"])):
                 occ[arrival + dt.timedelta(days=k)] += int(r["rooms"])
-        night, rooms = max(occ.items(), key=lambda kv: (kv[1], kv[0]))
-        return night, rooms
+        return occ
 
     def test_the_payload_says_the_room_count_was_inferred_and_from_where(self):
+        """Every field is checked against this fixture's own arithmetic.
+
+        A bound rather than a value is not a check: `nights_within_2pct >= 1`
+        passes with the field hard-wired to 1, and `second_highest <= rooms`
+        passes with it set to `rooms` itself, which is the one wrong answer
+        that matters, because the gap between the two is what says whether
+        the peak was a lone spike or a real ceiling.
+        """
         h = self.payload["hotel"]
-        night, rooms = self._peak_occupancy()
+        occ = self._occupancy()
+        night, rooms = max(occ.items(), key=lambda kv: (kv[1], kv[0]))
+        counts = sorted(occ.values(), reverse=True)
         self.assertTrue(h["rooms_inferred"])
         self.assertEqual(h["rooms"], rooms)
         self.assertEqual(h["peak_night"], night.isoformat())
-        self.assertGreaterEqual(h["nights_within_2pct"], 1)
-        self.assertLessEqual(h["second_highest"], h["rooms"])
+        self.assertEqual(h["nights_within_2pct"],
+                         sum(1 for c in counts if c >= rooms * 0.98))
+        self.assertEqual(h["second_highest"], counts[1])
+        # The fixture has to be able to tell a hard-wired answer from a real
+        # one, so neither field may happen to equal the trivial value.
+        self.assertGreater(h["nights_within_2pct"], 1)
+        self.assertLess(h["second_highest"], h["rooms"])
         self.assertEqual(max(h["per_year_max"].values()), h["rooms"])
         self.assertEqual(sorted(h["per_year_max"]),
-                         sorted({str(night.year)} | {r["arrival"][:4] for r in _as_dicts(self.rows)
-                                                     if r["status"] in ("stayed", "in_house")}))
+                         sorted({str(d.year) for d in occ}))
