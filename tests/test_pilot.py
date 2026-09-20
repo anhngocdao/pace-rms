@@ -1,6 +1,9 @@
 import collections
+import contextlib
 import csv
 import datetime as dt
+import hashlib
+import io
 import json
 import os
 import random
@@ -612,6 +615,33 @@ class Windows(unittest.TestCase):
         # count lands on the same night as the settled-based one here, even
         # though the two reads can disagree on real data.
         self.assertEqual(gap["full_but_uncensored_by_snapshot"], 1)
+
+    def test_the_trim_is_measured_against_the_rows_that_reach_the_ledger(self):
+        """windows.trim_nights describes the trim stay_window took, so it has
+        to be measured against the population stay_window trimmed.
+
+        One comped room entered a month before the first revenue arrival is
+        not in that population: it never reaches the ledger, it never moved
+        the window, and a trim measured from the raw file would report 33
+        nights of trimming where 3 happened.  It does not bite on H1 or H2
+        today, where the earliest arrival is the same in both populations,
+        which is exactly why it needs a test rather than a reader.
+        """
+        rows = [_row(booking_id="C1", segment="COMP", rate="0",
+                     booked_on="2023-12-01", arrival="2023-12-02", nights="1")]
+        rows += [_row(booking_id="A%d" % i, arrival="2024-01-01", nights="1") for i in range(9)]
+        rows += [_row(booking_id="L", arrival="2024-01-01", nights="4")]
+        rows += [_row(booking_id="Z", arrival="2024-06-01", nights="1")]
+        res = self._bookings(rows)
+        first, _last = pilot.stay_window(res.bookings, dt.date(2024, 12, 31))
+        # Ten rows reach the ledger, nine of one night and one of four, so the
+        # 99th percentile of their lengths is 3.73 and the trim is 3 nights
+        # off the first revenue arrival, 2024-01-01.
+        self.assertEqual(first, dt.date(2024, 1, 4))
+        self.assertEqual(pilot.trim_nights(res.bookings, first), 3)
+        # The comp row is 30 days earlier, so a trim taken from the raw file
+        # would say 33.
+        self.assertEqual(min(b.arrival for b in res.bookings), dt.date(2023, 12, 2))
 
     def test_the_deep_mark_is_h1_only(self):
         # Fixed from the brief: the fixture hotel's max_lead is 40, so 90 and
@@ -1228,12 +1258,79 @@ class Scoring(unittest.TestCase):
         self.assertIn("nothing in this table prices a night", text)
 
 
+def _payload_rows():
+    """The whole-run fixture: the shared synthetic history, plus two rows the
+    ingest is bound to flag.
+
+    The two zero-rate rows are the payload's proof of which report its ingest
+    block was filled from.  `pilot.walk` never looks at a rate, so only
+    `ingest.read_bookings` can have counted them; a block filled from the
+    walk's own report comes back without them however loudly it is labelled
+    `ingest`.
+    """
+    rows = history_rows(FIRST_ARRIVAL, NIGHTS)
+    rows += [_row(booking_id="Z1", booked_on="2024-03-01", arrival="2024-03-10",
+                  nights="1", rate="0"),
+             _row(booking_id="Z2", booked_on="2024-03-02", arrival="2024-03-11",
+                  nights="1", rate="0")]
+    return rows
+
+
+def _as_dicts(rows):
+    return [dict(zip(HEADER, r)) for r in rows]
+
+
+def _rows_that_reach_the_ledger(dicts):
+    """The rows the replay lets in, read off the CSV rather than off any
+    ledger: the fixture's segment map sends COMP to NONREV and nothing else,
+    and a zero-night row is day use."""
+    return [r for r in dicts if r["segment"] != "COMP" and int(r["nights"]) > 0]
+
+
+def _physically_full_nights(dicts, rooms, threshold, first, last):
+    """Nights occupied at or above the sell-out cut, counted from the rows.
+
+    A cancelled row and a no-show never sleep in the house; a comped room
+    does.  That is `ingest.physical_occupancy`'s rule, applied here to the CSV
+    so the payload's count has something to be wrong against.
+    """
+    occ = collections.Counter()
+    for r in dicts:
+        if r["status"] not in ("stayed", "in_house"):
+            continue
+        arrival = dt.date.fromisoformat(r["arrival"])
+        for k in range(int(r["nights"])):
+            occ[arrival + dt.timedelta(days=k)] += 1
+    return sorted(d for d, c in occ.items()
+                  if c >= rooms * threshold and first <= d <= last)
+
+
+def _fixture_settings(path):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"seed": 1, "lead_marks": [30, 14, 7], "lead_marks_h1_only": []}, fh)
+    return path
+
+
 class OneHotelPerProcess(unittest.TestCase):
     """hotelconfig.apply rewrites module-level state, so two hotels in one
     process means the second one's engine answers for the first one's."""
 
     def tearDown(self):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
         pilot._release_for_tests()
+
+    def _hotel_named(self, dirname, name="hotel.json"):
+        """A copy of the fixture hotel at a path of its own."""
+        d = tempfile.mkdtemp(prefix=dirname)
+        path = os.path.join(d, name)
+        with open(FIXTURE_HOTEL, encoding="utf-8") as fh:
+            raw = fh.read()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(raw)
+        return path
 
     def test_a_second_hotel_in_the_same_process_is_refused_in_a_sentence(self):
         pilot.claim_process("h1-hotel.json")
@@ -1242,15 +1339,459 @@ class OneHotelPerProcess(unittest.TestCase):
             pilot.claim_process("h2-hotel.json")
         self.assertIn("process of its own", str(ctx.exception))
 
+    def test_two_different_hotels_both_called_hotel_json_are_refused(self):
+        """The guard is keyed on which file the hotel is, not on what it is
+        called.  `hotel.json` beside a booking log is the shape CLAUDE.md
+        documents for the ingest, so two hotels with that name is the normal
+        case and not a corner of one: keyed on the basename, H2 would be
+        waved through and would rewrite H1's contract ratios in place, which
+        is the exact harm the guard exists to stop.
+        """
+        first = self._hotel_named("h1-")
+        second = self._hotel_named("h2-")
+        self.assertEqual(os.path.basename(first), os.path.basename(second))
+        pilot.claim_process(first)
+        with self.assertRaises(pilot.PilotError) as ctx:
+            pilot.claim_process(second)
+        self.assertIn("process of its own", str(ctx.exception))
+        # The sentence names both files, or a hotel cannot tell which two.
+        self.assertIn(os.path.realpath(first), str(ctx.exception))
+        self.assertIn(os.path.realpath(second), str(ctx.exception))
+
+    def test_the_same_hotel_reached_by_two_different_paths_is_allowed(self):
+        """The other direction of the same rule: one hotel is one hotel
+        however the path to it was spelled, so a guard that refused it would
+        refuse a legitimate run for the sake of a string comparison."""
+        path = self._hotel_named("h1-")
+        detour = os.path.join(os.path.dirname(path), "sub", "..", os.path.basename(path))
+        os.makedirs(os.path.join(os.path.dirname(path), "sub"), exist_ok=True)
+        self.assertNotEqual(path, detour)
+        pilot.claim_process(path)
+        pilot.claim_process(detour)                   # no raise: the same file
+        self.assertEqual(os.path.realpath(detour), os.path.realpath(path))
+
+    def test_run_one_refuses_a_second_hotel_before_it_reads_the_log(self):
+        """The headline of this task is that `run.py pilot` refuses the second
+        hotel, not that a function nobody calls would refuse it.  Nothing else
+        in the suite would notice `claim_process` being dropped out of
+        `run_one` altogether.
+        """
+        already = self._hotel_named("h1-")
+        second = self._hotel_named("h2-")
+        pilot.claim_process(already)
+        out_dir = tempfile.mkdtemp()
+        rows = [_row(booking_id="A%d" % i,
+                     arrival=(dt.date(2024, 1, 1) + dt.timedelta(days=i)).isoformat())
+                for i in range(10)]
+        with self.assertRaises(pilot.PilotError) as ctx:
+            pilot.run_one(_csv(rows), second, _fixture_settings(
+                os.path.join(out_dir, "settings.json")), out_dir,
+                score_first=dt.date(2024, 1, 20), score_last=dt.date(2024, 1, 25),
+                warmup_end=dt.date(2024, 1, 19))
+        self.assertIn("process of its own", str(ctx.exception))
+        self.assertIn(os.path.realpath(already), str(ctx.exception))
+        # Nothing was written for the hotel that was refused.
+        self.assertEqual([f for f in os.listdir(out_dir) if f.startswith("pilot-")], [])
+
+    def test_run_one_claims_the_hotel_it_was_given_and_not_a_fixed_name(self):
+        """The test above pre-claims the process by hand, so it still passes
+        with run_one handing `claim_process` a constant: the held key and the
+        constant differ, the second hotel is refused, and the guard looks
+        fine while two real runs would both claim that one constant and both
+        go through.  Only two run_one calls can tell the difference.
+        """
+        first = self._hotel_named("first-")
+        second = self._hotel_named("second-")
+        out_dir = tempfile.mkdtemp()
+        settings = _fixture_settings(os.path.join(out_dir, "settings.json"))
+        rows = [_row(booking_id="A%d" % i,
+                     arrival=(dt.date(2024, 1, 1) + dt.timedelta(days=i)).isoformat())
+                for i in range(10)]
+        csv_path = _csv(rows)
+        kw = dict(score_first=dt.date(2024, 1, 20), score_last=dt.date(2024, 1, 25),
+                  warmup_end=dt.date(2024, 1, 19))
+        # This run is allowed to fail on its data. What is being pinned is
+        # that it got past the claim, which sits after the cheap checks and
+        # before ingest.load, and claimed the file it was actually handed.
+        try:
+            pilot.run_one(csv_path, first, settings, out_dir, **kw)
+        except Exception:
+            pass
+        self.assertEqual(pilot._CLAIMED["hotel"], os.path.realpath(first))
+        with self.assertRaises(pilot.PilotError) as ctx:
+            pilot.run_one(csv_path, second, settings, out_dir, **kw)
+        self.assertIn("process of its own", str(ctx.exception))
+        self.assertIn(os.path.realpath(first), str(ctx.exception))
+
+    def test_a_hotel_json_that_cannot_be_read_does_not_claim_the_process(self):
+        """A typo in the path is the ordinary way this happens.  Claiming the
+        process for a hotel that never loaded turns one typo into a process
+        that refuses the hotel it was meant to run, and says something false
+        while it does it.  load_hotel_json touches no global, so validating
+        before claiming costs nothing.
+        """
+        out_dir = tempfile.mkdtemp()
+        rows = [_row(booking_id="A1")]
+        with self.assertRaises(HC.ConfigError):
+            pilot.run_one(_csv(rows), os.path.join(out_dir, "h1-hotel.jsn"),
+                          _fixture_settings(os.path.join(out_dir, "settings.json")), out_dir)
+        # The real file is still free to claim the process.
+        pilot.claim_process(FIXTURE_HOTEL)
+
 
 class PreRegistration(unittest.TestCase):
+    """The pre-registered file is checkable, and so is the code's agreement
+    with it.  A digest that proves the file has not moved proves nothing at
+    all if the constants the run uses were never tied to what it says."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, "data", "antonio", "settings.json"), encoding="utf-8") as fh:
+            cls.settings = json.load(fh)
+
     def test_the_pre_registered_settings_file_has_not_moved(self):
         """The whole point of pre-registration is that it is checkable."""
         path = os.path.join(ROOT, "data", "antonio", "settings.json")
         self.assertEqual(pilot.settings_digest(path), pilot.PREREG_SHA256)
 
+    def test_the_scoring_window_is_the_pre_registered_one(self):
+        self.assertEqual([pilot.SCORE_FIRST.isoformat(), pilot.SCORE_LAST.isoformat()],
+                         self.settings["scoring_window"])
+
+    def test_the_warm_up_ends_where_the_pre_registered_window_ends(self):
+        self.assertEqual(pilot.WARMUP_END.isoformat(), self.settings["warmup_window"][1])
+
+    def test_the_scoring_window_opens_the_day_after_the_warm_up_closes(self):
+        """A gap between them would leave nights in neither; an overlap would
+        fit the engine on nights it is then scored over."""
+        self.assertEqual(pilot.WARMUP_END + dt.timedelta(days=1), pilot.SCORE_FIRST)
+        self.assertEqual(pilot.WARMUP_END + dt.timedelta(days=1),
+                         dt.date.fromisoformat(self.settings["scoring_window"][0]))
+
+    def test_the_lead_marks_live_in_the_settings_file_and_nowhere_else(self):
+        """A module-level copy of the pre-registered marks that nothing reads
+        is a second answer to the question `which marks were pre-registered`,
+        free to disagree with the first.  marks_for reads the file, so the
+        module keeps no copy at all.
+        """
+        self.assertFalse(hasattr(pilot, "MARKS"))
+        hotel = HC.apply(HC.load_hotel_json(FIXTURE_HOTEL))
+        try:
+            shallow = {"lead_marks": [m for m in self.settings["lead_marks"]
+                                      if m <= hotel.max_lead],
+                       "lead_marks_h1_only": self.settings["lead_marks_h1_only"]}
+            self.assertEqual(list(pilot.marks_for("H1", shallow, hotel)),
+                             sorted(shallow["lead_marks"], reverse=True))
+        finally:
+            from pace import calendar as C
+            from pace import config
+            C.reset_seasonality()
+            config.reset_segments()
+
+    def test_the_driven_run_up_covers_the_deepest_pre_registered_mark(self):
+        """DRIVE_LEAD is the rate path in front of the scoring window.  A mark
+        deeper than it would be read at a rate the engine never walked to."""
+        self.assertGreaterEqual(pilot.DRIVE_LEAD, max(self.settings["lead_marks"]))
+        self.assertEqual(pilot.DRIVE_LEAD, 180)
+
 
 class RunOne(unittest.TestCase):
+    """One whole run, with every block of the payload checked against a value
+    worked out ahead of it.
+
+    Every expected number below comes from the CSV the fixture generated, from
+    tests/fixtures/pilot-hotel.json, or from arithmetic on the window that was
+    asked for.  None of them is read back out of the payload: a payload
+    checked against itself passes with `code` mutated to WRONG, because both
+    sides of the comparison move together.
+    """
+
+    SCORING_NIGHTS = 89          # 2025-02-01 to 2025-04-30 inclusive: 28 + 31 + 30
+    DRIVEN_DAYS = 269            # 2024-08-05 to 2025-04-30 inclusive
+    QUICK_NIGHTS = 21
+
+    @classmethod
+    def setUpClass(cls):
+        # Same reason walked() does it: plugins.py keeps a module-level
+        # registry that pipeline.run() fills and never clears, so this run's
+        # numbers must not depend on whether test_golden.py ran first.
+        from pace import plugins as _plugins
+        _plugins.reset()
+        cls.rows = _payload_rows()
+        cls.dicts = _as_dicts(cls.rows)
+        cls.csv_path = _csv(cls.rows)
+        cls.out_dir = tempfile.mkdtemp()
+        cls.settings_path = _fixture_settings(os.path.join(cls.out_dir, "settings.json"))
+        cls.payload = pilot.run_one(cls.csv_path, FIXTURE_HOTEL, cls.settings_path, cls.out_dir,
+                                    score_first=SCORE_FIRST, score_last=SCORE_LAST,
+                                    warmup_end=SCORE_FIRST - dt.timedelta(days=1))
+        cls.written = os.path.join(cls.out_dir, "pilot-pilot.json")
+        with open(cls.written, "rb") as fh:
+            cls.on_disk = fh.read()
+        # A second run of the same hotel, scoring three weeks instead of three
+        # months, standing in for `--quick`.
+        cls.quick = pilot.run_one(cls.csv_path, FIXTURE_HOTEL, cls.settings_path, cls.out_dir,
+                                  score_first=SCORE_FIRST,
+                                  score_last=SCORE_FIRST + dt.timedelta(days=cls.QUICK_NIGHTS - 1),
+                                  warmup_end=SCORE_FIRST - dt.timedelta(days=1),
+                                  label="quick")
+        with open(cls.written, "rb") as fh:
+            cls.on_disk_after_quick = fh.read()
+        with open(cls.written, encoding="utf-8") as fh:
+            cls.back = json.load(fh)
+        with open(FIXTURE_HOTEL, encoding="utf-8") as fh:
+            cls.hotel_json = json.load(fh)
+
+    @classmethod
+    def tearDownClass(cls):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
+        pilot._release_for_tests()
+
+    def test_the_payload_is_written_under_the_hotel_s_own_code(self):
+        """tests/fixtures/pilot-hotel.json is named "Pilot Fixture Hotel", so
+        the code is PILOT and the file is pilot-pilot.json.  Building the
+        expected name out of payload["hotel"]["code"] would assert nothing:
+        both sides would move together, and the file would still be found
+        with the code mutated to WRONG.
+        """
+        self.assertEqual(self.payload["hotel"]["code"], "PILOT")
+        self.assertTrue(os.path.exists(os.path.join(self.out_dir, "pilot-pilot.json")))
+        self.assertEqual(self.payload["_json_path"], os.path.join(self.out_dir, "pilot-pilot.json"))
+
+    def test_what_is_on_disk_is_the_payload_that_was_returned(self):
+        """Minus the path itself, which is added after the write and is the
+        one key the file cannot carry."""
+        self.assertEqual(self.back,
+                         {k: v for k, v in self.payload.items() if k != "_json_path"})
+
+    def test_the_windows_are_the_ones_the_run_was_asked_for(self):
+        w = self.back["windows"]
+        ledger_rows = _rows_that_reach_the_ledger(self.dicts)
+        first_arrival = min(dt.date.fromisoformat(r["arrival"]) for r in ledger_rows)
+        self.assertEqual(first_arrival, dt.date(2024, 1, 1))
+        # Stays in this fixture are 1, 2 or 3 nights, so the 99th percentile
+        # of their lengths is 3 and the front of the window is trimmed by 3.
+        self.assertEqual(w["trim_nights"], 3)
+        self.assertEqual(w["first_stay"], "2024-01-04")
+        # The history runs to 2025-05-14, well past the scoring window, so the
+        # back of the stay window is the scoring cap and not the export's end.
+        self.assertEqual(w["last_stay"], SCORE_LAST.isoformat())
+        self.assertEqual(w["score_first"], "2025-02-01")
+        self.assertEqual(w["score_last"], "2025-04-30")
+        self.assertEqual(w["warmup_end"], "2025-01-31")
+        # DRIVE_LEAD is 180 days of rate path in front of the window, so the
+        # engine is driven from 2025-02-01 minus 180 days.
+        self.assertEqual(w["drive_from"], "2024-08-05")
+        self.assertEqual(w["scoring_nights"], self.SCORING_NIGHTS)
+
+    def test_the_walk_reached_every_night_of_the_window_at_every_mark(self):
+        w = self.back["walk"]
+        ledger_rows = _rows_that_reach_the_ledger(self.dicts)
+        first_day = min(dt.date.fromisoformat(r["booked_on"]) for r in ledger_rows)
+        self.assertEqual(first_day, dt.date(2023, 11, 28))
+        # The day loop opens on the earliest booking in the file and closes on
+        # the last night of the stay window.
+        self.assertEqual(w["days"], (SCORE_LAST - first_day).days + 1)
+        self.assertEqual(w["days"], 520)
+        self.assertEqual(w["marks"], [30, 14, 7])
+        # Three marks plus the late mark, at every night of the window: the
+        # walk is driven from 2024-08-05, which is in front of 2025-02-01 by
+        # more than the deepest mark, so no night is short of a record.
+        self.assertEqual(w["records"], 4 * self.SCORING_NIGHTS)
+        self.assertEqual(w["records"], 356)
+        # One fit before the first driven day, then one every 28 days of the
+        # 269 driven days.
+        self.assertEqual(w["fits"], 1 + (self.DRIVEN_DAYS - 1) // 28)
+        self.assertEqual(w["fits"], 10)
+        self.assertGreater(w["solves"], 0)
+        self.assertGreater(w["seconds"], 0)
+
+    def test_the_ingest_block_carries_what_the_ingest_found(self):
+        """The block is labelled `ingest`, so it says what ingest found.
+
+        Filled from the walk's own fresh Report it would publish "no
+        warnings" over rows the reader was flagged for: at H1 that is
+        rate_nonpositive 752 and rate_out_of_range 5,555 reported as nothing
+        at all, beside a notes list that does come from the ingest.
+        """
+        block = self.back["ingest"]
+        ledger_rows = _rows_that_reach_the_ledger(self.dicts)
+        last_stay = SCORE_LAST
+        self.assertEqual(block["rows"], len(self.dicts))
+        self.assertEqual(block["rows"], 2474)
+        self.assertEqual(block["nonrev_rows"],
+                         sum(1 for r in self.dicts if r["segment"] == "COMP"))
+        self.assertEqual(block["bookings"],
+                         sum(1 for r in ledger_rows
+                             if dt.date.fromisoformat(r["booked_on"]) <= last_stay))
+        self.assertEqual(block["cancels"],
+                         sum(1 for r in ledger_rows
+                             if r["status"] == "cancelled" and r["status_date"]
+                             and dt.date.fromisoformat(r["status_date"]) <= last_stay))
+        # The two rows priced at zero. Only the reader can have counted these.
+        self.assertEqual(block["warnings"]["rate_nonpositive"], 2)
+
+    def test_the_two_replays_over_capacity_counts_are_not_added_together(self):
+        """ingest.replay and pilot.walk both settle the same nights and both
+        count over_capacity_nights into the report they are handed.  Sharing
+        one report is what puts the ingest's warnings in the payload; adding
+        the two counts together would publish a number that is a count of
+        nothing, so what the walk added is published as the walk's own.
+        """
+        ingest_block = self.back["ingest"]["warnings"]
+        walk_block = self.back["walk"]["over_capacity"]
+        # The fixture pushes one deliberate spike over the twenty rooms, and
+        # the ledger's rooms are a subset of the rooms in the house, so at
+        # most the one physically full night can be over capacity.
+        full = _physically_full_nights(self.dicts, 20, 0.97,
+                                       dt.date(2024, 1, 4), SCORE_LAST)
+        self.assertEqual(len(full), 1)
+        self.assertEqual(ingest_block["over_capacity_nights"], 1)
+        self.assertEqual(walk_block["over_capacity_nights"], 1)
+        self.assertEqual(ingest_block["rooms_walked_off_the_actuals"],
+                         walk_block["rooms_walked_off_the_actuals"])
+
+    def test_the_hotel_block_is_the_hotel_json_it_was_given(self):
+        h = self.back["hotel"]
+        j = self.hotel_json
+        self.assertEqual(h["name"], j["name"])
+        self.assertEqual(h["city"], j["city"])
+        self.assertEqual(h["currency"], j["currency"])
+        self.assertEqual(h["rooms"], j["sellable_rooms"])
+        self.assertEqual(h["rooms"], 20)
+        self.assertEqual(h["base_rate"], j["base_rate"])
+        self.assertEqual(h["rate_floor"], j["rate_floor"])
+        self.assertEqual(h["rate_ceiling"], j["rate_ceiling"])
+        self.assertEqual(h["rate_step"], j["rate_step"])
+        self.assertEqual(h["max_lead"], j["max_lead"])
+        self.assertEqual(h["max_los"], j["max_los"])
+        self.assertEqual(h["sellout_threshold"], j["sellout_threshold"])
+        self.assertEqual(h["variable_cost"], j["variable_cost"])
+        self.assertEqual(h["walk_cost"], j["walk_cost"])
+        self.assertEqual(h["demand_season_band"], j["demand_season_band"])
+        self.assertEqual(h["segment_rate_ratio"], j["segment_rate_ratio"])
+        self.assertEqual(h["rates_include_tax"], j["rates_include_tax"])
+        # 80 to 201 in steps of 2 stops at 200: the ceiling is not a rung.
+        self.assertEqual(h["top_rung"], 200.0)
+        # sellable_rooms is set in the fixture, so nothing was inferred.
+        self.assertFalse(h["rooms_inferred"])
+        self.assertIsNone(h["peak_night"])
+        self.assertEqual(h["per_year_max"], {})
+
+    def test_the_prereg_block_records_the_settings_file_that_was_read(self):
+        with open(self.settings_path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        p = self.back["prereg"]
+        self.assertEqual(p["settings_sha256"], digest)
+        self.assertEqual(p["settings_path"], self.settings_path)
+        self.assertEqual(p["commit"], pilot.PREREG_COMMIT)
+        # This run was given a settings file of its own, so the flag has to
+        # say the digest is not the pre-registered one.  A flag that is always
+        # true is worth less than no flag.
+        self.assertNotEqual(digest, pilot.PREREG_SHA256)
+        self.assertFalse(p["sha256_matches_the_recorded_one"])
+
+    def test_table_one_is_scored_at_the_marks_that_were_asked_for(self):
+        t = self.back["table1"]
+        self.assertEqual(t["leads"], ["30", "14", "7"])
+        self.assertEqual(t["late_lead"], "1")
+        self.assertEqual(t["methods"], ["engine", "pickup_add", "pickup_mult",
+                                        "stly_add", "average"])
+        self.assertEqual(sorted(t["overall"]), sorted(["30", "14", "7", "1"]))
+        for lead, block in t["overall"].items():
+            # A night is scored once, and only when every method could answer
+            # for it, so n can fall short of the window but never exceed it.
+            self.assertLessEqual(block["n"], self.SCORING_NIGHTS)
+            self.assertGreater(block["n"], 0)
+            # Capacity is the room count less the comped rooms of the night,
+            # so it sits just under 20; handed an empty non-revenue list it
+            # would be exactly 20 on every night.
+            self.assertLess(block["capacity_mean"], 20.0)
+            self.assertGreater(block["capacity_mean"], 19.0)
+            head = t["headline"][lead]
+            self.assertEqual(head["engine_mae"], block["methods"]["engine"]["mae"])
+            self.assertEqual(head["average_mae"], block["methods"]["average"]["mae"])
+
+    def test_the_season_cut_is_taken_over_the_warm_up_window(self):
+        """score() is handed the warm-up window as (first, last).  Swapped,
+        it reads no settled night at all and falls back to ranking the months
+        by their number, which makes January high season and July shoulder.
+
+        The fixture books July and August fuller than any other month by
+        construction, and the warm-up window covers a whole year of it.
+        """
+        seasons = self.back["table1"]["season_of_month"]
+        self.assertEqual(seasons["7"], "high")
+        self.assertEqual(seasons["8"], "high")
+        self.assertEqual(collections.Counter(seasons.values()),
+                         collections.Counter({"high": 4, "shoulder": 4, "low": 4}))
+
+    def test_the_full_night_gap_counts_the_window_it_was_handed(self):
+        gap = self.back["full_night_gap"]
+        first_stay = dt.date(2024, 1, 4)
+        self.assertEqual(gap["nights"], (SCORE_LAST - first_stay).days + 1)
+        self.assertEqual(gap["nights"], 483)
+        self.assertEqual(gap["rooms"], 20)
+        self.assertEqual(gap["threshold_rooms"], 19.4)
+        full = _physically_full_nights(self.dicts, 20, 0.97, first_stay, SCORE_LAST)
+        self.assertEqual(gap["physically_full"], len(full))
+        self.assertEqual(gap["physically_full"], 1)
+        # Both shares say which population they are a share of, and each one
+        # agrees with the counts beside it.
+        self.assertAlmostEqual(gap["share_of_nights"],
+                               gap["full_but_invisible"] / float(gap["nights"]))
+        self.assertAlmostEqual(gap["share_of_full_nights"],
+                               gap["full_but_invisible"] / float(gap["physically_full"]))
+
+    def test_tables_two_and_three_are_none_until_they_are_run(self):
+        self.assertIsNone(self.back["table2"])
+        self.assertIsNone(self.back["table3"])
+
+    def test_the_notes_the_payload_promises_are_in_it(self):
+        notes = self.back["notes"]
+        self.assertEqual(len(notes), 2)
+        self.assertIn("no number in this report is a revenue lift", " ".join(notes).lower())
+        # The second note is the one that keeps the two full-night counts
+        # apart; dropping it leaves the numbers with nothing saying which is
+        # which.
+        self.assertIn("full_but_uncensored_by_snapshot", " ".join(notes))
+        self.assertEqual(notes, [pilot.NO_LIFT_NOTE, pilot.FULL_NIGHT_NOTE])
+
+    def test_a_partial_run_cannot_overwrite_or_be_mistaken_for_a_whole_one(self):
+        """A run over part of the window is not the pilot's result, so it is
+        a file of its own and says so in its own payload.
+
+        The name alone would not survive the file being renamed or copied; the
+        field alone would still let a three-week run land on top of a
+        three-month one on disk.  Task 10 joins two hotels from two files, and
+        the failure this stops is a 21-night H1 being reported beside a
+        427-night H2 with nothing on either to say so.
+        """
+        quick_path = os.path.join(self.out_dir, "pilot-pilot-quick.json")
+        self.assertEqual(self.quick["_json_path"], quick_path)
+        self.assertTrue(os.path.exists(quick_path))
+        self.assertEqual(self.quick["label"], "quick")
+        self.assertEqual(self.payload["label"], "full")
+        self.assertEqual(self.quick["windows"]["scoring_nights"], self.QUICK_NIGHTS)
+        # The whole run's payload is untouched by the partial one.
+        self.assertEqual(self.on_disk, self.on_disk_after_quick)
+        self.assertEqual(sorted(f for f in os.listdir(self.out_dir) if f.startswith("pilot-")),
+                         ["pilot-pilot-quick.json", "pilot-pilot.json"])
+
+
+class RunOneErrors(unittest.TestCase):
+    """Every one of these is a path or a file typed on a command line, so
+    every one of them is owed a sentence rather than a traceback
+    (pace/hotelconfig.py's house rule, and ADR 0007's reason for it)."""
+
+    def setUp(self):
+        self.out_dir = tempfile.mkdtemp()
+        self.settings = _fixture_settings(os.path.join(self.out_dir, "settings.json"))
+        self.csv = _csv([_row(booking_id="A1")])
+
     def tearDown(self):
         from pace import calendar as C
         from pace import config
@@ -1258,26 +1799,277 @@ class RunOne(unittest.TestCase):
         config.reset_segments()
         pilot._release_for_tests()
 
-    def test_a_whole_run_writes_a_payload_that_survives_json(self):
-        rows = history_rows(FIRST_ARRIVAL, NIGHTS)
-        csv_path = _csv(rows)
+    def _run(self, csv_path=None, hotel=None, settings=None, out_dir=None, **kw):
+        return pilot.run_one(csv_path or self.csv, hotel or FIXTURE_HOTEL,
+                             settings or self.settings, out_dir or self.out_dir, **kw)
+
+    def test_a_missing_booking_log_is_a_sentence(self):
+        with self.assertRaises(pilot.PilotError) as ctx:
+            self._run(csv_path=os.path.join(self.out_dir, "not-here.csv"))
+        self.assertIn("no such file", str(ctx.exception))
+
+    def test_a_booking_log_that_is_a_directory_is_a_sentence(self):
+        with self.assertRaises(pilot.PilotError) as ctx:
+            self._run(csv_path=self.out_dir)
+        self.assertIn("directory", str(ctx.exception))
+
+    def test_a_missing_settings_file_is_a_sentence(self):
+        with self.assertRaises(pilot.PilotError) as ctx:
+            self._run(settings=os.path.join(self.out_dir, "nothing.json"))
+        self.assertIn("settings", str(ctx.exception))
+
+    def test_a_settings_file_that_is_not_json_is_a_sentence(self):
+        path = os.path.join(self.out_dir, "broken.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"seed": 1,')
+        with self.assertRaises(pilot.PilotError) as ctx:
+            self._run(settings=path)
+        self.assertIn("not valid JSON", str(ctx.exception))
+
+    def test_settings_without_lead_marks_is_a_sentence(self):
+        path = os.path.join(self.out_dir, "no-marks.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"seed": 1}, fh)
+        with self.assertRaises(pilot.PilotError) as ctx:
+            self._run(settings=path)
+        self.assertIn("lead_marks", str(ctx.exception))
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root writes into a read-only directory anyway")
+    def test_an_unwritable_out_directory_fails_before_the_walk(self):
+        """The walk is minutes on a real hotel.  Finding out that --out is
+        read-only at the moment the payload is written throws away the whole
+        run, which is the one failure that costs everything it had already
+        done.
+
+        `progress=1` makes the walk audible: it prints a line for every day it
+        walks.  Nothing printed is the demonstration that nothing was walked.
+        """
+        locked = tempfile.mkdtemp()
+        os.chmod(locked, 0o500)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                with self.assertRaises(pilot.PilotError) as ctx:
+                    self._run(out_dir=locked, progress=1)
+            self.assertIn("output directory", str(ctx.exception))
+            self.assertEqual(out.getvalue(), "")
+        finally:
+            os.chmod(locked, 0o700)
+
+    def test_a_stay_window_that_opens_after_the_scoring_window_is_a_sentence(self):
+        """The guard that says there is no warm-up to fit on.  With it
+        removed the run walks a window it has no history for and scores an
+        empty table instead of saying why.
+        """
+        rows = [_row(booking_id="A%d" % i,
+                     arrival=(dt.date(2024, 6, 1) + dt.timedelta(days=i)).isoformat())
+                for i in range(10)]
+        with self.assertRaises(pilot.PilotError) as ctx:
+            self._run(csv_path=_csv(rows), score_first=dt.date(2024, 1, 1),
+                      score_last=dt.date(2024, 6, 20), warmup_end=dt.date(2023, 12, 31))
+        self.assertIn("no warm-up to fit on", str(ctx.exception))
+
+
+class Switchboard(unittest.TestCase):
+    """run.py's pilot branch: what it passes down, and what it prints back."""
+
+    def setUp(self):
+        import run as runpy_module
+        self.run = runpy_module
+        self.real_run_one = pilot.run_one
+
+    def tearDown(self):
+        pilot.run_one = self.real_run_one
+        pilot._release_for_tests()
+
+    def _main(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.run.main(["run.py"] + argv)
+        return code, out.getvalue()
+
+    def _payload(self):
+        """A payload with numbers chosen so a line that prints the wrong field
+        prints a number that is visibly not the one asked for."""
+        methods = {name: {"mae": 4.0, "clamp_share": 0.25} for name in
+                   ("engine", "pickup_add", "pickup_mult", "stly_add", "average")}
+        methods["engine"] = {"mae": 3.5, "clamp_share": 0.25}
+        methods["average"] = {"mae": 6.5, "clamp_share": 0.0}
+        return {
+            "label": "full",
+            "hotel": {"name": "H1 Resort Hotel", "code": "H1", "rooms": 187,
+                      "rooms_inferred": True},
+            "walk": {"days": 898, "seconds": 16.1, "fits": 22, "records": 434},
+            "full_night_gap": {"nights": 414, "physically_full": 86,
+                               "full_but_invisible": 25, "share_of_full_nights": 25 / 86.0},
+            "table1": {"leads": ["30"], "late_lead": "1",
+                       "overall": {"30": {"n": 62, "methods": methods},
+                                   "1": {"n": 0, "methods": {"engine": {"mae": None}}}}},
+            "_json_path": "/tmp/out/pilot-h1.json",
+        }
+
+    def test_the_pilot_command_needs_both_paths(self):
+        code, text = self._main(["pilot"])
+        self.assertEqual(code, 1)
+        self.assertIn("usage: python3 run.py pilot", text)
+
+    def test_an_unknown_command_prints_the_doc_and_fails(self):
+        code, text = self._main(["nonsense"])
+        self.assertEqual(code, 1)
+        self.assertIn("run.py pilot", text)
+
+    def test_the_log_and_the_hotel_are_passed_in_the_order_they_were_typed(self):
+        seen = {}
+
+        def fake(csv_path, hotel_json_path, settings_path, out_dir, **kw):
+            seen.update(csv=csv_path, hotel=hotel_json_path, settings=settings_path,
+                        out=out_dir, kw=kw)
+            return self._payload()
+
+        pilot.run_one = fake
+        code, _text = self._main(["pilot", "bookings.csv", "hotel.json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["csv"], "bookings.csv")
+        self.assertEqual(seen["hotel"], "hotel.json")
+        # The defaults, when neither flag is given.
+        self.assertEqual(seen["out"], os.path.join(ROOT, "out"))
+        self.assertEqual(seen["settings"],
+                         os.path.join(ROOT, "data", "antonio", "settings.json"))
+        self.assertEqual(seen["kw"]["score_first"], pilot.SCORE_FIRST)
+        self.assertEqual(seen["kw"]["score_last"], pilot.SCORE_LAST)
+        self.assertEqual(seen["kw"]["label"], "")
+
+    def test_quick_moves_the_far_end_of_the_window_and_labels_the_run(self):
+        """--quick is a wiring check, not a result.  It shortens the window
+        from the far end: the near end is what the warm-up and the 180 driven
+        days in front of it are cut to, so moving it would move the run-up
+        as well and score nights the engine was never driven towards.
+        """
+        first, last, label = self.run._pilot_window(["--quick"])
+        self.assertEqual(first, pilot.SCORE_FIRST)
+        self.assertEqual(last, pilot.SCORE_FIRST + dt.timedelta(days=61))
+        self.assertEqual(last, dt.date(2016, 8, 31))
+        self.assertEqual(label, "quick")
+        plain = self.run._pilot_window([])
+        self.assertEqual(plain, (pilot.SCORE_FIRST, pilot.SCORE_LAST, ""))
+
+    def test_the_flags_are_read_off_the_arguments(self):
+        self.assertEqual(self.run._opt(["--out", "here"], "--out", "fallback"), "here")
+        self.assertEqual(self.run._opt([], "--out", "fallback"), "fallback")
+        # A flag with nothing after it takes the default rather than raising.
+        self.assertEqual(self.run._opt(["--out"], "--out", "fallback"), "fallback")
+
+    def test_the_flags_reach_run_one(self):
+        seen = {}
+
+        def fake(csv_path, hotel_json_path, settings_path, out_dir, **kw):
+            seen.update(settings=settings_path, out=out_dir, kw=kw)
+            return self._payload()
+
+        pilot.run_one = fake
+        code, _text = self._main(["pilot", "b.csv", "h.json", "--out", "/tmp/elsewhere",
+                                  "--settings", "/tmp/s.json", "--quick"])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["out"], "/tmp/elsewhere")
+        self.assertEqual(seen["settings"], "/tmp/s.json")
+        self.assertEqual(seen["kw"]["label"], "quick")
+        self.assertEqual(seen["kw"]["score_last"], pilot.SCORE_FIRST + dt.timedelta(days=61))
+
+    def test_what_it_prints_says_which_population_each_share_is_of(self):
+        """25 of 86 full nights is 29 percent of the full nights and 6 percent
+        of the window.  Printed as "25 of 414" it reads as the second while
+        being the first, and full_night_gap's own docstring is written against
+        exactly that.
+        """
+        pilot.run_one = lambda *a, **kw: self._payload()
+        code, text = self._main(["pilot", "b.csv", "h.json"])
+        self.assertEqual(code, 0)
+        self.assertIn("H1 Resort Hotel (H1), 187 rooms, inferred", text)
+        self.assertIn("walked 898 days in 16.1 s, 22 fits, 434 forecasts recorded", text)
+        self.assertIn("nights physically full 86 of 414 in the window", text)
+        self.assertIn("25 invisible to the ledger (29% of the full nights)", text)
+        self.assertIn("lead 30   n=62   engine MAE   3.50 (clamped   25%), average   6.50", text)
+        # A lead with nothing scored says so rather than printing a None.
+        self.assertIn("lead 1    no night scored", text)
+        self.assertIn("wrote /tmp/out/pilot-h1.json", text)
+
+    def test_a_bad_path_comes_back_as_one_sentence_and_exit_1(self):
         out_dir = tempfile.mkdtemp()
-        settings_path = os.path.join(out_dir, "settings.json")
-        with open(settings_path, "w", encoding="utf-8") as fh:
-            json.dump({"seed": 1, "lead_marks": [30, 14, 7], "lead_marks_h1_only": []}, fh)
-        payload = pilot.run_one(csv_path, FIXTURE_HOTEL, settings_path, out_dir,
-                                score_first=SCORE_FIRST, score_last=SCORE_LAST,
-                                warmup_end=SCORE_FIRST - dt.timedelta(days=1))
-        written = os.path.join(out_dir, "pilot-%s.json" % payload["hotel"]["code"].lower())
-        self.assertTrue(os.path.exists(written))
-        with open(written, encoding="utf-8") as fh:
-            back = json.load(fh)
-        self.assertEqual(back["hotel"]["rooms"], 20)
-        self.assertEqual(back["table2"], None)
-        self.assertEqual(back["table3"], None)
-        self.assertGreater(back["table1"]["overall"]["30"]["n"], 20)
-        self.assertGreater(back["walk"]["days"], 450)
-        self.assertEqual(back["prereg"]["commit"], pilot.PREREG_COMMIT)
-        self.assertIn("full_night_gap", back)
-        self.assertIn("no number in this report is a revenue lift",
-                      " ".join(back["notes"]).lower())
+        code, text = self._main(["pilot", os.path.join(out_dir, "nope.csv"), FIXTURE_HOTEL,
+                                 "--out", out_dir,
+                                 "--settings", _fixture_settings(
+                                     os.path.join(out_dir, "settings.json"))])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(text.strip().splitlines()), 1)
+        self.assertIn("no such file", text)
+        self.assertNotIn("Traceback", text)
+
+
+def _hotel_without_a_room_count(out_dir):
+    """The fixture hotel with sellable_rooms left null, which is what an
+    export from a PMS that does not state the room count looks like."""
+    with open(FIXTURE_HOTEL, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    raw["sellable_rooms"] = None
+    path = os.path.join(out_dir, "hotel.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(raw, fh)
+    return path
+
+
+class RunOneWhenTheRoomCountIsInferred(unittest.TestCase):
+    """RunOne's fixture states sellable_rooms, so `rooms_inferred` is False
+    there no matter what the code does: that class's assertion on the field
+    passes with it hard-wired to False, and the three fields that describe
+    the inference are all empty either way.  Only a hotel whose room count
+    really was inferred can tell the two apart.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from pace import plugins as _plugins
+        _plugins.reset()
+        cls.rows = _payload_rows()
+        cls.out_dir = tempfile.mkdtemp()
+        cls.payload = pilot.run_one(
+            _csv(cls.rows), _hotel_without_a_room_count(cls.out_dir),
+            _fixture_settings(os.path.join(cls.out_dir, "settings.json")), cls.out_dir,
+            score_first=SCORE_FIRST, score_last=SCORE_FIRST + dt.timedelta(days=13),
+            warmup_end=SCORE_FIRST - dt.timedelta(days=1))
+
+    @classmethod
+    def tearDownClass(cls):
+        from pace import calendar as C
+        from pace import config
+        C.reset_seasonality()
+        config.reset_segments()
+        pilot._release_for_tests()
+
+    def _peak_occupancy(self):
+        """The busiest night in the file, counted here rather than read back
+        out of the payload: `infer_sellable_rooms` takes the room count from
+        the peak of physical occupancy, so this is the same number arrived at
+        by a different road."""
+        occ = collections.Counter()
+        for r in _as_dicts(self.rows):
+            if r["status"] not in ("stayed", "in_house") or int(r["nights"]) < 1:
+                continue
+            arrival = dt.date.fromisoformat(r["arrival"])
+            for k in range(int(r["nights"])):
+                occ[arrival + dt.timedelta(days=k)] += int(r["rooms"])
+        night, rooms = max(occ.items(), key=lambda kv: (kv[1], kv[0]))
+        return night, rooms
+
+    def test_the_payload_says_the_room_count_was_inferred_and_from_where(self):
+        h = self.payload["hotel"]
+        night, rooms = self._peak_occupancy()
+        self.assertTrue(h["rooms_inferred"])
+        self.assertEqual(h["rooms"], rooms)
+        self.assertEqual(h["peak_night"], night.isoformat())
+        self.assertGreaterEqual(h["nights_within_2pct"], 1)
+        self.assertLessEqual(h["second_highest"], h["rooms"])
+        self.assertEqual(max(h["per_year_max"].values()), h["rooms"])
+        self.assertEqual(sorted(h["per_year_max"]),
+                         sorted({str(night.year)} | {r["arrival"][:4] for r in _as_dicts(self.rows)
+                                                     if r["status"] in ("stayed", "in_house")}))

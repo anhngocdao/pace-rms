@@ -36,8 +36,14 @@ from .ingest import Booking, Report
 from .ledger import Hold, Ledger
 from .policy import PaceEngine
 
-# Pre-registered in data/antonio/settings.json, section 9 of the design.
-MARKS = (120, 90, 60, 30, 14, 7)
+# The three windows below are pre-registered in data/antonio/settings.json,
+# section 9 of the design, and written out here as dates because pace/ must not
+# read data/: a hotel running the ingest has the package and not the pilot's
+# fixtures.  A second copy is only safe if it cannot drift from the first, so
+# tests/test_pilot.py's PreRegistration pins each one to the file, the way
+# tests/test_convert_antonio.py pins the converter's own copies.  The
+# pre-registered lead marks are deliberately not copied here at all: marks_for
+# reads them out of the settings file, so that list has exactly one home.
 LATE_MARK = 1
 SCORE_FIRST = dt.date(2016, 7, 1)
 SCORE_LAST = dt.date(2017, 8, 31)
@@ -239,6 +245,16 @@ def hotel_code(cfg) -> str:
     return head[0].upper() if head else "HOTEL"
 
 
+def ledger_rows(bookings: List[Booking]) -> List[Booking]:
+    """The rows that reach the ledger: revenue rows with at least one night.
+
+    walk() and ingest.replay both filter exactly this way, so every window and
+    every count taken from the log is taken from this population rather than
+    from the raw file, which also carries comped rooms and zero-night day use.
+    """
+    return [b for b in bookings if b.target not in (None, "NONREV") and b.nights > 0]
+
+
 def stay_window(bookings: List[Booking], last_cap: dt.date) -> Tuple[dt.date, dt.date]:
     """The stay window the ledger is built over (design, section 4).
 
@@ -247,7 +263,7 @@ def stay_window(bookings: List[Booking], last_cap: dt.date) -> Tuple[dt.date, dt
     Trim the front by the 99th percentile of length of stay: 14 nights at H1 and
     9 at H2 on the public dataset. The back is capped because the export stops.
     """
-    rows = [b for b in bookings if b.target not in (None, "NONREV") and b.nights > 0]
+    rows = ledger_rows(bookings)
     if not rows:
         raise PilotError("no booking row reaches the ledger, so there is no stay window to take; "
                          "check the segment map and that the export covers real stays")
@@ -258,6 +274,18 @@ def stay_window(bookings: List[Booking], last_cap: dt.date) -> Tuple[dt.date, dt
         raise PilotError("the stay window is empty after trimming %d nights off the front: "
                          "first stay %s, last stay %s" % (trim, first, last))
     return first, last
+
+
+def trim_nights(bookings: List[Booking], first_stay: dt.date) -> int:
+    """How many nights stay_window took off the front, measured against the
+    rows it trimmed.
+
+    Against the raw file instead, one comped room or one day-use row entered
+    before the first real arrival is reported as a trim of weeks that never
+    happened: the window the code used would be right and the number beside it
+    describing that window would be wrong.
+    """
+    return (first_stay - min(b.arrival for b in ledger_rows(bookings))).days
 
 
 def capacity_on(hotel: Hotel, nonrev: List[Booking], night: dt.date,
@@ -342,23 +370,37 @@ NO_LIFT_NOTE = (
 _CLAIMED = {"hotel": None}
 
 
-def claim_process(name: str) -> None:
-    """One hotel per process.
+def claim_process(hotel_json_path: str) -> None:
+    """One hotel per process, keyed on which file this hotel is.
 
     hotelconfig.apply rebinds the module-level seasonality and mutates the
     shared SEGMENTS dict in place, so loading a second hotel rewrites the first
     one's engine: H1 sets CORP 0.6275 and GROUP 0.9949, H2 sets 0.7391 and
     0.7653.  Refusing here is cheaper than a report whose H1 tables were built
     with H2's contract ratios, because that report would look fine.
+
+    The key is os.path.realpath and not the file's name.  `hotel.json` beside a
+    booking log is the shape CLAUDE.md documents for the ingest, so two hotels
+    in two directories are both called hotel.json more often than not, and a
+    guard keyed on the name would wave the second one through with nothing to
+    say.  realpath answers the other direction too: the same hotel reached by
+    two different relative paths, or through a symlink, is one hotel and is
+    allowed.
     """
+    key = os.path.realpath(hotel_json_path)
     held = _CLAIMED["hotel"]
-    if held is not None and held != name:
+    if held is not None and held != key:
+        # The command that joins the two files is described rather than named:
+        # `run.py pilot-report` does not exist until Task 10, and an error
+        # message that sends a hotel to a command which prints a usage dump is
+        # worse than one that says what to do.  Task 10 may name it here.
         raise PilotError(
             "this process already ran %s. hotelconfig.apply rebinds the engine's "
             "seasonality and rewrites its segment table in place, so %s has to run "
-            "in a process of its own: run the command again for it, then join the "
-            "two JSON files with run.py pilot-report." % (held, name))
-    _CLAIMED["hotel"] = name
+            "in a process of its own: run the same command again for it, and the "
+            "report that stands two hotels side by side is built afterwards from "
+            "the two JSON files the two runs wrote." % (held, key))
+    _CLAIMED["hotel"] = key
 
 
 def _release_for_tests() -> None:
@@ -371,21 +413,103 @@ def settings_digest(path: str) -> str:
         return hashlib.sha256(fh.read()).hexdigest()
 
 
+def _read_settings(path: str) -> dict:
+    """The pre-registered settings file, or a sentence saying what is wrong.
+
+    A hotel is owed a sentence rather than a traceback (hotelconfig.py's house
+    rule), and every one of these is a path typed on a command line.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            settings = json.load(fh)
+    except OSError as exc:
+        raise PilotError("cannot read the settings file at %s: %s. Point --settings at the "
+                         "pre-registered file, or leave it off to take "
+                         "data/antonio/settings.json." % (path, exc))
+    except ValueError as exc:
+        # json.JSONDecodeError is a ValueError; a half-edited settings file is
+        # the ordinary way this happens.
+        raise PilotError("the settings file at %s is not valid JSON: %s" % (path, exc))
+    if not isinstance(settings, dict):
+        raise PilotError("the settings file at %s holds a %s, not an object of settings"
+                         % (path, type(settings).__name__))
+    if "lead_marks" not in settings:
+        raise PilotError("the settings file at %s has no lead_marks, so there is no lead to "
+                         "score table 1 at; it should carry the pre-registered list from "
+                         "data/antonio/settings.json." % path)
+    return settings
+
+
+def _prepare_out_dir(out_dir: str, path: str) -> None:
+    """Make --out and prove the payload can be written into it, before the walk.
+
+    The walk is minutes on a real hotel.  Discovering a read-only directory
+    afterwards throws the whole run away, and it is the one failure that costs
+    everything it had already done, so it is bought out here for a file the
+    size of nothing.
+    """
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        probe = os.path.join(out_dir, ".pilot-write-probe-%d" % os.getpid())
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("")
+        os.remove(probe)
+    except OSError as exc:
+        raise PilotError("cannot write into the output directory %s: %s. This is checked "
+                         "before the walk rather than after it, because the walk is "
+                         "minutes and the payload is the whole point of it." % (out_dir, exc))
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        raise PilotError("the payload this run would write, %s, already exists and is not "
+                         "writable. This is checked before the walk rather than after it, "
+                         "because the walk is minutes and the payload is the whole point "
+                         "of it." % path)
+
+
 def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: str,
             score_first: dt.date = SCORE_FIRST, score_last: dt.date = SCORE_LAST,
-            warmup_end: dt.date = WARMUP_END, progress: Optional[int] = None) -> dict:
-    """Ingest, walk, score table 1, write the payload.  One hotel, one process."""
-    # Imported here, not at the top: score imports pilot for capacity_on and
-    # LATE_MARK, so a top-level import either way round is a cycle.
+            warmup_end: dt.date = WARMUP_END, progress: Optional[int] = None,
+            label: str = "") -> dict:
+    """Ingest, walk, score table 1, write the payload.  One hotel, one process.
+
+    `label` marks a run that did not score the whole pre-registered window:
+    it is written into the file name and into the payload, so a partial run
+    can neither overwrite a real one nor be read back as if it were one.
+
+    Everything that can be checked cheaply is checked before the process is
+    claimed and before the walk starts.  A hotel gets one run; a typo in a
+    path should cost a sentence, not the run, and a hotel.json that never
+    loaded must not be the name every later attempt is refused against.
+    """
+    # Imported here rather than at the top: pace.score imports pace.pilot for
+    # capacity_on and LATE_MARK, so the two modules are a cycle in the import
+    # graph whichever way round the import is written.  It is a benign one --
+    # score's import of pilot completes before either module uses a name from
+    # the other, and a top-level `from . import score` here passes in every
+    # import order -- so this deferral is a choice that keeps the orchestrator
+    # out of its own parts' imports, not a necessity.
     from . import score as scoring
-    claim_process(os.path.basename(hotel_json_path))
-    with open(settings_path, encoding="utf-8") as fh:
-        settings = json.load(fh)
+
+    settings = _read_settings(settings_path)
     digest = settings_digest(settings_path)
+    if not os.path.isfile(csv_path):
+        raise PilotError("no booking log to read at %s: %s. The first argument is the CSV "
+                         "export and the second is the hotel.json that describes it."
+                         % (csv_path, "that path is a directory"
+                            if os.path.isdir(csv_path) else "there is no such file"))
+    # Read and validated before the claim, and before ingest.load reads it
+    # again: load_hotel_json touches no global (only hotelconfig.apply does),
+    # so a hotel.json with a typo in its path or its JSON fails here with a
+    # sentence and leaves the process free for the file that was meant.
+    cfg = HC.load_hotel_json(hotel_json_path)
+    code = hotel_code(cfg)
+    path = os.path.join(out_dir, "pilot-%s%s.json"
+                        % (code.lower(), ("-" + label) if label else ""))
+    _prepare_out_dir(out_dir, path)
+
+    claim_process(hotel_json_path)
 
     res = ingest.load(csv_path, hotel_json_path,
                       seed=int(settings.get("seed", ingest.DEFAULT_SEED)))
-    code = hotel_code(res.cfg)
     first_stay, last_stay = stay_window(res.bookings, score_last)
     if first_stay > score_first:
         raise PilotError("the stay window starts at %s, after the scoring window opens at %s; "
@@ -394,14 +518,30 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
     drive_from = score_first - dt.timedelta(days=DRIVE_LEAD)
     cal = HC.event_calendar(res.cfg)
 
+    # The walk writes into the hotel's own ingest report, so the audit block
+    # below carries what ingest actually found instead of an empty report
+    # standing in for it.  Both replays count over_capacity_nights, over
+    # windows that overlap, so the sum of the two is a count of nothing:
+    # ingest's findings are read here, before the walk adds to them, and what
+    # the walk added is published beside them as the walk's own.
+    ingest_warnings = {k: v for k, v in res.report.warnings.items() if not k.startswith("_")}
     out = walk(res.bookings, res.hotel, cal, first_stay, last_stay,
-               score_first, score_last, marks, drive_from, progress=progress)
+               score_first, score_last, marks, drive_from, rep=res.report, progress=progress)
+    walk_warnings = {}
+    for k, v in res.report.warnings.items():
+        if not k.startswith("_") and v - ingest_warnings.get(k, 0) > 0:
+            walk_warnings[k] = v - ingest_warnings.get(k, 0)
     gap = full_night_gap(res.bookings, out.ledger, res.hotel, first_stay, last_stay)
     table1 = scoring.score(out, res.hotel, res.bookings, res.nonrev, marks,
                            score_first, score_last, first_stay, warmup_end)
 
     inf = res.inference
     payload = {
+        # A run that scored only part of the window is a different file with a
+        # different name and says which it is in its own right.  The name alone
+        # would not survive being renamed; the field alone would still let a
+        # 62-night run overwrite a 427-night one on disk.
+        "label": label or "full",
         "hotel": {
             "code": code, "name": res.cfg.name, "city": res.cfg.city,
             "currency": res.cfg.currency, "rooms": res.hotel.rooms,
@@ -425,7 +565,7 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
             "warmup_end": warmup_end.isoformat(),
             "score_first": score_first.isoformat(), "score_last": score_last.isoformat(),
             "drive_from": drive_from.isoformat(),
-            "trim_nights": (first_stay - min(b.arrival for b in res.bookings)).days,
+            "trim_nights": trim_nights(res.bookings, first_stay),
             "scoring_nights": (score_last - score_first).days + 1,
         },
         "prereg": {"commit": PREREG_COMMIT, "settings_sha256": digest,
@@ -433,11 +573,12 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
                    "sha256_matches_the_recorded_one": digest == PREREG_SHA256},
         "walk": {"days": out.days, "seconds": round(out.seconds, 1),
                  "fits": len(out.engine.fit_log), "records": len(out.records),
-                 "marks": [int(m) for m in marks], "solves": out.engine.solves},
+                 "marks": [int(m) for m in marks], "solves": out.engine.solves,
+                 "over_capacity": walk_warnings},
         "ingest": {
             "rows": len(res.bookings), "bookings": out.ledger.n_bookings,
             "cancels": out.ledger.n_cancels, "nonrev_rows": len(res.nonrev),
-            "warnings": {k: v for k, v in out.report.warnings.items() if not k.startswith("_")},
+            "warnings": ingest_warnings,
             "notes": list(res.report.notes),
         },
         "full_night_gap": gap,
@@ -448,8 +589,6 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
         "table3": None,
         "notes": [NO_LIFT_NOTE, FULL_NIGHT_NOTE],
     }
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "pilot-%s.json" % code.lower())
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
     payload["_json_path"] = path

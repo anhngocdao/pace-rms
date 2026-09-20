@@ -122,13 +122,11 @@ def main(argv):
         from pace.hotelconfig import ConfigError
         out_dir = _opt(args, "--out", os.path.join(HERE, "out"))
         settings = _opt(args, "--settings", os.path.join(HERE, "data", "antonio", "settings.json"))
-        first, last = pilot.SCORE_FIRST, pilot.SCORE_LAST
-        if "--quick" in args:
-            # Two months of scoring, so the wiring can be checked in a minute.
-            last = first + dt.timedelta(days=61)
+        first, last, label = _pilot_window(args)
         try:
             payload = pilot.run_one(args[0], args[1], settings, out_dir,
-                                    score_first=first, score_last=last, progress=90)
+                                    score_first=first, score_last=last, progress=90,
+                                    label=label)
         except (ingest.IngestError, ConfigError, pilot.PilotError) as exc:
             print(exc)
             return 1
@@ -139,8 +137,12 @@ def main(argv):
         print("walked %d days in %.1f s, %d fits, %d forecasts recorded"
               % (w["days"], w["seconds"], w["fits"], w["records"]))
         gap = payload["full_night_gap"]
-        print("nights physically full %d, of them invisible to the ledger %d of %d nights"
-              % (gap["physically_full"], gap["full_but_invisible"], gap["nights"]))
+        # Both counts say which population they are a share of: the invisible
+        # nights are a share of the full nights, never of the window.
+        print("nights physically full %d of %d in the window, of those %d invisible to the "
+              "ledger (%.0f%% of the full nights)"
+              % (gap["physically_full"], gap["nights"], gap["full_but_invisible"],
+                 100 * gap["share_of_full_nights"]))
         for lead in payload["table1"]["leads"] + [payload["table1"]["late_lead"]]:
             block = payload["table1"]["overall"][lead]
             m = block["methods"]
@@ -162,6 +164,23 @@ def main(argv):
 
     print(__doc__)
     return 1
+
+
+def _pilot_window(args):
+    """The pilot's scoring window, and the label a partial run is filed under.
+
+    --quick scores the first two months of the pre-registered window so the
+    wiring can be checked in a minute.  It moves the far end and never the
+    near one: the near end is what the warm-up and the 180 days of driven rate
+    path in front of it are cut to.  A partial run is labelled, because its
+    numbers are not the pilot's numbers and its payload must not be read, or
+    overwritten, as though they were.
+    """
+    from pace import pilot
+    first = pilot.SCORE_FIRST
+    if "--quick" in args:
+        return first, first + dt.timedelta(days=61), "quick"
+    return first, pilot.SCORE_LAST, ""
 
 
 def _opt(args, name, default):
