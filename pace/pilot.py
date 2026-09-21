@@ -487,6 +487,7 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
     # the other, and a top-level `from . import score` here passes in every
     # import order -- so this deferral is a choice that keeps the orchestrator
     # out of its own parts' imports, not a necessity.
+    from . import ratecheck
     from . import score as scoring
 
     settings = _read_settings(settings_path)
@@ -583,12 +584,15 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
         },
         "full_night_gap": gap,
         "table1": table1,
-        # Table 2 is written by the rate check and table 3 by the holdout.  A
-        # None here means that table was not run, which is what --quick leaves.
-        "table2": None,
+        # Table 3 is written by the holdout.  A None here means it was not run,
+        # which is what --quick leaves behind.
         "table3": None,
         "notes": [NO_LIFT_NOTE, FULL_NIGHT_NOTE],
     }
+    payload["table2"] = ratecheck.table2(
+        out, res.bookings, res.nonrev, res.hotel, code,
+        {int(k): v for k, v in table1["season_of_month"].items()},
+        score_first, score_last)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
     payload["_json_path"] = path

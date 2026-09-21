@@ -15,6 +15,7 @@ from pace import baselines
 from pace import hotelconfig as HC
 from pace import ingest
 from pace import pilot
+from pace import ratecheck
 from pace import score as S
 from pace.elasticity import acceptance as _price_acceptance
 from pace.ledger import Ledger
@@ -23,7 +24,7 @@ from pace.policy import PaceEngine
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_HOTEL = os.path.join(ROOT, "tests", "fixtures", "pilot-hotel.json")
 HEADER = ["booking_id", "booked_on", "arrival", "nights", "rooms", "rate", "currency",
-          "segment", "rate_code", "source", "room_type", "company", "status",
+          "segment", "rate_code", "source", "room_type", "meal", "company", "status",
           "status_date", "updated_on"]
 
 
@@ -39,7 +40,7 @@ def _csv(rows, header=HEADER):
 def _row(**kw):
     base = dict(booking_id="B1", booked_on="2024-01-01", arrival="2024-02-01", nights="1",
                 rooms="1", rate="120", currency="EUR", segment="WEB", rate_code="",
-                source="", room_type="STD", company="", status="stayed",
+                source="", room_type="STD", meal="BB", company="", status="stayed",
                 status_date="", updated_on="")
     base.update(kw)
     return [base[h] for h in HEADER]
@@ -85,6 +86,13 @@ def history_rows(first_arrival, nights_count, seed=3):
     rooms and `Ledger.settle`'s walk branch actually runs.
     """
     rng = random.Random(seed)
+    # Board and room type are drawn from a stream of their own.  Neither
+    # reaches the ledger (`ingest._Req` carries a target, a room count and
+    # dates, and nothing else), so the walk is the same walk with or without
+    # them; drawing them from `rng` would nonetheless shift every later date,
+    # rate and status in this history and move numbers in tests that have
+    # nothing to do with board.
+    mix = random.Random(seed + 101)
     rows = []
     n = 0
     for k in range(nights_count):
@@ -111,7 +119,9 @@ def history_rows(first_arrival, nights_count, seed=3):
                 nights = str(rng.choice([2, 3]))
             roll = rng.random()
             kw = dict(booking_id="S%05d" % n, segment=segment, booked_on=booked_on.isoformat(),
-                     arrival=d.isoformat(), nights=nights, rate=rate)
+                     arrival=d.isoformat(), nights=nights, rate=rate,
+                     meal=mix.choice(["BB", "BB", "HB"]),
+                     room_type=mix.choice(["STD", "STD", "STD", "SUP"]))
             if roll < 0.03:
                 kw.update(segment="COMP")                       # non-revenue: never reaches the ledger
             elif roll < 0.06:
@@ -1305,6 +1315,50 @@ def _physically_full_nights(dicts, rooms, threshold, first, last):
                   if c >= rooms * threshold and first <= d <= last)
 
 
+def _priced_room_nights(dicts, first, last):
+    """Room nights the priced segments occupied inside a window, by room type,
+    counted off the CSV.
+
+    The fixture's segment map sends WEB to RETAIL and BOOKING to OTA, and
+    those two are the priced segments; CORP is contracted and COMP is
+    non-revenue, so neither belongs in a comparison of public rates.
+    """
+    counts = collections.Counter()
+    for r in dicts:
+        if r["segment"] not in ("WEB", "BOOKING") or r["status"] not in ("stayed", "in_house"):
+            continue
+        arrival = dt.date.fromisoformat(r["arrival"])
+        for k in range(int(r["nights"])):
+            night = arrival + dt.timedelta(days=k)
+            if first <= night <= last:
+                counts[r["room_type"]] += 1
+    return dict(counts)
+
+
+def _nights_with_a_basket(dicts, first, last, lo, hi, room_type):
+    """Nights in the window with at least one priced row of `room_type` booked
+    between `lo` and `hi` days before that night, counted off the CSV.
+
+    The trim is left out on purpose: it drops at most one row from each end of
+    a basket of three or more and never empties one, so it cannot change this
+    count, and repeating it here would only repeat whatever the code under
+    test does with it.
+    """
+    nights = set()
+    for r in dicts:
+        if r["segment"] not in ("WEB", "BOOKING") or r["status"] not in ("stayed", "in_house"):
+            continue
+        if r["room_type"] != room_type or float(r["rate"]) <= 0:
+            continue
+        arrival = dt.date.fromisoformat(r["arrival"])
+        booked = dt.date.fromisoformat(r["booked_on"])
+        for k in range(int(r["nights"])):
+            night = arrival + dt.timedelta(days=k)
+            if first <= night <= last and hi <= (night - booked).days <= lo:
+                nights.add(night)
+    return len(nights)
+
+
 def _fixture_settings(path):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"seed": 1, "lead_marks": [30, 14, 7], "lead_marks_h1_only": []}, fh)
@@ -1487,6 +1541,36 @@ class PreRegistration(unittest.TestCase):
             from pace import config
             C.reset_seasonality()
             config.reset_segments()
+
+    def test_the_rate_windows_are_the_pre_registered_ones(self):
+        """`pace/ratecheck.py` keeps its own copy of the comparison windows,
+        because pace/ must not read data/.  A second copy is only safe while
+        it cannot drift from the first, so every bound is checked against the
+        file it was pre-registered in, not merely against itself.
+        """
+        self.assertEqual({k: list(v) for k, v in ratecheck.RATE_WINDOWS.items()},
+                         self.settings["rate_windows"])
+        # Spelled out as well, so a settings file edited to agree with a
+        # mutated constant still fails here: both sides would have to be
+        # changed, and the digest above says the file has not been.
+        self.assertEqual(ratecheck.RATE_WINDOWS,
+                         {"60": (75, 45), "30": (40, 21), "14": (21, 7), "7": (10, 4)})
+        for mark, (lo, hi) in ratecheck.RATE_WINDOWS.items():
+            self.assertLess(hi, int(mark), "window %s opens after its own mark" % mark)
+            self.assertLess(int(mark), lo, "window %s closes before its own mark" % mark)
+
+    def test_the_basket_trim_is_the_pre_registered_one(self):
+        self.assertEqual(list(ratecheck.TRIM), self.settings["basket_trim_percentiles"])
+        self.assertEqual(ratecheck.TRIM, (0.01, 0.99))
+
+    def test_every_pre_registered_rate_window_has_a_lead_mark_to_read(self):
+        """A window with no mark behind it is a column of the table nothing
+        can fill: the published rate is read out of the walk at that lead."""
+        self.assertEqual(sorted(int(m) for m in ratecheck.RATE_WINDOWS),
+                         sorted(m for m in self.settings["lead_marks"]
+                                if m in (60, 30, 14, 7)))
+        for mark in ratecheck.RATE_WINDOWS:
+            self.assertIn(int(mark), self.settings["lead_marks"])
 
     def test_the_driven_run_up_covers_the_deepest_pre_registered_mark(self):
         """DRIVE_LEAD is the rate path in front of the scoring window.  A mark
@@ -1746,9 +1830,95 @@ class RunOne(unittest.TestCase):
         self.assertAlmostEqual(gap["share_of_full_nights"],
                                gap["full_but_invisible"] / float(gap["physically_full"]))
 
-    def test_tables_two_and_three_are_none_until_they_are_run(self):
-        self.assertIsNone(self.back["table2"])
+    def test_table_three_is_none_until_the_holdout_is_run(self):
         self.assertIsNone(self.back["table3"])
+
+    def test_table_two_was_handed_this_run_s_own_window_and_hotel(self):
+        """Every number here is worked out from the CSV or from
+        tests/fixtures/pilot-hotel.json, never read back out of the payload.
+
+        The share is the discriminating one: counted over the scoring window
+        it is 126 STD room nights out of 164, and counted over the whole
+        history it is a different number, so a table2 handed the stay window
+        instead of the scoring window fails here rather than looking fine.
+        """
+        t2 = self.back["table2"]
+        priced = _priced_room_nights(self.dicts, SCORE_FIRST, SCORE_LAST)
+        self.assertEqual(priced, {"STD": 126, "SUP": 38})
+        self.assertEqual(t2["room_type"], "STD")
+        self.assertAlmostEqual(t2["room_type_share"], 126 / 164.0)
+        self.assertEqual(t2["meals"], ["BB", "HB"])
+        # The band, read off the hotel.json this run was pointed at: floor 80,
+        # ceiling 201, step 2, so the ladder stops at 200 and the ceiling test
+        # can never fire.
+        self.assertEqual(t2["rate_floor"], 80.0)
+        self.assertEqual(t2["rate_ceiling"], 201.0)
+        self.assertEqual(t2["top_rung"], 200.0)
+        self.assertLess(t2["top_rung"], t2["rate_ceiling"])
+
+    def test_table_two_scored_the_nights_the_csv_says_it_could(self):
+        """The count at each mark, derived from the CSV by a basket written
+        here rather than by the one under test.
+
+        This fixture drives the engine for 180 days before the window opens,
+        so every night of it has a record with a rate on it; what decides
+        whether a night is scored is whether anyone booked the top room type
+        inside that mark's comparison window.  A mark reading the wrong lead,
+        the wrong window bounds, the wrong room type or the wrong segments
+        lands on a different count.  It says nothing about the scoring window
+        being too wide, because the walk files no record outside it: the
+        share above catches that, and the partial run below catches a window
+        too narrow.
+        """
+        t2 = self.back["table2"]
+        for mark, expect in (("30", 36), ("14", 39), ("7", 24)):
+            lo, hi = ratecheck.RATE_WINDOWS[mark]
+            counted = _nights_with_a_basket(self.dicts, SCORE_FIRST, SCORE_LAST, lo, hi, "STD")
+            self.assertEqual(counted, expect, "mark %s" % mark)
+            self.assertEqual(t2["cells"][mark]["all"]["n"], expect, "mark %s" % mark)
+            self.assertEqual(t2["pinned"][mark]["n"], expect, "mark %s" % mark)
+        # This fixture's marks are 30, 14 and 7 and its longest lead is 35
+        # days, so the 60 row has neither a record to read nor anyone who
+        # booked that far out.  Which of the two empties it is settled on the
+        # hand-built walk in Table2, not here.
+        self.assertEqual(t2["cells"]["60"]["all"]["n"], 0)
+        self.assertEqual(_nights_with_a_basket(self.dicts, SCORE_FIRST, SCORE_LAST,
+                                               75, 45, "STD"), 0)
+        self.assertIsNone(t2["pinned"]["60"]["share"])
+        self.assertEqual(t2["pinned_overall"]["n"], 36 + 39 + 24)
+
+    def test_table_two_cuts_by_the_seasons_table_one_measured(self):
+        """Not by hotel.json's demand_season_band, which is an engine input
+        and labels its months peak, shoulder and trough."""
+        t2 = self.back["table2"]
+        months = set(range(SCORE_FIRST.month, SCORE_LAST.month + 1))
+        expected = set(self.back["table1"]["season_of_month"][str(m)] for m in months)
+        self.assertEqual(expected, {"low", "shoulder"})
+        for mark in ("30", "14", "7"):
+            self.assertEqual(set(t2["cells"][mark]["by_season"]), expected)
+            self.assertEqual(sum(c["n"] for c in t2["cells"][mark]["by_season"].values()),
+                             t2["cells"][mark]["all"]["n"])
+            self.assertEqual(t2["cells"][mark]["nonrev_nights"]["n"]
+                             + t2["cells"][mark]["clean_nights"]["n"],
+                             t2["cells"][mark]["all"]["n"])
+
+    def test_table_two_carries_the_mark_sixty_label_for_a_hotel_that_is_not_h1(self):
+        """This fixture's code is PILOT, so it gets the label; H1 does not."""
+        self.assertEqual(self.back["hotel"]["code"], "PILOT")
+        self.assertEqual(self.back["table2"]["notes"][-1], ratecheck.MARK60_NOTE)
+        self.assertEqual(len(self.back["table2"]["notes"]), 6)
+
+    def test_a_partial_run_s_table_two_is_over_the_partial_window(self):
+        quick_last = SCORE_FIRST + dt.timedelta(days=self.QUICK_NIGHTS - 1)
+        self.assertEqual(self.quick["table2"]["room_type"], "STD")
+        for mark in ("30", "14", "7"):
+            lo, hi = ratecheck.RATE_WINDOWS[mark]
+            self.assertEqual(self.quick["table2"]["cells"][mark]["all"]["n"],
+                             _nights_with_a_basket(self.dicts, SCORE_FIRST, quick_last,
+                                                   lo, hi, "STD"),
+                             "mark %s" % mark)
+        self.assertLess(self.quick["table2"]["pinned_overall"]["n"],
+                        self.back["table2"]["pinned_overall"]["n"])
 
     def test_the_notes_the_payload_promises_are_in_it(self):
         notes = self.back["notes"]
@@ -2128,3 +2298,509 @@ class RunOneWhenTheRoomCountIsInferred(unittest.TestCase):
         self.assertEqual(max(h["per_year_max"].values()), h["rooms"])
         self.assertEqual(sorted(h["per_year_max"]),
                          sorted({str(d.year) for d in occ}))
+
+
+def _reset_config():
+    from pace import calendar as C
+    from pace import config
+    C.reset_seasonality()
+    config.reset_segments()
+
+
+class RateCheck(unittest.TestCase):
+    """The parts of table 2, each on a fixture whose right answer was worked
+    out before the code ran and is not a number a wrong answer would reach."""
+
+    def tearDown(self):
+        _reset_config()
+
+    def _bookings(self, rows):
+        return ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1).bookings
+
+    def test_the_room_type_that_slept_the_most_nights_wins_not_the_one_with_the_most_rows(self):
+        """Three three-night stays in a junior suite are nine room nights;
+        five one-night stays in a standard are five.  Counting bookings makes
+        STD the winner, counting room nights makes JS the winner, and the
+        table compares rates for a night, so it is nights that decide.
+        """
+        first, last = dt.date(2024, 2, 1), dt.date(2024, 2, 3)
+        rows = [_row(booking_id="J%d" % i, arrival="2024-02-01", nights="3", room_type="JS")
+                for i in range(3)]
+        rows += [_row(booking_id="S%d" % i, arrival="2024-02-02", nights="1", room_type="STD")
+                 for i in range(5)]
+        # Twelve suite nights outside the window: the winner is decided inside
+        # it, so a table2 handed the wrong window answers SUP instead.
+        rows += [_row(booking_id="O%d" % i, arrival="2024-03-01", nights="1", room_type="SUP")
+                 for i in range(12)]
+        rows += [
+            _row(booking_id="COMP1", segment="COMP", arrival="2024-02-01", nights="3",
+                 room_type="STD", rate="0"),
+            _row(booking_id="CORP1", segment="CORP", arrival="2024-02-01", nights="3",
+                 room_type="STD", rate="96"),
+            _row(booking_id="CXL1", arrival="2024-02-01", nights="3", room_type="STD",
+                 status="cancelled", status_date="2024-01-20"),
+            _row(booking_id="DAY1", arrival="2024-02-01", nights="0", room_type="STD"),
+        ]
+        code, share = ratecheck.top_room_type(self._bookings(rows), first, last)
+        self.assertEqual(code, "JS")
+        # Nine junior-suite nights out of the fourteen priced room nights in
+        # the window: the comp, the contract, the cancellation and the day
+        # use are all outside the population, and each of them would move
+        # this.
+        self.assertAlmostEqual(share, 9 / 14.0)
+
+    def test_the_room_type_share_is_none_of_the_shapes_an_empty_answer_takes(self):
+        code, share = ratecheck.top_room_type([], dt.date(2024, 2, 1), dt.date(2024, 2, 3))
+        self.assertEqual(code, "")
+        self.assertEqual(share, 0.0)
+
+    def test_the_basket_takes_both_ends_of_its_window_and_nothing_outside_them(self):
+        night = dt.date(2024, 2, 1)
+        rows = [_row(booking_id="L%d" % lead, rate="%d" % (100 + lead),
+                     booked_on=(night - dt.timedelta(days=lead)).isoformat(),
+                     arrival="2024-02-01", nights="1")
+                for lead in (6, 7, 21, 22)]
+        got = ratecheck.basket(self._bookings(rows), night, 21, 7, "STD")
+        self.assertEqual(sorted(got), [107.0, 121.0])
+
+    def test_the_basket_measures_the_lead_to_the_night_not_to_the_arrival(self):
+        """A three-night stay booked fifteen days before it arrives was booked
+        seventeen days before its third night, and it is the third night's
+        rate that the seventeen-day mark published.  So a window of exactly
+        seventeen days finds this stay on its last night and on neither of the
+        other two.
+        """
+        rows = [
+            _row(booking_id="LONG", booked_on="2024-01-17", arrival="2024-02-01",
+                 nights="3", rate="150"),
+            # A one-night stay whose own lead to 2024-02-01 is 17, so the
+            # window has something to find on that night: the long stay is
+            # missing from it because of its lead and not because the window
+            # is empty of everything.
+            _row(booking_id="SHORT", booked_on="2024-01-15", arrival="2024-02-01",
+                 nights="1", rate="181"),
+        ]
+        bookings = self._bookings(rows)
+        self.assertEqual(ratecheck.basket(bookings, dt.date(2024, 2, 1), 17, 17, "STD"),
+                         [181.0])
+        self.assertEqual(ratecheck.basket(bookings, dt.date(2024, 2, 2), 17, 17, "STD"), [])
+        self.assertEqual(ratecheck.basket(bookings, dt.date(2024, 2, 3), 17, 17, "STD"),
+                         [150.0])
+
+    def test_the_basket_holds_lead_room_type_and_board_constant(self):
+        night = dt.date(2024, 2, 1)
+        rows = [
+            _row(booking_id="IN", booked_on="2024-01-18", arrival="2024-02-01", nights="1",
+                 room_type="STD", meal="BB", rate="150"),            # lead 14, in
+            _row(booking_id="LATE", booked_on="2024-01-29", arrival="2024-02-01", nights="1",
+                 room_type="STD", meal="BB", rate="90"),             # lead 3, out
+            _row(booking_id="EARLY", booked_on="2024-01-02", arrival="2024-02-01", nights="1",
+                 room_type="STD", meal="BB", rate="95"),             # lead 30, out
+            _row(booking_id="OTHERROOM", booked_on="2024-01-18", arrival="2024-02-01", nights="1",
+                 room_type="SUP", meal="BB", rate="300"),            # wrong room type
+            _row(booking_id="OTHERMEAL", booked_on="2024-01-18", arrival="2024-02-01", nights="1",
+                 room_type="STD", meal="HB", rate="400"),            # wrong board
+            _row(booking_id="COMP", segment="COMP", booked_on="2024-01-18",
+                 arrival="2024-02-01", nights="1", room_type="STD", meal="BB", rate="0"),
+            _row(booking_id="CORP", segment="CORP", booked_on="2024-01-18",
+                 arrival="2024-02-01", nights="1", room_type="STD", meal="BB", rate="96"),
+            _row(booking_id="CXL", booked_on="2024-01-18", arrival="2024-02-01", nights="1",
+                 room_type="STD", meal="BB", rate="999", status="cancelled",
+                 status_date="2024-01-20"),
+            _row(booking_id="FREE", booked_on="2024-01-18", arrival="2024-02-01", nights="1",
+                 room_type="STD", meal="BB", rate="0"),
+        ]
+        got = ratecheck.basket(self._bookings(rows), night, 21, 7, "STD", "BB")
+        self.assertEqual(got, [150.0])
+
+    def test_the_basket_with_no_board_asked_for_takes_every_board(self):
+        night = dt.date(2024, 2, 1)
+        rows = [_row(booking_id="BB1", booked_on="2024-01-18", arrival="2024-02-01",
+                     meal="BB", rate="100"),
+                _row(booking_id="HB1", booked_on="2024-01-18", arrival="2024-02-01",
+                     meal="HB", rate="200")]
+        bookings = self._bookings(rows)
+        self.assertEqual(sorted(ratecheck.basket(bookings, night, 21, 7, "STD")),
+                         [100.0, 200.0])
+        self.assertEqual(ratecheck.basket(bookings, night, 21, 7, "STD", "HB"), [200.0])
+
+    def test_the_basket_trims_the_two_rates_that_are_not_prices(self):
+        """One rate in the two real files is negative and one is 5,400.  Six
+        rows here, and the first and ninety-ninth percentile take the
+        outermost of them off each end.
+        """
+        night = dt.date(2024, 2, 1)
+        rates = [100, 110, 120, 130, 140, 5400]
+        rows = [_row(booking_id="R%d" % r, booked_on="2024-01-18", arrival="2024-02-01",
+                     rate=str(r)) for r in rates]
+        got = ratecheck.basket(self._bookings(rows), night, 21, 7, "STD")
+        self.assertEqual(sorted(got), [110.0, 120.0, 130.0, 140.0])
+
+    def test_a_basket_too_short_to_trim_is_returned_whole(self):
+        night = dt.date(2024, 2, 1)
+        rows = [_row(booking_id="R%d" % r, booked_on="2024-01-18", arrival="2024-02-01",
+                     rate=str(r)) for r in (100, 5400)]
+        got = ratecheck.basket(self._bookings(rows), night, 21, 7, "STD")
+        self.assertEqual(sorted(got), [100.0, 5400.0])
+
+    def test_the_nightly_index_files_a_stay_under_every_night_it_slept(self):
+        rows = [
+            _row(booking_id="LONG", booked_on="2024-01-15", arrival="2024-02-01",
+                 nights="3", rate="150"),
+            _row(booking_id="ONE", booked_on="2024-01-25", arrival="2024-02-02",
+                 nights="1", rate="130"),
+            _row(booking_id="CXL", booked_on="2024-01-15", arrival="2024-02-01",
+                 nights="3", rate="140", status="cancelled", status_date="2024-01-20"),
+            _row(booking_id="COMP", segment="COMP", booked_on="2024-01-15",
+                 arrival="2024-02-01", nights="3", rate="0"),
+        ]
+        bookings = self._bookings(rows)
+        index = ratecheck.nightly_index(bookings)
+        self.assertEqual({d: sorted(b.booking_id for b in bs) for d, bs in index.items()},
+                         {dt.date(2024, 2, 1): ["LONG"],
+                          dt.date(2024, 2, 2): ["LONG", "ONE"],
+                          dt.date(2024, 2, 3): ["LONG"]})
+        # And slicing it is the same question as reading the whole log, which
+        # is the only reason table2 is allowed to slice it.
+        for day in (dt.date(2024, 2, 1), dt.date(2024, 2, 2), dt.date(2024, 2, 3)):
+            self.assertEqual(ratecheck.basket(index.get(day, ()), day, 21, 7, "STD"),
+                             ratecheck.basket(bookings, day, 21, 7, "STD"))
+
+    def test_the_quartiles_are_the_quartiles_and_in_that_order(self):
+        # Ten values, so the three answers are three different numbers: p25
+        # interpolates between 12 and 14, the median between 18 and 20.
+        values = [10, 12, 14, 15, 18, 20, 21, 26, 30, 44]
+        p25, mid, p75 = ratecheck.quartiles(values)
+        self.assertAlmostEqual(p25, 14.25)
+        self.assertAlmostEqual(mid, 19.0)
+        self.assertAlmostEqual(p75, 24.75)
+        self.assertEqual(ratecheck.quartiles([]), (None, None, None))
+
+    def test_a_cell_is_the_median_of_the_gaps_not_the_gap_of_the_medians(self):
+        """The two are 40 and 20 on these five nights, and only one of them is
+        what the table claims to print."""
+        c = ratecheck._cell([(200.0, 150.0), (180.0, 120.0), (160.0, 155.0),
+                             (150.0, 140.0), (140.0, 100.0)])
+        self.assertEqual(c["n"], 5)
+        self.assertAlmostEqual(c["median_gap"], 40.0)         # median of 50,60,5,10,40
+        self.assertAlmostEqual(c["median_published"], 160.0)
+        self.assertAlmostEqual(c["median_realised"], 140.0)   # so the gap of medians is 20
+        self.assertAlmostEqual(c["p25"], 10.0)
+        self.assertAlmostEqual(c["p75"], 50.0)
+
+    def test_an_empty_cell_says_nothing_rather_than_zero(self):
+        self.assertEqual(ratecheck._cell([]),
+                         {"n": 0, "median_gap": None, "p25": None, "p75": None,
+                          "median_published": None, "median_realised": None})
+
+
+# ---------------------------------------------------------------------------
+# A hand-built table 2.  Four nights, four marks, every rate chosen so that no
+# answer the table prints is a number a wrong one would also reach: the median
+# of the gaps differs from the gap of the medians on every line, the two board
+# codes disagree with each other and with the pooled row, the two seasons
+# disagree, the quartiles sit either side of the median, and the three marks
+# that score anything score a different number of nights each.
+T2_D1 = dt.date(2024, 2, 28)        # February, "high" below
+T2_D2 = dt.date(2024, 2, 29)
+T2_D3 = dt.date(2024, 3, 1)         # March, "low"
+T2_D4 = dt.date(2024, 3, 2)
+T2_NIGHTS = (T2_D1, T2_D2, T2_D3, T2_D4)
+T2_SEASONS = {m: ("high" if m == 2 else "low" if m == 3 else "shoulder")
+              for m in range(1, 13)}
+
+# night -> lead -> (segment, room_type, meal, rate).  Leads 14, 5 and 30 are
+# each inside exactly one pre-registered window (14 in 21-7, 5 in 10-4, 30 in
+# 40-21), so no row is counted at two marks and every basket is readable by
+# eye.  Nothing sits at leads 45 to 75, which is what leaves the 60 mark with
+# nothing to score.
+T2_ROWS = {
+    T2_D1: {14: [("WEB", "STD", "BB", 96), ("BOOKING", "STD", "BB", 104),
+                 ("WEB", "STD", "BB", 140), ("BOOKING", "STD", "HB", 150),
+                 ("WEB", "STD", "HB", 180), ("WEB", "SUP", "BB", 210)],
+             5: [("WEB", "STD", "BB", 110), ("BOOKING", "STD", "BB", 120),
+                 ("WEB", "STD", "HB", 140), ("WEB", "SUP", "BB", 300)],
+            30: [("WEB", "STD", "BB", 118), ("BOOKING", "STD", "HB", 150)]},
+    T2_D2: {14: [("WEB", "STD", "BB", 90), ("BOOKING", "STD", "BB", 118),
+                 ("WEB", "STD", "BB", 126), ("BOOKING", "STD", "HB", 160),
+                 ("WEB", "STD", "HB", 176), ("WEB", "SUP", "BB", 212)],
+             5: [("WEB", "STD", "BB", 130), ("BOOKING", "STD", "BB", 144),
+                 ("WEB", "STD", "HB", 170), ("WEB", "SUP", "BB", 302)],
+            30: [("WEB", "STD", "BB", 124), ("BOOKING", "STD", "HB", 156)]},
+    T2_D3: {14: [("WEB", "STD", "BB", 80), ("BOOKING", "STD", "BB", 100),
+                 ("WEB", "STD", "BB", 112), ("BOOKING", "STD", "HB", 130),
+                 ("WEB", "STD", "HB", 148), ("WEB", "SUP", "BB", 214)],
+             5: [("WEB", "STD", "BB", 90), ("BOOKING", "STD", "BB", 106),
+                 ("WEB", "STD", "HB", 128)],
+            30: [("WEB", "STD", "BB", 108), ("BOOKING", "STD", "HB", 136)]},
+    T2_D4: {14: [("WEB", "STD", "BB", 70), ("BOOKING", "STD", "BB", 86),
+                 ("WEB", "STD", "BB", 94), ("BOOKING", "STD", "HB", 120),
+                 ("WEB", "STD", "HB", 134), ("WEB", "SUP", "BB", 216)],
+             5: [("WEB", "STD", "BB", 60), ("BOOKING", "STD", "BB", 78),
+                 ("WEB", "STD", "HB", 110)],
+            30: [("WEB", "STD", "BB", 102), ("BOOKING", "STD", "HB", 130)]},
+}
+
+# lead -> night -> (published rate, days between the solve and the mark).  A
+# rate of None is a mark the engine published nothing at; an age of None is a
+# mark with no solve recorded behind it.  The three marks that score carry
+# three different rates for the same night, so a table reading its rate at the
+# wrong lead reads a different number rather than the same one.
+T2_PUBLISHED = {
+    60: {T2_D1: (200.0, 0), T2_D2: (200.0, 0), T2_D3: (200.0, 0), T2_D4: (200.0, 0)},
+    30: {T2_D1: (120.0, 14), T2_D2: (122.0, 9), T2_D3: (124.0, 0), T2_D4: (126.0, 2)},
+    14: {T2_D1: (200.0, 0), T2_D2: (200.0, 3), T2_D3: (164.0, 7), T2_D4: (152.0, 5)},
+    7: {T2_D1: (None, 4), T2_D2: (200.0, 1), T2_D3: (140.0, 6), T2_D4: (120.0, None)},
+}
+# The one record that carries a rate and is still not scored, so the two ways
+# a night drops out are one each rather than both the same way.
+T2_NOT_READY = (30, T2_D4)
+
+
+def _t2_rows():
+    rows = []
+    n = 0
+    for night in T2_NIGHTS:
+        for lead, spec in sorted(T2_ROWS[night].items()):
+            for segment, room, meal, rate in spec:
+                n += 1
+                rows.append(_row(booking_id="T%03d" % n, segment=segment, room_type=room,
+                                 meal=meal, rate=str(rate), nights="1",
+                                 arrival=night.isoformat(),
+                                 booked_on=(night - dt.timedelta(days=lead)).isoformat()))
+    rows += [
+        # A three-night stay booked sixteen days before it arrives: seventeen
+        # and eighteen days before its second and third nights, so all three
+        # of its nights land in the 14 mark's window and none in any other.
+        _row(booking_id="TLONG", segment="WEB", room_type="STD", meal="HB", rate="136",
+             nights="3", arrival=T2_D2.isoformat(),
+             booked_on=(T2_D2 - dt.timedelta(days=16)).isoformat()),
+        # Comped rooms.  The first is entered a month out and is on the books
+        # at every mark; the second is entered ten days out, so the 7 mark
+        # sees it and the 14 and 30 marks, reading the house as it stood on
+        # their own day, do not.
+        _row(booking_id="TCOMP1", segment="COMP", room_type="STD", meal="BB", rate="0",
+             nights="1", arrival=T2_D2.isoformat(),
+             booked_on=(T2_D1 - dt.timedelta(days=30)).isoformat()),
+        _row(booking_id="TCOMP2", segment="COMP", room_type="STD", meal="BB", rate="0",
+             nights="1", arrival=T2_D3.isoformat(),
+             booked_on=(T2_D3 - dt.timedelta(days=10)).isoformat()),
+        # Rows that must not reach a basket: a contract rate, a group rate, a
+        # cancellation, a day use, and a zero-rate row that is a real stay and
+        # so does count towards which room type the house mostly sold.
+        _row(booking_id="TCORP", segment="CORP", room_type="STD", meal="BB", rate="500",
+             nights="1", arrival=T2_D1.isoformat(),
+             booked_on=(T2_D1 - dt.timedelta(days=14)).isoformat()),
+        _row(booking_id="TGROUP", segment="GROUP", room_type="STD", meal="BB", rate="400",
+             nights="1", arrival=T2_D1.isoformat(),
+             booked_on=(T2_D1 - dt.timedelta(days=14)).isoformat()),
+        _row(booking_id="TCXL", segment="WEB", room_type="STD", meal="BB", rate="999",
+             nights="1", arrival=T2_D1.isoformat(), status="cancelled",
+             booked_on=(T2_D1 - dt.timedelta(days=14)).isoformat(),
+             status_date=(T2_D1 - dt.timedelta(days=10)).isoformat()),
+        _row(booking_id="TDAY", segment="WEB", room_type="STD", meal="BB", rate="140",
+             nights="0", arrival=T2_D1.isoformat(),
+             booked_on=(T2_D1 - dt.timedelta(days=14)).isoformat()),
+        _row(booking_id="TFREE", segment="WEB", room_type="STD", meal="BB", rate="0",
+             nights="1", arrival=T2_D1.isoformat(),
+             booked_on=(T2_D1 - dt.timedelta(days=14)).isoformat()),
+        # A suite at a lead inside no window at all, with no board code on it:
+        # it moves the room-type share and nothing else, and it is what the
+        # list of board codes has to leave out.
+        _row(booking_id="TSUP", segment="WEB", room_type="SUP", meal="", rate="250",
+             nights="1", arrival=T2_D1.isoformat(),
+             booked_on=(T2_D1 - dt.timedelta(days=100)).isoformat()),
+    ]
+    return rows
+
+
+def _t2_records():
+    records = {}
+    for lead, per_night in T2_PUBLISHED.items():
+        for night, (rate, age) in per_night.items():
+            asof = night - dt.timedelta(days=lead)
+            records[(night, lead)] = pilot.WalkRecord(
+                stay_date=night, lead=lead, asof=asof, otb=0,
+                published_rate=rate,
+                solved_on=(None if age is None else asof - dt.timedelta(days=age)),
+                engine_ready=((lead, night) != T2_NOT_READY))
+    return records
+
+
+class Table2(unittest.TestCase):
+    """Table 2 over a hand-built walk, against numbers worked out from the
+    fixture before the code was run."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.res = ingest.load(_csv(_t2_rows()), FIXTURE_HOTEL, seed=1)
+        cls.table = ratecheck.table2(
+            _bare_walk(None, _t2_records()), cls.res.bookings, cls.res.nonrev,
+            cls.res.hotel, "H2", T2_SEASONS, T2_D1, T2_D4)
+
+    @classmethod
+    def tearDownClass(cls):
+        _reset_config()
+
+    def cell(self, mark, *path):
+        block = self.table["cells"][mark]
+        for key in path:
+            block = block[key]
+        return block
+
+    def assertCell(self, mark, path, n, gap, p25, p75, published, realised):
+        got = self.cell(mark, *path)
+        where = "mark %s %s" % (mark, "/".join(path))
+        self.assertEqual(got["n"], n, where)
+        for name, want in (("median_gap", gap), ("p25", p25), ("p75", p75),
+                           ("median_published", published), ("median_realised", realised)):
+            self.assertAlmostEqual(got[name], want, msg="%s %s" % (where, name))
+
+    def test_the_marks_are_the_four_pre_registered_ones_deepest_first(self):
+        self.assertEqual(self.table["marks"], ["60", "30", "14", "7"])
+        self.assertEqual(self.table["windows"],
+                         {"60": [75, 45], "30": [40, 21], "14": [21, 7], "7": [10, 4]})
+
+    def test_the_top_room_type_is_the_one_the_priced_nights_slept_in(self):
+        """Forty-four standard room nights against seven suite nights over the
+        four scored nights: twenty at the 14 mark's lead, twelve at the 7
+        mark's, eight at the 30 mark's, three from the long stay and one from
+        the zero-rate row, against six suite nights in the baskets and the one
+        suite at a lead no window reaches.  The comp, the contract, the group,
+        the cancellation and the day use are all outside the population.
+        """
+        self.assertEqual(self.table["room_type"], "STD")
+        self.assertAlmostEqual(self.table["room_type_share"], 44 / 51.0)
+        self.assertEqual(self.table["meals"], ["BB", "HB"])
+
+    def test_the_band_is_the_hotel_s_and_its_top_rung_is_under_its_ceiling(self):
+        self.assertEqual(self.table["rate_floor"], 80.0)
+        self.assertEqual(self.table["rate_ceiling"], 201.0)
+        self.assertEqual(self.table["top_rung"], 200.0)
+
+    def test_the_sixty_mark_has_a_rate_to_read_and_no_one_to_compare_it_with(self):
+        """The 60 row is empty because nobody booked inside 75 to 45 days out,
+        not because the engine published nothing then and not because the
+        room type is wrong: the record carries 200.00 and the same nights
+        have full baskets at shorter leads.
+        """
+        rec = _t2_records()[(T2_D2, 60)]
+        self.assertEqual(rec.published_rate, 200.0)
+        self.assertTrue(rec.engine_ready)
+        self.assertEqual(ratecheck.basket(self.res.bookings, T2_D2, 75, 45, "STD"), [])
+        self.assertNotEqual(ratecheck.basket(self.res.bookings, T2_D2, 75, 4, "STD"), [])
+        self.assertCell("60", ("all",), 0, None, None, None, None, None)
+        self.assertEqual(self.table["cells"]["60"]["by_meal"], {})
+        self.assertEqual(self.table["cells"]["60"]["by_season"], {})
+        self.assertEqual(self.table["pinned"]["60"],
+                         {"n": 0, "n_pinned": 0, "share": None})
+        self.assertEqual(self.table["solve_age_days"]["60"],
+                         {"median": None, "max": None, "n": 0})
+
+    def test_the_fourteen_mark_is_the_median_of_four_nights_of_gaps(self):
+        """Baskets 140, 131, 121 and 107 against rates 200, 200, 164 and 152:
+        gaps of 60, 69, 43 and 45.  The median of those is 52.5 and the gap
+        between the median rate, 182, and the median basket, 126, is 56.
+        """
+        self.assertCell("14", ("all",), 4, 52.5, 44.5, 62.25, 182.0, 126.0)
+
+    def test_the_fourteen_mark_splits_by_board_into_two_different_answers(self):
+        """Bed and breakfast baskets are 104, 118, 100 and 86; half board
+        ones are 165, 160, 136 and 134.  Neither is the pooled 52.5, and the
+        long stay's half-board rate is what moves three of the four.
+        """
+        self.assertCell("14", ("by_meal", "BB"), 4, 74.0, 65.5, 85.5, 182.0, 102.0)
+        self.assertCell("14", ("by_meal", "HB"), 4, 31.5, 25.5, 36.25, 182.0, 148.0)
+        self.assertEqual(sorted(self.table["cells"]["14"]["by_meal"]), ["BB", "HB"])
+
+    def test_the_fourteen_mark_splits_by_the_season_it_was_handed(self):
+        self.assertCell("14", ("by_season", "high"), 2, 64.5, 62.25, 66.75, 200.0, 135.5)
+        self.assertCell("14", ("by_season", "low"), 2, 44.0, 43.5, 44.5, 158.0, 114.0)
+
+    def test_the_fourteen_mark_keeps_the_comped_night_apart(self):
+        """One comp room was on the books a month out, so it is there at this
+        mark; the other was entered ten days out and is not."""
+        self.assertCell("14", ("nonrev_nights",), 1, 69.0, 69.0, 69.0, 200.0, 131.0)
+        self.assertCell("14", ("clean_nights",), 3, 45.0, 44.0, 52.5, 164.0, 121.0)
+
+    def test_the_seven_mark_drops_the_night_the_engine_published_nothing_for(self):
+        """The first night has a basket at this lead and no rate, so it is
+        the rate that drops it and not the basket."""
+        self.assertNotEqual(ratecheck.basket(self.res.bookings, T2_D1, 10, 4, "STD"), [])
+        self.assertIsNone(_t2_records()[(T2_D1, 7)].published_rate)
+        self.assertCell("7", ("all",), 3, 42.0, 38.0, 49.0, 140.0, 106.0)
+        self.assertCell("7", ("by_meal", "BB"), 3, 51.0, 46.5, 57.0, 140.0, 98.0)
+        self.assertCell("7", ("by_meal", "HB"), 3, 12.0, 11.0, 21.0, 140.0, 128.0)
+
+    def test_the_seven_mark_sees_the_comp_room_the_longer_marks_could_not(self):
+        """The second comp room is entered ten days out.  At this mark the
+        house is read seven days out and it is there; at the 14 and 30 marks
+        it is not, and the same night sits on the other side of the line.
+        """
+        self.assertCell("7", ("nonrev_nights",), 2, 45.0, 39.5, 50.5, 170.0, 125.0)
+        self.assertCell("7", ("clean_nights",), 1, 42.0, 42.0, 42.0, 120.0, 78.0)
+        self.assertCell("7", ("by_season", "high"), 1, 56.0, 56.0, 56.0, 200.0, 144.0)
+        self.assertCell("7", ("by_season", "low"), 2, 38.0, 36.0, 40.0, 130.0, 92.0)
+
+    def test_the_thirty_mark_drops_the_night_the_engine_was_not_ready_for(self):
+        """And its gaps are negative: the engine is under the market here, in
+        the one direction a table that only ever prints overshoots would
+        never show.
+        """
+        self.assertEqual(_t2_records()[(T2_D4, 30)].published_rate, 126.0)
+        self.assertFalse(_t2_records()[(T2_D4, 30)].engine_ready)
+        self.assertNotEqual(ratecheck.basket(self.res.bookings, T2_D4, 40, 21, "STD"), [])
+        self.assertCell("30", ("all",), 3, -14.0, -16.0, -6.0, 122.0, 134.0)
+        self.assertCell("30", ("by_meal", "BB"), 3, 2.0, 0.0, 9.0, 122.0, 118.0)
+        self.assertCell("30", ("by_meal", "HB"), 3, -30.0, -32.0, -21.0, 122.0, 150.0)
+        self.assertCell("30", ("by_season", "high"), 2, -16.0, -17.0, -15.0, 121.0, 137.0)
+        self.assertCell("30", ("by_season", "low"), 1, 2.0, 2.0, 2.0, 124.0, 122.0)
+
+    def test_the_pinned_share_counts_the_nights_sitting_on_the_top_rung(self):
+        """Two of the four nights at the 14 mark are published at 200.00, one
+        of the three at the 7 mark is, none of the three at the 30 mark is,
+        and the 60 mark scores nothing, so the share is a different number on
+        every line and the total is three nights of ten.
+        """
+        self.assertEqual(self.table["pinned"]["14"], {"n": 4, "n_pinned": 2, "share": 0.5})
+        self.assertEqual(self.table["pinned"]["7"]["n"], 3)
+        self.assertEqual(self.table["pinned"]["7"]["n_pinned"], 1)
+        self.assertAlmostEqual(self.table["pinned"]["7"]["share"], 1 / 3.0)
+        self.assertEqual(self.table["pinned"]["30"], {"n": 3, "n_pinned": 0, "share": 0.0})
+        self.assertEqual(self.table["pinned_overall"]["n"], 10)
+        self.assertEqual(self.table["pinned_overall"]["n_pinned"], 3)
+        self.assertAlmostEqual(self.table["pinned_overall"]["share"], 0.3)
+
+    def test_the_age_of_the_solve_behind_each_mark_is_published(self):
+        """The 7 mark scores three nights and only two of them have a solve
+        recorded, so the count of ages is not the count of nights."""
+        self.assertEqual(self.table["solve_age_days"]["30"], {"median": 9, "max": 14, "n": 3})
+        self.assertEqual(self.table["solve_age_days"]["14"], {"median": 4.0, "max": 7, "n": 4})
+        self.assertEqual(self.table["solve_age_days"]["7"], {"median": 3.5, "max": 6, "n": 2})
+
+    def test_the_band_note_carries_the_measured_count_and_the_verdict(self):
+        note = self.table["band_note"]
+        self.assertIn("top rung is 200.00 against a ceiling of 201.00", note)
+        self.assertIn("3 of 10 scored nights are pinned on the top rung", note)
+        self.assertIn("artefact of a frozen band", note)
+        self.assertEqual(self.table["notes"][1], note)
+
+    def test_the_notes_refuse_the_revenue_reading(self):
+        text = " ".join(self.table["notes"])
+        self.assertIn("not evidence of revenue", text)
+        self.assertIn("net rate", text)
+        self.assertIn("compares two different products", text)
+        self.assertIn("re-solves on a cadence", text)
+
+    def test_only_a_hotel_that_is_not_h1_is_told_why_it_has_a_sixty_row(self):
+        self.assertEqual(self.table["notes"][-1], ratecheck.MARK60_NOTE)
+        h1 = ratecheck.table2(_bare_walk(None, _t2_records()), self.res.bookings,
+                              self.res.nonrev, self.res.hotel, "h1", T2_SEASONS,
+                              T2_D1, T2_D4)
+        self.assertNotIn(ratecheck.MARK60_NOTE, h1["notes"])
+        self.assertEqual(len(h1["notes"]), 5)
+        self.assertEqual(len(self.table["notes"]), 6)
+        # Everything except the note is the same table, so the label is a
+        # label and not a second way of scoring the hotel.
+        self.assertEqual({k: v for k, v in h1.items() if k != "notes"},
+                         {k: v for k, v in self.table.items() if k != "notes"})
