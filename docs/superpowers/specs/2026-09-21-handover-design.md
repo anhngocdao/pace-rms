@@ -15,7 +15,7 @@ Three departments, in the two-block model the hotel itself uses.
 
 | Block | Department | Question |
 |---|---|---|
-| Front of house | Front desk | Which nights am I at risk of having no room for a guest who holds a booking? |
+| Front of house | Front desk | Which nights are going to sell out, and how much notice do I get? |
 | Back of house | Kitchen | How many covers? |
 | Back of house | Housekeeping | How many rooms, of which kind? |
 
@@ -53,8 +53,12 @@ every table on the page carries the label this section defines.
 - **Dinner on evening D** is served to the half-board and full-board guests
   staying **night D**. Dinner belongs to the same night.
 - **Departures on day D** are bookings whose last stay night was **D − 1**.
-- **Stayovers on day D** are rooms occupied on **both** night D − 1 and
-  night D.
+- **Stayovers on day D** are bookings that cover **both** night D − 1 and
+  night D. Per booking, not per room: this log has a room *type* but no room
+  *number*, so "the same room on two nights" is not a thing it can express.
+  One booking spanning both nights is a stayover; two consecutive bookings by
+  the same guest are a departure and an arrival, which is also what the floor
+  sees, because the room is stripped and made up between them.
 - **Arrivals on day D** are bookings whose first stay night is **D**.
 
 So `rooms occupied on night D − 1 = departures on day D + stayovers on day D`.
@@ -63,6 +67,17 @@ asserts it holds on every day of the window.
 
 The front desk tab is the only one indexed by stay night. The kitchen and
 housekeeping tabs are indexed by service day, and each table says which.
+
+**Which lead a service day carries.** A quantity is at the lead of the night
+it belongs to, not the day it is served. Breakfast on morning D and departures
+on day D both belong to night D − 1, so both carry night D − 1's lead. Dinner
+on evening D belongs to night D and carries night D's lead.
+
+The consequence is the first row of a fourteen-day view: tomorrow morning's
+breakfast belongs to tonight, which is lead 0. The walk therefore records lead
+0 as well as leads 1 to 14. `Ledger.otb_at(d, 0)` already answers it, the band
+at lead 0 is narrow because almost nothing is still to come, and the first row
+is the one the chef needs most.
 
 ## 4. Schema and data rules
 
@@ -97,8 +112,11 @@ reader's existing counts. It still counts as a room for housekeeping: nobody
 ate, but the room was slept in and has to be cleaned. Covers and rooms part
 company here, which is the reason they are banded separately in section 6.
 
-A blank `children` would be read as zero. This file has none, in any row,
-cancelled or stayed, so that rule is stated rather than exercised.
+**`children` carries four missing values**, written as the literal string
+`NA`, all four at the city hotel. They are read as zero, and counted in a
+`children_missing` warning so the reading is visible rather than silent. Four
+rows in 119,390 changes nothing; the count is reported because a rule applied
+without a count is a rule nobody can check.
 
 The change is recorded in `data/antonio/settings.json`'s
 `_added_after_the_download` block, because a pre-registered schema must not
@@ -110,12 +128,15 @@ change quietly.
 - **Dinner**: `HB`, `FB`.
 - **Neither**: `SC` and `Undefined`.
 
-`SC` is self catering. `Undefined` is not a board code, it is a missing one,
-and counting it as no meal is a choice rather than a reading. The choice is
-taken because the alternative is to invent a board for it, and its size is
-printed beside the kitchen table so a reader can see how much of the answer
-rests on it: at H1 it is 3,890 of 119,887 stayed room nights, 3.2 percent, and
-at H2 there are none.
+This is the dataset's own documentation, not an interpretation: the data
+dictionary published with Antonio, de Almeida and Nunes lists `Undefined/SC`
+together as the no-meal-package category. Reading them apart would be the
+departure.
+
+The share is still printed beside the kitchen table, because a documented
+reading is worth no more than its size if it turns out to be wrong: at H1
+`Undefined` is 3,890 of 119,887 stayed room nights, 3.2 percent, and at H2
+there are none.
 
 ## 5. What each department gets
 
@@ -126,12 +147,18 @@ prepares 144 and runs short about half the time.
 
 Indexed by stay night. Per night: rooms on the books, the forecast band for
 rooms that will actually stay, the rooms authorised for sale above the room
-count, and a warning on the condition set out in section 7.1. The estimated
-cost of relocating a guest is printed beside the warning; `walk_cost` is
-already in `hotel.json`.
+count, and a **sell-out warning** on the condition set out in section 7.1.
+
+The warning says the night is going to fill, not that anyone will be
+relocated. Section 7.1 shows why the second claim cannot be made on a hotel
+whose room count Pace inferred, and this tab does not make it: `walk_cost` is
+not printed here, because a cost attached to an event the data cannot show is
+an invitation to believe the event was shown.
 
 The front desk does not choose an end of the band. It always reads the top,
-because relocating a guest is a failure money does not undo.
+because the actions a sell-out warning triggers — stop discounting, tighten
+the minimum stay, brief the desk — are cheap to take on a night that then
+does not fill, and expensive to skip on a night that does.
 
 ### Kitchen
 
@@ -201,22 +228,48 @@ The engine forecasts rooms. It does not forecast covers or departures, so
 those are derived, and the derivation uses only what was knowable on the
 forecast day.
 
-- **Rooms on night N**: the engine's own forecast. This is the quantity phase
-  5b scores.
-- **Breakfast covers on morning D**: the rooms forecast for night D − 1, times
-  the breakfast share, times guests per room.
-- **Dinner covers on evening D**: the rooms forecast for night D, times the
-  half-and-full-board share, times guests per room.
-- **Stayovers on day D**: the rooms forecast for night D − 1, times the
-  stayover share.
-- **Departures on day D**: the rooms forecast for night D − 1, minus the
-  stayovers forecast, which keeps the section 3 identity true by construction.
+**Rooms on night N** are the engine's own forecast. That is the quantity
+phase 5b scores, and the only one taken from the engine unchanged.
 
-The three ratios — breakfast share, dinner share, guests per room — and the
-stayover share are estimated from the settled history available **on the
-forecast day**, over a trailing window of the same weekday, on the pattern
-`pace/baselines.py` already uses. A ratio estimated from the whole file would
-be a leak, and the phase 5b task 1 guard catches exactly that.
+**The other four are split in two before any ratio is applied**, because at
+these leads most of the night is already known. At lead 7 the bookings that
+will occupy that night are largely on the books already, and each of them
+states its own board, its own guest count and its own departure date. A
+half-board tour group of forty rooms is sitting in the log with `HB` written
+on it; multiplying a room forecast by last month's average board share
+dissolves that group into the average and then reports a band wide enough to
+have hidden it.
+
+So each quantity is `booked + pickup`:
+
+- **The booked part** is counted from the bookings on the books at that lead,
+  using their own board codes, their own guest counts and their own
+  departure dates. Nothing is estimated.
+- **The pickup part** is `rooms forecast − rooms on the books`, the rooms
+  still to come, and only that part is multiplied by a historical ratio.
+
+Which gives:
+
+| Quantity | Booked part | Pickup part |
+|---|---|---|
+| Breakfast covers, morning D | guests on the books for night D − 1 whose board is BB, HB or FB | pickup for night D − 1 × breakfast share × guests per room |
+| Dinner covers, evening D | guests on the books for night D whose board is HB or FB | pickup for night D × dinner share × guests per room |
+| Stayovers, day D | bookings on the books covering night D − 1 and night D | pickup for night D − 1 × stayover share |
+| Departures, day D | rooms forecast for night D − 1 − stayovers forecast | (identity, section 3) |
+
+The ratios — breakfast share, dinner share, guests per room, stayover share —
+are estimated from the settled history available **on the forecast day**, over
+a trailing window of the same weekday, on the pattern `pace/baselines.py`
+already uses. A ratio estimated from the whole file would be a leak, and the
+phase 5b task 1 guard catches exactly that.
+
+Nothing in the booked part is a leak either: those bookings were in the log on
+the forecast day, which is the same test every other figure here passes.
+
+This does not change whether a band is honest. Coverage is measured end to end
+either way (section 6.1), so a worse point forecast would simply produce a
+wider band and a truthful coverage figure. It changes how wide the band has to
+be, which is what the departments actually feel.
 
 ### 6.3 Where the width comes from
 
@@ -237,10 +290,11 @@ visibly skewed, and `pilot.percentile` already exists.
 
 **Every lead, not the pilot's marks.** The pilot snapshots at 120, 90, 60, 30,
 14, 7 and 1, because those are the pre-registered marks table 1 is scored at.
-The handover needs all fourteen. `Ledger.otb_at` answers at any lead up to
-`max_lead`, so the handover walk records every lead from 1 to 14 rather than
-interpolating between marks. Interpolation would invent a width for eleven of
-the fourteen leads and then report coverage against it.
+The handover needs all of them. `Ledger.otb_at` answers at any lead up to
+`max_lead`, so the handover walk records **every lead from 0 to 14** rather
+than interpolating between marks. Interpolation would invent a width for
+twelve of the fifteen leads and then report coverage against it. Lead 0 is
+there because tomorrow morning's breakfast belongs to tonight (section 3).
 
 ### 6.4 The quantiles, decided
 
@@ -275,47 +329,87 @@ label on the page is written from the measurement.
 
 ### 7.1 Front desk: an alarm, not a forecast
 
-**The warning and the event use the same condition.** The warning fires when
-the top of the band **exceeds** the rooms that are sellable on that night. The
-night counts as one that needed the warning when the settled ledger shows
-rooms that would have occupied **exceeding** sellable rooms, or shows a walk.
+**The event this alarm was first written for does not occur in this data, at
+all.** Measured over the 427-night scoring window, on both hotels:
 
-Both sides are "exceeds". An earlier draft defined the event as "sold at or
-above capacity", which is a different event: a night that sells exactly to
-capacity is the best night of the year, not a night anyone was turned away
-from. Measuring a warning against an event it was not making would report a
-precision and a recall for something nobody asked about.
+| | H1 | H2 |
+|---|---|---|
+| Nights where rooms sold exceeded capacity | 0 | 0 |
+| Nights with a walk recorded | 0 | 0 |
+| Busiest night, as a share of capacity | 98.9% | 100.0% |
 
-Sellable rooms is `pilot.capacity_on`, the same capacity table 1's clamp uses,
-so the two tables cannot disagree about how large the hotel was.
+And the reason is structural rather than lucky. `sellable_rooms` is inferred
+from the busiest night the log contains, 187 of 187 at H1 and 226 of 226 at
+H2, so occupancy cannot exceed it: the ceiling is defined as the highest point
+of the floor. The public dataset records no walk either, so a walk could only
+ever have come from the replay's own arithmetic, and the replay never had a
+night to walk anyone from.
+
+A warning about being oversold is therefore unmeasurable on any hotel whose
+room count Pace has to infer, which is every hotel that arrives without
+stating one. This is not a gap to be closed later by better code.
+
+**So the alarm is about sell-out, and says so.** The event is the night
+reaching the pre-registered sell-out cut: settled revenue rooms at or above
+`sellout_threshold` times `pilot.capacity_on`. The threshold is 0.97 and it
+was pre-registered in `data/antonio/settings.json` before the data was
+downloaded, so it is not a number chosen to make the event set a convenient
+size. What it produces:
+
+| | H1 | H2 |
+|---|---|---|
+| Nights reaching the cut | 94 | 132 |
+| Share of the scoring window | 22.0% | 30.9% |
+
+That is worth a front desk knowing, and it is worth it for reasons that are
+not overbooking: stop discounting, tighten the minimum stay, and warn the desk
+that walk-ins will be turned away. It is **not** a claim that anyone will be
+relocated, and the tab does not make one.
+
+**Both sides use the same quantity and the same cut.** The warning fires when
+the top of the band reaches `sellout_threshold × capacity_on`. The event is
+settled revenue rooms reaching `sellout_threshold × capacity_on`. Forecast and
+outcome are both revenue rooms, and `capacity_on` nets out the comped rooms on
+both sides, so the two can never disagree about how large the hotel was.
 
 Three figures:
 
-- **Precision**: of the nights warned, the share that needed it.
-- **Recall**: of the nights that needed it, the share warned. For an alarm the
-  miss is the expensive error, and precision alone hides it.
+- **Precision**: of the nights warned, the share that reached the cut.
+- **Recall**: of the nights that reached the cut, the share warned. For an
+  alarm the miss is the expensive error, and precision alone hides it.
 - **Notice**: the deepest lead L such that the warning was on at **every lead**
   from L through to the night. A warning that switches on, off and on again
-  gives notice from the last time it came on, not the first. A correct warning
-  delivered six hours out is useless: there is no time to hold a room next
-  door.
+  gives notice from the last time it came on, not the first.
 
-**The invisible nights, counted separately.** Phase 5b task 3 measured nights
-that were physically full in the house while the ledger could not tell: over
-the scoring window, 94 full nights at H1 of which 29 were invisible, and 132
-at H2 of which 32 were invisible. Those nights are excluded from the event set
-above, and that pulls in two directions at once:
+**Notice is censored at 14** because the walk records no lead deeper than 14.
+A night whose warning was on at every lead from 14 down is reported as **"14 or
+more"**, never as 14, and the count of censored nights is printed beside the
+median notice. A censored figure presented as an exact one is a smaller lie
+than most but it is still one.
 
-- a night Pace warned about that is invisible is being counted as a **false
-  alarm**, so the precision reported above is a **lower** bound;
-- recall's denominator is short by the invisible nights and its numerator is
-  short by however many of them were warned, so recall can be biased **either
-  way**.
+**Every rate is printed beside its count**, and a rate is not printed at all
+below the same 30-night floor section 6.4 sets for bands: a recall of "3 of 4"
+is a number about four nights, and rendering it as 75 percent invites the
+reader to treat it as a property of the hotel. Both hotels clear the floor
+here, 94 and 132 against 30; the rule exists for the cut, the season or the
+hotel where they do not.
 
-So the page reports one more pair: **how many invisible nights there were, and
-how many of them Pace warned about**. With those two counts the true recall
-is not bounded, it is computable, and the reader can do it. Reporting a bound
-instead would be less than the data supports.
+**The nights the log cannot speak for.** Phase 5b task 3 counted nights that
+were physically full in the house while the settled ledger showed fewer rooms
+sold: 29 of 94 at H1 and 32 of 132 at H2.
+
+Those nights are not missed events. The event here is reaching the sell-out
+cut, and reaching it is exactly what they did. They are the nights where the
+booking log cannot say **whether anyone was turned away**, because the
+difference between a full house and a ledger that is short of one is made of
+no-shows and rooms released at the last moment, and neither is recorded as a
+refusal.
+
+So they are reported as their own count, under their own heading, as the part
+of the picture the data does not contain. They are not folded into precision,
+they are not folded into recall, and no bound is claimed from them. The
+earlier draft called recall an upper bound on their account; that was wrong in
+both directions, and the honest reply is that they measure something else.
 
 ### 7.2 Kitchen
 
@@ -393,6 +487,13 @@ means building on numbers that are still moving.
 The `guests` column is its own task, ahead of the rest, on the pattern of
 task 2.
 
+CLAUDE.md requires a new mechanism to start as an ADR marked "Proposed" before
+any code lands. Two are owed here, and they are the two decisions a later
+reader will most want the reasoning for: that the front desk alarm is about
+sell-out rather than overbooking, with the measurement that forced it, and
+that every quantity is banded on its own error rather than on the rooms band
+times a ratio.
+
 ## 12. Decisions taken
 
 1. Three departments: front desk, kitchen, housekeeping. Not four.
@@ -415,6 +516,18 @@ task 2.
    to the hotel, with the median as the default that asks the hotel for
    nothing.
 10. Arrivals are a priority line for housekeeping, never a workload line.
-11. The warning and the event it is scored against use the same condition,
-    "exceeds sellable rooms", on both sides.
-12. Live warnings are not scored, and the page says why.
+11. The front desk alarm is about **sell-out**, not about being oversold.
+    Measured on both hotels: zero nights above capacity and zero walks, because
+    `sellable_rooms` is inferred from the busiest night in the log. The event
+    is reaching `sellout_threshold` (0.97, pre-registered) times
+    `capacity_on`, which is 94 nights at H1 and 132 at H2, and the warning
+    fires on the same quantity against the same cut.
+12. Nights full in the house but short in the ledger (29 of 94 at H1, 32 of
+    132 at H2) are reported as their own count. They are not missed events and
+    no bound is claimed from them: they are where the log cannot say whether
+    anyone was turned away.
+13. Notice is censored at 14 and reported as "14 or more", with the count of
+    censored nights beside it.
+14. Every rate is printed beside its count, and no rate is printed below the
+    same 30-night floor that governs bands.
+15. Live warnings are not scored, and the page says why.
