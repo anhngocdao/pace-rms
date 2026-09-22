@@ -156,8 +156,8 @@ not printed here, because a cost attached to an event the data cannot show is
 an invitation to believe the event was shown.
 
 The front desk does not choose an end of the band. It always reads the top,
-because the actions a sell-out warning triggers — stop discounting, tighten
-the minimum stay, brief the desk — are cheap to take on a night that then
+because the actions a sell-out warning triggers (stop discounting, tightening
+the minimum stay, briefing the desk) are cheap to take on a night that then
 does not fill, and expensive to skip on a night that does.
 
 ### Kitchen
@@ -257,8 +257,9 @@ Which gives:
 | Stayovers, day D | bookings on the books covering night D − 1 and night D | pickup for night D − 1 × stayover share |
 | Departures, day D | rooms forecast for night D − 1 − stayovers forecast | (identity, section 3) |
 
-The ratios — breakfast share, dinner share, guests per room, stayover share —
-are estimated from the settled history available **on the forecast day**, over
+The four ratios (breakfast share, dinner share, guests per room, stayover
+share) are estimated from the settled history available **on the forecast
+day**, over
 a trailing window of the same weekday, on the pattern `pace/baselines.py`
 already uses. A ratio estimated from the whole file would be a leak, and the
 phase 5b task 1 guard catches exactly that.
