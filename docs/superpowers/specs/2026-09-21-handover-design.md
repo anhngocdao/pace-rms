@@ -282,34 +282,42 @@ So each quantity is `booked + pickup`:
 
 - **The booked part** is counted from the bookings on the books at that lead,
   using their own board codes, their own guest counts and their own
-  departure dates. Nothing is estimated.
-- **The pickup part** is `rooms forecast − rooms on the books`, the rooms
-  still to come, and only that part is multiplied by a historical ratio.
+  departure dates, and then multiplied by the survival rate `s`, the share of
+  such rooms that go on to stay. Nothing in it but `s` is estimated.
+- **The pickup part** is `rooms forecast − (rooms on the books × s)`, the
+  rooms the forecast expects to stay that are not already accounted for by a
+  surviving booking, and only that part is multiplied by a historical ratio.
 
 Which gives:
 
 | Quantity | Booked part | Pickup part |
 |---|---|---|
-| Breakfast covers, morning D | guests on the books for night D − 1 whose board is BB, HB or FB | pickup for night D − 1 × breakfast share × guests per room |
-| Dinner covers, evening D | guests on the books for night D whose board is HB or FB | pickup for night D × dinner share × guests per room |
-| Stayovers, day D | bookings on the books covering night D − 1 and night D | pickup for night D − 1 × stayover share |
+| Breakfast covers, morning D | guests on the books for night D − 1 whose board is BB, HB or FB, × s | pickup for night D − 1 × breakfast share × guests per room |
+| Dinner covers, evening D | guests on the books for night D whose board is HB or FB, × s | pickup for night D × dinner share × guests per room |
+| Stayovers, day D | rooms on bookings on the books covering night D − 1 and night D, × s | pickup for night D − 1 × stayover share |
 | Departures, day D | rooms forecast for night D − 1 − stayovers forecast | (identity, section 3) |
 
-The four ratios (breakfast share, dinner share, guests per room, stayover
-share) are estimated from the settled history available **on the forecast
-day**, over
-a trailing window of the same weekday, on the pattern `pace/baselines.py`
-already uses. A ratio estimated from the whole file would be a leak, and the
-phase 5b task 1 guard catches exactly that.
+The five ratios (breakfast share, dinner share, guests per room, stayover
+share, and the survival rate `s`) are estimated from the settled history
+available **on the forecast day**, over the ten trailing nights of the same
+weekday: the window `pace/baselines.py` already uses and `settings.json`
+pre-registers as `baseline_window_weeks`, so no new window is chosen here. A
+ratio estimated from the whole file would be a leak, and the phase 5b task 1
+guard catches exactly that. A night whose trailing window cannot supply a ratio
+has no forecast for the quantities that need it and is left out of scoring, the
+rule table 1 already applies to a night a baseline cannot forecast; it is never
+filled with a default.
 
 Nothing in the booked part is a leak either: those bookings were in the log on
 the forecast day, which is the same test every other figure here passes.
 
 The pickup part is never negative. The engine floors its forecast at the rooms
 already on the books (`expected = max(float(otb), expected)`, `pace/forecast.py`
-line 91), so `rooms forecast − rooms on the books` is always well formed.
+line 91), and `s` is a share so it never exceeds 1, so `rooms forecast −
+(rooms on the books × s)` is at least `rooms forecast − rooms on the books`,
+which is at least zero.
 
-#### Open, not settled: does the booked part get a survival rate?
+#### The survival rate, decided
 
 The booked part is counted gross. A booking on the books at lead L may still
 cancel, and when it does, its board and its guest count are never removed with
@@ -340,26 +348,40 @@ inside fourteen days. What has not been measured is survival by board code,
 which is the quantity that matters here; segment is a proxy for it, and the
 proxy says the effect is small.
 
-**Two ways to close it.** Either apply a survival rate `s(L, weekday)`,
-estimated as the four ratios are and under the same leak guard; or leave the
-booked part gross and say on the page that it is, how large the bias is, and
-that the band has absorbed it. The second is a legitimate choice, but a
-survival rate is something Pace has not computed rather than something it
-cannot know, so it belongs here in section 6 and not among the limits.
+**Decided: the booked part is multiplied by `s(L, weekday)`**, the share of
+rooms on the books at lead L that went on to stay, over the ten trailing nights
+of that weekday. It is estimated exactly as the four other ratios are and sits
+behind the same leak guard. Leaving the booked part gross was a legitimate
+alternative, since coverage would have stayed honest, but a bias of 2 to 9
+percent that always runs upward is something Pace can compute, and the whole
+reason for splitting booked from pickup was to narrow the band.
 
-**If the first is chosen, the pickup term has to change with it.** The engine's
-rooms forecast already nets out the cancellations it expects, so shrinking the
-booked part by `s` while keeping `pickup = forecast − on the books` would
-subtract the same cancellations twice and the parts would no longer add up to
-the forecast. The consistent form is:
+**The pickup term changes with it, and this is not optional.** The engine's
+rooms forecast already nets out the cancellations it expects. Shrinking the
+booked part by `s` while keeping `pickup = forecast − on the books` would subtract
+the same cancellations twice, and the parts would no longer add up to the
+forecast. The consistent form, for rooms and so for every quantity derived
+from them:
 
 ```
 booked part that stays = rooms on the books × s
 pickup                 = rooms forecast − (rooms on the books × s)
+booked + pickup        = rooms forecast
 ```
 
-which reduces to the present form when `s = 1`. Adding `s` to the first line
-without changing the second makes the forecast worse, not better.
+The third line is the check: a test asserts that booked plus pickup equals the
+engine's rooms forecast on every night, to rounding, so a version that applies
+`s` to one line and not the other fails at once. When `s = 1` the form reduces
+to the one this section had before.
+
+**One `s` for every board, stated as an assumption.** A booking cancels whole,
+so the same `s` applies to its rooms, its guests and its board. That is exact
+for rooms. For covers it assumes that cancelling bookings carry the same board
+mix and the same guests per room as the ones that stay. Survival by board code
+has not been measured; survival by segment has, and its spread at lead 7 is
+under one point at H1 and under two at H2 (above), so the assumption is carried
+on that evidence and named on the kitchen tab rather than hidden inside the
+number.
 
 This does not change whether a band is honest. Coverage is measured end to end
 either way (section 6.1), so a worse point forecast would simply produce a
@@ -627,9 +649,11 @@ later reader will most want the reasoning for:
 2. That every quantity is banded on its own error rather than on the rooms
    band times a ratio.
 3. That the four derived quantities are split into a booked part and a pickup
-   part before any ratio is applied. This is a new mechanism in its own right,
-   and it is the one the open survival question in 6.2 sits inside. An earlier
-   draft counted two ADRs and missed it.
+   part before any ratio is applied, with the booked part multiplied by the
+   survival rate `s` and the pickup term redefined so the two still sum to the
+   forecast. This is a new mechanism in its own right, and the one the
+   survival rate of 6.2 sits inside. An earlier draft counted two ADRs and
+   missed it.
 
 ## 12. Decisions taken
 
@@ -674,7 +698,9 @@ later reader will most want the reasoning for:
 16. Every rate is printed beside its count, and no rate is printed below the
     same 30-night floor that governs bands.
 17. Live warnings are not scored, and the page says why.
-
-**One thing is not on this list:** whether the booked part of each derived
-quantity gets a survival rate (section 6.2). It decides whether there is a
-fifth ratio to estimate, so the implementation plan waits on it.
+18. The booked part of every derived quantity is multiplied by the survival
+    rate `s(L, weekday)`, estimated over the ten trailing same-weekday nights
+    under the same leak guard, and the pickup term is `rooms forecast −
+    (rooms on the books × s)`, so booked plus pickup equals the rooms forecast
+    and a test asserts it. One `s` serves every board, which is an assumption
+    about cancellations and is named on the kitchen tab.
