@@ -12,6 +12,7 @@ import unittest
 from collections import defaultdict
 
 from pace import baselines
+from pace import holdout
 from pace import hotelconfig as HC
 from pace import ingest
 from pace import pilot
@@ -1559,6 +1560,14 @@ class PreRegistration(unittest.TestCase):
             self.assertLess(hi, int(mark), "window %s opens after its own mark" % mark)
             self.assertLess(int(mark), lo, "window %s closes before its own mark" % mark)
 
+    def test_the_cheap_first_mark_is_the_pre_registered_one(self):
+        """`pace/holdout.py` keeps its own copy of the mark the cheap channels
+        close at, for the reason the rate windows are copied: pace/ must not
+        read data/.  Checked against the file and spelled out as well, so a
+        settings file edited to agree with a mutated constant still fails."""
+        self.assertEqual(holdout.MARK, self.settings["close_cheap_first_mark"])
+        self.assertEqual(holdout.MARK, 0.90)
+
     def test_the_basket_trim_is_the_pre_registered_one(self):
         self.assertEqual(list(ratecheck.TRIM), self.settings["basket_trim_percentiles"])
         self.assertEqual(ratecheck.TRIM, (0.01, 0.99))
@@ -2804,3 +2813,412 @@ class Table2(unittest.TestCase):
         # label and not a second way of scoring the hotel.
         self.assertEqual({k: v for k, v in h1.items() if k != "notes"},
                          {k: v for k, v in self.table.items() if k != "notes"})
+
+
+# --------------------------------------------------------------------- table 3
+
+
+def _feb(day):
+    return dt.date(2024, 2, day)
+
+
+def _a_rows(n, booked_on="2024-01-01", arrival="2024-02-01"):
+    """`n` single nights on one date, one room each, entered on one day."""
+    return [_row(booking_id="A%02d" % i, booked_on=booked_on, arrival=arrival, nights="1")
+            for i in range(n)]
+
+
+def _a_ids(n):
+    return set("A%02d" % i for i in range(n))
+
+
+class CutRules(unittest.TestCase):
+    """A 20-room fixture hotel cut to 12 rooms, so the mark is 10.8.
+
+    Every count below is read off the rows by hand before the code runs, and
+    every fixture is built so the rule under test gives a different answer from
+    the rule beside it: a cut that refused nothing, or a mark that never bound,
+    would pass an assertion about rooms and prove nothing.
+    """
+
+    CAP = 12
+    LAST = dt.date(2024, 2, 28)
+
+    def tearDown(self):
+        _reset_config()
+
+    def _load(self, rows):
+        return ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
+
+    def _cut(self, rows, rule, cap=None):
+        """Note the mark is never passed: every test below exercises the
+        module's own default, so moving MARK moves these answers."""
+        res = self._load(rows)
+        kept, cut = holdout.cut_history(res.bookings, self.CAP if cap is None else cap,
+                                        rule, self.LAST)
+        return res, set(b.booking_id for b in kept), cut
+
+    # ------------------------------------------------------------- the names
+
+    def test_an_unknown_rule_is_named_and_the_three_real_ones_listed(self):
+        res = self._load(_a_rows(1))
+        with self.assertRaises(pilot.PilotError) as ctx:
+            holdout.cut_history(res.bookings, self.CAP, "close_expensive_first", self.LAST)
+        self.assertIn("close_expensive_first", str(ctx.exception))
+        for rule in holdout.RULES:
+            self.assertIn(rule, str(ctx.exception))
+
+    def test_every_rule_has_a_name_and_no_name_is_without_a_rule(self):
+        self.assertEqual(holdout.RULES,
+                         ("sell_until_full", "close_cheap_first", "close_cheap_first_ota"))
+        self.assertEqual(sorted(holdout.RULE_NAMES), sorted(holdout.RULES))
+
+    def test_the_cheap_branches_are_the_converter_s_offline_ta_to_branches(self):
+        """The origin has to be read off the branch code, because two of the
+        three map to CORP and are indistinguishable from a corporate account
+        once mapped.  Dropping one of them silently sells a tour operator
+        allotment straight through the mark.
+
+        This is the only guard on OFFLINE_TO_GROUP's membership.  That branch
+        maps to the GROUP target, which closes at the mark anyway, so dropping
+        it changes no answer this dataset can produce; it would change them at
+        a hotel whose map sends its tour operator blocks somewhere else."""
+        from tools import convert_antonio as CA
+        self.assertEqual(set(holdout.CHEAP_BRANCHES),
+                         set(b for b in CA.ALL_BRANCHES if b.startswith("OFFLINE_TO")))
+        self.assertEqual(len(holdout.CHEAP_BRANCHES), 3)
+
+    def test_the_note_says_which_part_of_the_rule_never_fires_here(self):
+        """Section 5's rule closes promotional and non-refundable rate codes at
+        the same mark.  Neither hotel's export carries a rate code on a single
+        row, so that part of the rule is inert and the table says so rather
+        than letting a reader assume it ran."""
+        note = holdout.NO_RATE_CODES_NOTE
+        self.assertIn("Promotional", note)
+        self.assertIn("non-refundable", note)
+        self.assertIn("no rate codes at all", note)
+        for name in ("h1", "h2"):
+            path = os.path.join(ROOT, "data", "antonio", "%s-bookings.csv" % name)
+            with open(path, newline="", encoding="utf-8-sig") as fh:
+                coded = sum(1 for r in csv.DictReader(fh) if (r["rate_code"] or "").strip())
+            self.assertEqual(coded, 0, name)
+
+    # -------------------------------------------------------- sell until full
+
+    def test_sell_until_full_refuses_the_row_that_would_pass_the_cap(self):
+        """Fourteen single nights on 1 February entered one a day into twelve
+        rooms: the first twelve are taken in the order they arrived and the
+        last two are refused."""
+        rows = [_row(booking_id="A%02d" % i, booked_on="2024-01-%02d" % (i + 1),
+                     arrival="2024-02-01", nights="1") for i in range(14)]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(12))
+        self.assertEqual(cut, {_feb(1): 2})
+
+    def test_a_row_losing_one_night_loses_all_of_them(self):
+        """Twelve rooms are gone on the 2nd only.  The three-night stay that
+        wants the 1st, the 2nd and the 3rd is refused for all three, because a
+        guest turned away for the middle night does not take the ends."""
+        rows = _a_rows(12, arrival="2024-02-02")
+        rows += [_row(booking_id="SPAN", booked_on="2024-01-10",
+                      arrival="2024-02-01", nights="3")]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(12))
+        self.assertEqual(cut, {_feb(1): 1, _feb(2): 1, _feb(3): 1})
+
+    # --------------------------------------------------------- cancellations
+
+    def test_a_cancellation_of_an_accepted_row_frees_its_room(self):
+        """Eleven rooms, then a twelfth that cancels on 20 January.  The row
+        entered on the 25th finds the room back."""
+        rows = _a_rows(11)
+        rows += [_row(booking_id="C1", booked_on="2024-01-02", arrival="2024-02-01",
+                      nights="1", status="cancelled", status_date="2024-01-20"),
+                 _row(booking_id="LATE", booked_on="2024-01-25", arrival="2024-02-01",
+                      nights="1")]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(11) | {"C1", "LATE"})
+        self.assertEqual(cut, {})
+
+    def test_a_refused_row_gives_nothing_back_when_its_cancel_date_arrives(self):
+        """The cap was already full when C1 was entered, so C1 never held a
+        room and its cancellation on 20 January frees none.  LATE is refused
+        too, and the night lost two rooms rather than one."""
+        rows = _a_rows(12)
+        rows += [_row(booking_id="C1", booked_on="2024-01-01", arrival="2024-02-01",
+                      nights="1", status="cancelled", status_date="2024-01-20"),
+                 _row(booking_id="LATE", booked_on="2024-01-25", arrival="2024-02-01",
+                      nights="1")]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(12))
+        self.assertEqual(cut, {_feb(1): 2})
+
+    def test_a_row_cancelled_on_the_day_it_was_booked_gives_its_room_back(self):
+        """1,263 of H1's 10,831 dated cancellations fall on their own booking
+        day.  Held for the rest of that day, where `ingest.replay` also holds
+        them, and given back at the end of it: a room taken in January that is
+        never given back would refuse every later row for nothing."""
+        rows = _a_rows(11)
+        rows += [_row(booking_id="SAME", booked_on="2024-01-02", arrival="2024-02-01",
+                      nights="1", status="cancelled", status_date="2024-01-02"),
+                 _row(booking_id="LATE", booked_on="2024-01-03", arrival="2024-02-01",
+                      nights="1")]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(11) | {"SAME", "LATE"})
+        self.assertEqual(cut, {})
+
+    # ---------------------------------------------------------------- groups
+
+    def test_a_group_is_refused_whole_at_the_mark_and_accepted_under_the_cap(self):
+        """Five rooms are gone and a block of seven is asked for.  Under the
+        cap it fits exactly and is taken.  At the mark of 10.8 it does not fit,
+        and all seven rooms go, not the two that crossed the mark."""
+        rows = _a_rows(5)
+        rows += [_row(booking_id="G%d" % i, segment="GROUP", company="ACME",
+                      booked_on="2024-01-02", arrival="2024-02-01", nights="1")
+                 for i in range(7)]
+        group = set("G%d" % i for i in range(7))
+        _res, kept_full, cut_full = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept_full, _a_ids(5) | group)
+        self.assertEqual(cut_full, {})
+        _res, kept_cheap, cut_cheap = self._cut(rows, "close_cheap_first")
+        self.assertEqual(kept_cheap, _a_ids(5))
+        self.assertEqual(cut_cheap, {_feb(1): 7})
+
+    def test_two_companies_on_the_same_day_are_two_decisions(self):
+        """Five rooms gone, then three for ACME and three for BETA.  ACME fits
+        under the mark and BETA does not.  One block of six would refuse both;
+        six separate rooms would take ACME's three and two of BETA's."""
+        rows = _a_rows(5)
+        rows += [_row(booking_id="ACME%d" % i, segment="GROUP", company="ACME",
+                      booked_on="2024-01-02", arrival="2024-02-01", nights="1")
+                 for i in range(3)]
+        rows += [_row(booking_id="BETA%d" % i, segment="GROUP", company="BETA",
+                      booked_on="2024-01-02", arrival="2024-02-01", nights="1")
+                 for i in range(3)]
+        _res, kept, cut = self._cut(rows, "close_cheap_first")
+        self.assertEqual(kept, _a_ids(5) | set("ACME%d" % i for i in range(3)))
+        self.assertEqual(cut, {_feb(1): 3})
+
+    # --------------------------------------------------------- close cheap first
+
+    def _ten_then(self, extra_branch):
+        """Ten rooms committed, then a row from `extra_branch`, an OTA row and
+        a direct row, all entered on the same later day and in that order."""
+        rows = _a_rows(10)
+        rows += [_row(booking_id="TO", segment=extra_branch, booked_on="2024-01-05",
+                      arrival="2024-02-01", nights="1"),
+                 _row(booking_id="OTA1", segment="BOOKING", booked_on="2024-01-05",
+                      arrival="2024-02-01", nights="1"),
+                 _row(booking_id="WEB1", booked_on="2024-01-05", arrival="2024-02-01",
+                      nights="1")]
+        return rows
+
+    def test_close_cheap_first_shuts_every_offline_branch_at_the_mark(self):
+        """At ten committed rooms the eleventh crosses the mark of 10.8 and
+        stays under the cap of twelve, so the two rules disagree about every
+        row in the queue: the tour operator row goes and the direct row that
+        would otherwise have been the thirteenth survives in its place."""
+        # Spelled out rather than read off CHEAP_BRANCHES, which is the
+        # constant under test: a loop over it tests only what it still
+        # contains and passes the moment a branch is dropped from it.
+        for branch in ("OFFLINE_TO_CONTRACT", "OFFLINE_TO_TRANSIENT", "OFFLINE_TO_GROUP"):
+            rows = self._ten_then(branch)
+            _res, kept, cut = self._cut(rows, "sell_until_full")
+            self.assertEqual(kept, _a_ids(10) | {"TO", "OTA1"}, branch)
+            self.assertEqual(cut, {_feb(1): 1}, branch)
+            _res, kept, cut = self._cut(rows, "close_cheap_first")
+            self.assertEqual(kept, _a_ids(10) | {"OTA1", "WEB1"}, branch)
+            self.assertEqual(cut, {_feb(1): 1}, branch)
+
+    def test_the_secondary_form_shuts_the_ota_rows_too_and_the_primary_does_not(self):
+        rows = _a_rows(10)
+        rows += [_row(booking_id="OTA1", segment="BOOKING", booked_on="2024-01-05",
+                      arrival="2024-02-01", nights="1"),
+                 _row(booking_id="WEB1", booked_on="2024-01-05", arrival="2024-02-01",
+                      nights="1")]
+        _res, kept, cut = self._cut(rows, "close_cheap_first")
+        self.assertEqual(kept, _a_ids(10) | {"OTA1", "WEB1"})
+        self.assertEqual(cut, {})
+        _res, kept, cut = self._cut(rows, "close_cheap_first_ota")
+        self.assertEqual(kept, _a_ids(10) | {"WEB1"})
+        self.assertEqual(cut, {_feb(1): 1})
+
+    # ------------------------------------------------------------- the mark
+
+    def test_the_mark_is_nine_tenths_of_the_cap_and_not_a_smaller_share(self):
+        """Seventeen rooms committed into a cap of twenty.  The mark is exactly
+        eighteen rooms, the tour operator row is the eighteenth, and a row at
+        the mark has not passed it.  At 0.85 the mark would be seventeen and
+        this row would be refused."""
+        rows = _a_rows(17) + [_row(booking_id="TO", segment="OFFLINE_TO_TRANSIENT",
+                                   booked_on="2024-01-05", arrival="2024-02-01", nights="1")]
+        _res, kept, cut = self._cut(rows, "close_cheap_first", cap=20)
+        self.assertEqual(kept, _a_ids(17) | {"TO"})
+        self.assertEqual(cut, {})
+
+    def test_the_mark_is_nine_tenths_of_the_cap_and_not_a_larger_share(self):
+        """One room further on, the same row is the nineteenth and is refused,
+        although the cap of twenty has two rooms left.  At 0.95 the mark would
+        be nineteen and this row would be taken."""
+        rows = _a_rows(18) + [_row(booking_id="TO", segment="OFFLINE_TO_TRANSIENT",
+                                   booked_on="2024-01-05", arrival="2024-02-01", nights="1")]
+        _res, kept, cut = self._cut(rows, "close_cheap_first", cap=20)
+        self.assertEqual(kept, _a_ids(18))
+        self.assertEqual(cut, {_feb(1): 1})
+
+    # ----------------------------------------------- rows outside the cap
+
+    def test_a_comp_room_entered_after_the_cap_overshoots_and_is_not_cut(self):
+        """A comp room is not for sale, so it evicts nobody and nothing evicts
+        it: the night ends on thirteen physical rooms in a house cut to
+        twelve."""
+        rows = _a_rows(12)
+        rows += [_row(booking_id="COMP1", segment="COMP", rate="0", booked_on="2024-01-28",
+                      arrival="2024-02-01", nights="1")]
+        res = self._load(rows)
+        kept, cut = holdout.cut_history(res.bookings, self.CAP, "sell_until_full", self.LAST)
+        self.assertEqual(set(b.booking_id for b in kept), _a_ids(12) | {"COMP1"})
+        self.assertEqual(cut, {})
+        self.assertEqual(ingest.physical_occupancy(kept)[_feb(1)], 13)
+
+    def test_a_day_use_row_is_kept_and_never_counted_against_the_cap(self):
+        """Zero nights never reach the ledger, so they cannot fill a room, and
+        the thirteenth real room is still the one that is refused."""
+        rows = _a_rows(12)
+        rows += [_row(booking_id="DAY", booked_on="2024-01-28", arrival="2024-02-01",
+                      nights="0"),
+                 _row(booking_id="LATE", booked_on="2024-01-29", arrival="2024-02-01",
+                      nights="1")]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(12) | {"DAY"})
+        self.assertEqual(cut, {_feb(1): 1})
+
+
+class CappedReplay(unittest.TestCase):
+    """Both halves of the cap.  Either one alone leaves table 3 a null."""
+
+    CAP = 12
+    NIGHT = dt.date(2024, 2, 1)
+    LAST = dt.date(2024, 2, 28)
+
+    def setUp(self):
+        rows = [_row(booking_id="A%02d" % i, booked_on="2024-01-%02d" % (i + 1),
+                     arrival="2024-02-01", nights="1") for i in range(14)]
+        self.res = ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
+        self.kept, self.cut = holdout.cut_history(self.res.bookings, self.CAP,
+                                                  "sell_until_full", self.LAST)
+
+    def tearDown(self):
+        _reset_config()
+
+    def _capped(self, bookings, rep=None):
+        return holdout.capped_ledger(bookings, self.res.hotel, self.CAP,
+                                     self.NIGHT, self.LAST, rep)
+
+    def test_the_cut_history_is_replayed_into_a_hotel_of_the_cap_s_size(self):
+        led, capped = self._capped(self.kept)
+        self.assertEqual(capped.rooms, self.CAP)
+        self.assertEqual(self.res.hotel.rooms, 20)      # the real hotel is untouched
+        self.assertEqual(capped.base_rate, self.res.hotel.base_rate)
+        self.assertIs(led.hotel, capped)
+        settled = led.settled[self.NIGHT]
+        self.assertEqual(settled["rooms_sold"], 12)
+        self.assertEqual(settled["occupancy"], 1.0)     # 0.6 in a house of twenty
+        self.assertEqual(settled["walked"], 0)
+
+    def test_a_capped_night_is_censored_only_because_the_hotel_is_the_cap(self):
+        """Twelve rooms sold is 0.97 of twelve and is not 0.97 of twenty.  The
+        same cut history replayed into the real room count is a history in
+        which nothing is censored and table 3 has nothing to score."""
+        led, capped = self._capped(self.kept)
+        self.assertAlmostEqual(capped.rooms * capped.sellout_threshold, 11.64)
+        self.assertEqual(led.settled[self.NIGHT]["rooms_sold"], 12)      # 12 >= 11.64
+        full = ingest.replay(self.kept, self.res.hotel, self.NIGHT, self.LAST,
+                             ingest.Report())
+        self.assertAlmostEqual(self.res.hotel.rooms * self.res.hotel.sellout_threshold, 19.4)
+        self.assertEqual(full.settled[self.NIGHT]["rooms_sold"], 12)     # 12 < 19.4
+
+    def test_without_the_cut_the_settlement_walks_the_excess_instead_of_refusing_it(self):
+        """Lowering the room count imposes no cap on its own: the replay books
+        every row and the settlement walks two guests off the actuals after the
+        fact, which is an edit to the hotel's own history, not a refusal."""
+        self.assertEqual(len(self.kept), 12)
+        self.assertEqual(self.cut, {self.NIGHT: 2})
+        rep = ingest.Report()
+        led, _capped = self._capped(self.res.bookings, rep)
+        self.assertEqual(led.settled[self.NIGHT]["walked"], 2)
+        self.assertEqual(rep.warnings["over_capacity_nights"], 1)
+        self.assertEqual(rep.warnings["rooms_walked_off_the_actuals"], 2)
+        cut_rep = ingest.Report()
+        cut_led, _capped = self._capped(self.kept, cut_rep)
+        self.assertEqual(cut_led.settled[self.NIGHT]["walked"], 0)
+        self.assertEqual(cut_rep.warnings["over_capacity_nights"], 0)
+
+
+class CleanNights(unittest.TestCase):
+    """Twenty rooms, so a threshold of 0.90 is eighteen of them."""
+
+    def tearDown(self):
+        _reset_config()
+
+    def _filler(self, days, skip=()):
+        return [_row(booking_id="Q%02d-%02d" % (day, i), arrival="2024-02-%02d" % day,
+                     nights="1")
+                for day in days if day not in skip for i in range(2)]
+
+    def _load(self, rows):
+        return ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
+
+    def test_the_window_takes_the_neighbours_of_a_full_night_out_with_it(self):
+        """The 10th reaches nineteen rooms.  With a window of three the 7th to
+        the 13th all go, because a stay spanning the 10th is refused for every
+        night it covers and none of those nights has a known answer either."""
+        rows = [_row(booking_id="F%02d" % i, arrival="2024-02-10", nights="1")
+                for i in range(19)]
+        rows += self._filler(range(1, 21), skip=(10,))
+        res = self._load(rows)
+        clean = holdout.clean_nights(res.bookings, res.hotel, _feb(1), _feb(20),
+                                     threshold=0.90, window=3)
+        self.assertEqual(clean, [_feb(d) for d in list(range(1, 7)) + list(range(14, 21))])
+
+    def test_a_night_full_only_thanks_to_comp_rooms_is_not_clean(self):
+        """Sixteen sold and three comped is nineteen rooms in the house and
+        sixteen in the ledger.  Read off the ledger the night looks quiet, and
+        the guest turned away on it still went elsewhere."""
+        rows = [_row(booking_id="S%02d" % i, arrival="2024-02-10", nights="1")
+                for i in range(16)]
+        rows += [_row(booking_id="C%d" % i, segment="COMP", rate="0",
+                      arrival="2024-02-10", nights="1") for i in range(3)]
+        rows += self._filler(range(1, 21), skip=(10,))
+        res = self._load(rows)
+        clean = holdout.clean_nights(res.bookings, res.hotel, _feb(1), _feb(20),
+                                     threshold=0.90, window=0)
+        self.assertEqual(clean, [_feb(d) for d in range(1, 21) if d != 10])
+
+    def test_a_full_night_past_the_last_one_offered_still_takes_its_neighbours(self):
+        """The 21st is full and is outside the window being offered.  A window
+        read only against the nights on offer would hand back the 19th and the
+        20th, and a three-night stay over the 21st covers both."""
+        rows = [_row(booking_id="F%02d" % i, arrival="2024-02-21", nights="1")
+                for i in range(19)]
+        rows += self._filler(range(1, 22), skip=(21,))
+        res = self._load(rows)
+        clean = holdout.clean_nights(res.bookings, res.hotel, _feb(1), _feb(20),
+                                     threshold=0.90, window=2)
+        self.assertEqual(clean, [_feb(d) for d in range(1, 19)])
+
+    def test_the_threshold_is_a_share_of_the_room_count_and_a_night_at_it_is_busy(self):
+        """Eighteen of twenty rooms is exactly nine tenths, so the night is
+        busy at 0.90 and quiet at 0.95, and the whole month turns over on
+        which of the two is asked for."""
+        rows = [_row(booking_id="F%02d" % i, arrival="2024-02-10", nights="1")
+                for i in range(18)]
+        rows += self._filler(range(1, 21), skip=(10,))
+        res = self._load(rows)
+        at_90 = holdout.clean_nights(res.bookings, res.hotel, _feb(1), _feb(20),
+                                     threshold=0.90, window=0)
+        at_95 = holdout.clean_nights(res.bookings, res.hotel, _feb(1), _feb(20),
+                                     threshold=0.95, window=0)
+        self.assertEqual(at_90, [_feb(d) for d in range(1, 21) if d != 10])
+        self.assertEqual(at_95, [_feb(d) for d in range(1, 21)])
