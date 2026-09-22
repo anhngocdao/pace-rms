@@ -2851,8 +2851,10 @@ class CutRules(unittest.TestCase):
         return ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
 
     def _cut(self, rows, rule, cap=None):
-        """Note the mark is never passed: every test below exercises the
-        module's own default, so moving MARK moves these answers."""
+        """Note the mark is never passed: every test that comes through here
+        exercises the module's own default, so moving MARK moves these
+        answers.  The one test that hands a share in calls `cut_history`
+        itself."""
         res = self._load(rows)
         kept, cut = holdout.cut_history(res.bookings, self.CAP if cap is None else cap,
                                         rule, self.LAST)
@@ -2940,6 +2942,24 @@ class CutRules(unittest.TestCase):
         self.assertEqual(kept, _a_ids(11) | {"C1", "LATE"})
         self.assertEqual(cut, {})
 
+    def test_a_room_given_back_this_morning_can_be_sold_this_afternoon(self):
+        """Eleven rooms, then a twelfth, C1, that cancels on 10 January, and
+        SAMEDAY entered on the 10th for the same night.  The day's
+        cancellations are applied before its bookings, so SAMEDAY finds C1's
+        room and the night loses nothing.  Given back only at the end of the
+        10th, the room is still held when SAMEDAY asks and SAMEDAY is refused.
+        The test above cannot tell the two apart, because its cancellation and
+        its next booking fall on different days."""
+        rows = _a_rows(11)
+        rows += [_row(booking_id="C1", booked_on="2024-01-02", arrival="2024-02-01",
+                      nights="1", status="cancelled", status_date="2024-01-10"),
+                 _row(booking_id="SAMEDAY", booked_on="2024-01-10", arrival="2024-02-01",
+                      nights="1")]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(11) | {"C1", "SAMEDAY"},
+                         "the room C1 gave back on the 10th was not for sale on the 10th")
+        self.assertEqual(cut, {})
+
     def test_a_refused_row_gives_nothing_back_when_its_cancel_date_arrives(self):
         """The cap was already full when C1 was entered, so C1 never held a
         room and its cancellation on 20 January frees none.  LATE is refused
@@ -2999,6 +3019,61 @@ class CutRules(unittest.TestCase):
         _res, kept, cut = self._cut(rows, "close_cheap_first")
         self.assertEqual(kept, _a_ids(5) | set("ACME%d" % i for i in range(3)))
         self.assertEqual(cut, {_feb(1): 3})
+
+    def test_group_rows_with_no_company_are_decided_one_room_at_a_time(self):
+        """Five rooms gone, then nine group rows with no company, all entered
+        on 2 January for one night on the 1st.  Nothing in them says they are
+        one booking, so each is its own decision: the first seven fill the cap
+        of twelve and the last two are refused.  Merged on the date they share
+        into one block of nine, they would be fourteen rooms against twelve
+        and all nine would go."""
+        rows = _a_rows(5)
+        rows += [_row(booking_id="G%d" % i, segment="GROUP", company="",
+                      booked_on="2024-01-02", arrival="2024-02-01", nights="1")
+                 for i in range(9)]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(5) | set("G%d" % i for i in range(7)),
+                         "group rows with no company were decided as one block")
+        self.assertEqual(cut, {_feb(1): 2})
+
+    def test_one_company_s_rooms_for_two_lengths_of_stay_are_two_decisions(self):
+        """Five rooms gone on the 1st, then ACME asks on one day for three
+        one-night rooms and three two-night rooms, all arriving on the 1st.
+        At the mark of 10.8 the one-night block fits at eight rooms and the
+        two-night block, eleven on the 1st, does not.  One block of six would
+        be eleven on the 1st and would keep none of them."""
+        rows = _a_rows(5)
+        rows += [_row(booking_id="ONE%d" % i, segment="GROUP", company="ACME",
+                      booked_on="2024-01-02", arrival="2024-02-01", nights="1")
+                 for i in range(3)]
+        rows += [_row(booking_id="TWO%d" % i, segment="GROUP", company="ACME",
+                      booked_on="2024-01-02", arrival="2024-02-01", nights="2")
+                 for i in range(3)]
+        _res, kept, cut = self._cut(rows, "close_cheap_first")
+        self.assertEqual(kept, _a_ids(5) | set("ONE%d" % i for i in range(3)),
+                         "one company's one-night and two-night rooms were one decision")
+        self.assertEqual(cut, {_feb(1): 3, _feb(2): 3})
+
+    def test_one_company_s_rooms_for_two_arrivals_are_two_decisions(self):
+        """Five rooms gone on the 1st and eight on the 2nd, then ACME asks on
+        one day for three one-night rooms on the 1st and three on the 2nd.  At
+        the mark of 10.8 the block for the 1st fits at eight rooms and the
+        block for the 2nd, eleven, does not.  One block of six would be
+        eleven on the 1st and would keep none of them."""
+        rows = _a_rows(5)
+        rows += [_row(booking_id="B%02d" % i, arrival="2024-02-02", nights="1")
+                 for i in range(8)]
+        rows += [_row(booking_id="FIRST%d" % i, segment="GROUP", company="ACME",
+                      booked_on="2024-01-02", arrival="2024-02-01", nights="1")
+                 for i in range(3)]
+        rows += [_row(booking_id="SECOND%d" % i, segment="GROUP", company="ACME",
+                      booked_on="2024-01-02", arrival="2024-02-02", nights="1")
+                 for i in range(3)]
+        _res, kept, cut = self._cut(rows, "close_cheap_first")
+        self.assertEqual(kept, _a_ids(5) | set("B%02d" % i for i in range(8))
+                         | set("FIRST%d" % i for i in range(3)),
+                         "one company's rooms for the 1st and the 2nd were one decision")
+        self.assertEqual(cut, {_feb(2): 3})
 
     # --------------------------------------------------------- close cheap first
 
@@ -3067,6 +3142,28 @@ class CutRules(unittest.TestCase):
         self.assertEqual(kept, _a_ids(18))
         self.assertEqual(cut, {_feb(1): 1})
 
+    def test_a_share_handed_in_moves_the_mark_and_the_default_does_not_stand_in_for_it(self):
+        """Every other test here runs the default mark.  Ten rooms gone, the
+        tour operator row is the eleventh and crosses 10.8; handed a share of
+        one, the mark is the cap itself and the same row is taken.  Five rooms
+        gone, the row is the sixth and sits under 10.8; handed a share of 0.4,
+        the mark is 4.8 and the row is refused."""
+        tour = [_row(booking_id="TO", segment="OFFLINE_TO_TRANSIENT", booked_on="2024-01-05",
+                     arrival="2024-02-01", nights="1")]
+
+        def cut(committed, **share):
+            res = self._load(_a_rows(committed) + tour)
+            kept, lost = holdout.cut_history(res.bookings, self.CAP, "close_cheap_first",
+                                             self.LAST, **share)
+            return set(b.booking_id for b in kept), lost
+
+        self.assertEqual(cut(10), (_a_ids(10), {_feb(1): 1}))
+        self.assertEqual(cut(10, mark_share=1.0), (_a_ids(10) | {"TO"}, {}),
+                         "a share of one did not move the mark up to the cap")
+        self.assertEqual(cut(5), (_a_ids(5) | {"TO"}, {}))
+        self.assertEqual(cut(5, mark_share=0.4), (_a_ids(5), {_feb(1): 1}),
+                         "a share of 0.4 did not move the mark down to 4.8 rooms")
+
     # ----------------------------------------------- rows outside the cap
 
     def test_a_comp_room_entered_after_the_cap_overshoots_and_is_not_cut(self):
@@ -3093,6 +3190,125 @@ class CutRules(unittest.TestCase):
         _res, kept, cut = self._cut(rows, "sell_until_full")
         self.assertEqual(kept, _a_ids(12) | {"DAY"})
         self.assertEqual(cut, {_feb(1): 1})
+
+    # ---------------------------------------------------------- the arguments
+
+    def test_a_generator_is_cut_exactly_as_the_list_it_yields(self):
+        """`cut_history` reads its rows more than once and finds the refusals
+        by identity.  A version that did not take a generator into a list
+        first would empty it on the first pass and hand back no rows at all,
+        and the cut beside that empty answer would still look right."""
+        rows = [_row(booking_id="A%02d" % i, booked_on="2024-01-%02d" % (i + 1),
+                     arrival="2024-02-01", nights="1") for i in range(14)]
+        res = self._load(rows)
+        kept, cut = holdout.cut_history(res.bookings, self.CAP, "sell_until_full", self.LAST)
+        gen_kept, gen_cut = holdout.cut_history((b for b in res.bookings), self.CAP,
+                                                "sell_until_full", self.LAST)
+        self.assertEqual([b.booking_id for b in kept], ["A%02d" % i for i in range(12)])
+        self.assertEqual(cut, {_feb(1): 2})
+        self.assertEqual([id(b) for b in gen_kept], [id(b) for b in kept],
+                         "a generator came back with different rows from its list")
+        self.assertEqual(gen_cut, {_feb(1): 2})
+
+    def test_a_row_booked_after_the_last_stay_night_is_still_decided(self):
+        """The loop runs to the last booking day when that is later than
+        `last_stay`.  A row entered on 1 March for a night in March is past
+        the 28 February handed in; stopping the loop there would leave it
+        undecided and drop it from `kept`, and the caller would lose a row the
+        cap never refused."""
+        rows = _a_rows(3) + [_row(booking_id="MARCH", booked_on="2024-03-01",
+                                  arrival="2024-03-05", nights="1")]
+        _res, kept, cut = self._cut(rows, "sell_until_full")
+        self.assertEqual(kept, _a_ids(3) | {"MARCH"},
+                         "a row booked after last_stay was dropped without being refused")
+        self.assertEqual(cut, {})
+
+
+class NetCut(unittest.TestCase):
+    """`net_cut` against the lead-0 snapshot it says it is on the scale of.
+
+    The same twelve-room cap as above.  Twelve single nights on 1 February fill
+    it, and every row after them is refused: a two-night stay, a one-night
+    stay, a cancelled three-night stay, a one-night no-show, a three-night
+    no-show arriving on the 1st, and a three-night no-show that arrived on 30
+    January, before the window opens.
+
+    The two multi-night no-shows are the point of the fixture.  The replay
+    snapshots a night and then settles it, and settlement releases a no-show
+    from its arrival night onward, so the one arriving on the 1st stands in the
+    lead-0 snapshot of the 1st and of no later night.  The one arriving on the
+    30th is never settled, because the replay settles only nights from the
+    window's first, so it is never released and stands in the snapshot of the
+    1st, the only one of its three nights the window holds.
+
+    Each wrong version of the rule fails here for its own reason.  Counting
+    every night of a no-show reports the 1st's arrival on the 2nd and 3rd too.
+    Counting only a no-show's arrival night loses the early one from the 1st.
+    Not clipping to the window reports the 30th and the 31st, nights no
+    snapshot exists for.
+    """
+
+    CAP = 12
+    FIRST = dt.date(2024, 2, 1)
+    LAST = dt.date(2024, 2, 28)
+
+    def setUp(self):
+        rows = _a_rows(12)
+        rows += [_row(booking_id="STAY2", booked_on="2024-01-05", arrival="2024-02-01",
+                      nights="2"),
+                 _row(booking_id="STAY1", booked_on="2024-01-05", arrival="2024-02-01",
+                      nights="1"),
+                 _row(booking_id="CANC3", booked_on="2024-01-05", arrival="2024-02-01",
+                      nights="3", status="cancelled", status_date="2024-01-20"),
+                 _row(booking_id="NOSHOW", booked_on="2024-01-05", arrival="2024-02-01",
+                      nights="1", status="no_show"),
+                 _row(booking_id="NOSHOW3", booked_on="2024-01-05", arrival="2024-02-01",
+                      nights="3", status="no_show"),
+                 _row(booking_id="EARLYNS", booked_on="2024-01-05", arrival="2024-01-30",
+                      nights="3", status="no_show")]
+        self.res = ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
+        self.kept, self.cut = holdout.cut_history(self.res.bookings, self.CAP,
+                                                  "sell_until_full", self.LAST)
+
+    def tearDown(self):
+        _reset_config()
+
+    def test_the_fixture_refuses_all_six(self):
+        """Every row after the twelve is refused, on every night it covers,
+        because each of them needs the 1st and the 1st is full."""
+        self.assertEqual(set(b.booking_id for b in self.kept), _a_ids(12))
+        self.assertEqual(self.cut, {dt.date(2024, 1, 30): 1, dt.date(2024, 1, 31): 1,
+                                    _feb(1): 6, _feb(2): 3, _feb(3): 2})
+
+    def test_the_net_cut_counts_each_refusal_where_the_snapshot_would_have(self):
+        """The 1st: the two stays, the one-night no-show, the three-night
+        no-show on its arrival night, and the early no-show that was never
+        released, five.  The 2nd: the two-night stay, one.  The 3rd: nothing,
+        because the three-night no-show was released on the 1st.  The cancelled
+        stay is on no night at all, and nothing is reported before the 1st."""
+        self.assertEqual(holdout.net_cut(self.res.bookings, self.kept, self.FIRST, self.LAST),
+                         {_feb(1): 5, _feb(2): 1},
+                         "a refused no-show or a refused cancellation was counted on the wrong nights")
+
+    def test_the_net_cut_is_the_gap_between_the_two_lead_0_snapshots(self):
+        """The whole history replayed into the real hotel, less the cut
+        history replayed into the capped one, night by night at lead 0.  This
+        is the oracle: it reads the replay itself rather than a restatement of
+        the rule, so it holds `net_cut` to whatever the replay actually does."""
+        full = ingest.replay(self.res.bookings, self.res.hotel, self.FIRST, self.LAST,
+                             ingest.Report())
+        capped, _hotel = holdout.capped_ledger(self.kept, self.res.hotel, self.CAP,
+                                               self.FIRST, self.LAST)
+        self.assertEqual(full.snapshots[self.FIRST][0], 17)
+        self.assertEqual(capped.snapshots[self.FIRST][0], 12)
+        gap = {}
+        d = self.FIRST
+        while d <= self.LAST:
+            n = full.snapshots[d][0] - capped.snapshots[d][0]
+            if n:
+                gap[d] = n
+            d += dt.timedelta(days=1)
+        self.assertEqual(holdout.net_cut(self.res.bookings, self.kept, self.FIRST, self.LAST), gap)
 
 
 class CappedReplay(unittest.TestCase):
@@ -3128,16 +3344,37 @@ class CappedReplay(unittest.TestCase):
         self.assertEqual(settled["walked"], 0)
 
     def test_a_capped_night_is_censored_only_because_the_hotel_is_the_cap(self):
-        """Twelve rooms sold is 0.97 of twelve and is not 0.97 of twenty.  The
-        same cut history replayed into the real room count is a history in
-        which nothing is censored and table 3 has nothing to score."""
+        """`unconstrain.class_demand` marks a night censored when its lead-0
+        snapshot reaches `rooms * sellout_threshold` of the Hotel it is handed,
+        or when the ledger logged a denial for it, and a replay logs none.
+        Twelve rooms on the books at lead 0 is past 0.97 of twelve and short of
+        0.97 of twenty, so the one cut history is censored in the hotel of the
+        cap's size and uncensored in the real one, where table 3 would have
+        nothing to score.  The flag is read off `class_demand` itself, not
+        restated here."""
+        from pace.calendar import EventCalendar
+        from pace.otb import GLOBAL_KEY
+        from pace.unconstrain import class_demand
+
+        class AtTheReferenceRate:
+            """Acceptance of one: the price restatement moves the observed
+            value and never the censoring flag, which is all this reads."""
+            def accept(self, code, rate, ref):
+                return 1.0
+
         led, capped = self._capped(self.kept)
-        self.assertAlmostEqual(capped.rooms * capped.sellout_threshold, 11.64)
-        self.assertEqual(led.settled[self.NIGHT]["rooms_sold"], 12)      # 12 >= 11.64
         full = ingest.replay(self.kept, self.res.hotel, self.NIGHT, self.LAST,
                              ingest.Report())
-        self.assertAlmostEqual(self.res.hotel.rooms * self.res.hotel.sellout_threshold, 19.4)
-        self.assertEqual(full.settled[self.NIGHT]["rooms_sold"], 12)     # 12 < 19.4
+        for ledger in (led, full):
+            self.assertEqual(ledger.snapshots[self.NIGHT][0], 12)
+            self.assertEqual(ledger.observable_denials(self.NIGHT), 0)
+        in_the_cap = class_demand(led, [self.NIGHT], capped, EventCalendar(),
+                                  AtTheReferenceRate())
+        in_the_real_hotel = class_demand(full, [self.NIGHT], self.res.hotel, EventCalendar(),
+                                         AtTheReferenceRate())
+        self.assertEqual(in_the_cap.censored[GLOBAL_KEY], 1,
+                         "the unconstrainer did not see a night at the cap as censored")
+        self.assertEqual(in_the_real_hotel.censored[GLOBAL_KEY], 0)
 
     def test_without_the_cut_the_settlement_walks_the_excess_instead_of_refusing_it(self):
         """Lowering the room count imposes no cap on its own: the replay books

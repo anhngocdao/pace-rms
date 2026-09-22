@@ -110,6 +110,13 @@ percentile of nights, come to 50, 99 and 115 at H1 and 158, 185 and 236 at H2
 for the three clean thresholds. The design's three cut-size buckets can come
 back empty.
 
+Corrected 22 September 2026, when table 3's cut was built and the counts were
+measured again. Those six numbers are right for every night the export covers,
+806 at H1 and 803 at H2. Table 3 runs on the trimmed stay window instead, the
+one `pilot.stay_window` returns, and over that window the counts are 45, 94 and
+109 at H1 and 144, 171 and 222 at H2. The survey's window, not its arithmetic,
+is what differs.
+
 ## Measured costs
 
 | Step | H1 | H2 |
