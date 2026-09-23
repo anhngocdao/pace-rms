@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import tempfile
@@ -1568,6 +1569,14 @@ class PreRegistration(unittest.TestCase):
         self.assertEqual(holdout.MARK, self.settings["close_cheap_first_mark"])
         self.assertEqual(holdout.MARK, 0.90)
 
+    def test_the_holdout_grid_is_the_pre_registered_one(self):
+        """The clean thresholds and the caps of table 3, copied into
+        pace/holdout.py for the same reason and checked the same way."""
+        self.assertEqual(list(holdout.THRESHOLDS), self.settings["holdout_clean_thresholds"])
+        self.assertEqual(list(holdout.CAPS), self.settings["holdout_caps"])
+        self.assertEqual(holdout.THRESHOLDS, (0.80, 0.85, 0.90))
+        self.assertEqual(holdout.CAPS, (0.60, 0.70, 0.80))
+
     def test_the_basket_trim_is_the_pre_registered_one(self):
         self.assertEqual(list(ratecheck.TRIM), self.settings["basket_trim_percentiles"])
         self.assertEqual(ratecheck.TRIM, (0.01, 0.99))
@@ -1627,7 +1636,7 @@ class RunOne(unittest.TestCase):
                                   score_first=SCORE_FIRST,
                                   score_last=SCORE_FIRST + dt.timedelta(days=cls.QUICK_NIGHTS - 1),
                                   warmup_end=SCORE_FIRST - dt.timedelta(days=1),
-                                  label="quick")
+                                  label="quick", with_holdout=False)
         with open(cls.written, "rb") as fh:
             cls.on_disk_after_quick = fh.read()
         with open(cls.written, encoding="utf-8") as fh:
@@ -1839,8 +1848,29 @@ class RunOne(unittest.TestCase):
         self.assertAlmostEqual(gap["share_of_full_nights"],
                                gap["full_but_invisible"] / float(gap["physically_full"]))
 
-    def test_table_three_is_none_until_the_holdout_is_run(self):
-        self.assertIsNone(self.back["table3"])
+    def test_table_three_is_none_when_the_holdout_is_not_run(self):
+        self.assertIsNone(self.quick["table3"])
+        with open(os.path.join(self.out_dir, "pilot-pilot-quick.json"), encoding="utf-8") as fh:
+            self.assertIsNone(json.load(fh)["table3"])
+
+    def test_table_three_is_the_grid_over_this_run_s_stay_window(self):
+        """The grid run again here, on a ledger ingest builds over the stay
+        window the test works out for itself, with the neighbour window read
+        off the CSV: the 90th percentile of the nights of every row that
+        reaches the ledger.  The payload has to be that grid exactly."""
+        stays = sorted(int(r["nights"]) for r in _rows_that_reach_the_ledger(self.dicts))
+        window = int(pilot.percentile([float(n) for n in stays], 0.90))
+        self.assertEqual(window, 2)
+        self.assertEqual(self.back["table3"]["window"], window)
+        first_stay = dt.date.fromisoformat(self.back["windows"]["first_stay"])
+        self.assertEqual(first_stay, FIRST_ARRIVAL + dt.timedelta(days=int(pilot.percentile(
+            [float(n) for n in stays], 0.99))))
+        res = ingest.load(self.csv_path, FIXTURE_HOTEL, seed=1,
+                          first_stay=first_stay, last_stay=SCORE_LAST)
+        grid = holdout.run_grid(res.bookings, res.hotel, res.ledger, first_stay, SCORE_LAST,
+                                window)
+        self.assertEqual(self.back["table3"], json.loads(json.dumps(grid)))
+        self.assertEqual(len(self.back["table3"]["combos"]), 24)
 
     def test_table_two_was_handed_this_run_s_own_window_and_hotel(self):
         """Every number here is worked out from the CSV or from
@@ -2118,6 +2148,7 @@ class Switchboard(unittest.TestCase):
         self.assertEqual(seen["kw"]["score_first"], pilot.SCORE_FIRST)
         self.assertEqual(seen["kw"]["score_last"], pilot.SCORE_LAST)
         self.assertEqual(seen["kw"]["label"], "")
+        self.assertIs(seen["kw"]["with_holdout"], True)
 
     def test_quick_moves_the_far_end_of_the_window_and_labels_the_run(self):
         """--quick is a wiring check, not a result.  It shortens the window
@@ -2154,6 +2185,8 @@ class Switchboard(unittest.TestCase):
         self.assertEqual(seen["settings"], "/tmp/s.json")
         self.assertEqual(seen["kw"]["label"], "quick")
         self.assertEqual(seen["kw"]["score_last"], pilot.SCORE_FIRST + dt.timedelta(days=61))
+        # --quick is a wiring check and skips the 24 cut replays of table 3.
+        self.assertIs(seen["kw"]["with_holdout"], False)
 
     def test_what_it_prints_says_which_population_each_share_is_of(self):
         """25 of 86 full nights is 29 percent of the full nights and 6 percent
@@ -3459,3 +3492,494 @@ class CleanNights(unittest.TestCase):
                                      threshold=0.95, window=0)
         self.assertEqual(at_90, [_feb(d) for d in range(1, 21) if d != 10])
         self.assertEqual(at_95, [_feb(d) for d in range(1, 21)])
+
+
+# ------------------------------------------------------------------ table 3
+
+T3_FIRST = dt.date(2024, 1, 29)
+T3_LAST = dt.date(2024, 2, 14)
+T3_EARLY = "2024-01-31"
+T3_LATE = "2024-02-01"
+
+
+def _t3_singles(day, n, prefix, booked_on=T3_EARLY, **kw):
+    return [_row(booking_id="%s%02d" % (prefix, i), booked_on=booked_on,
+                 arrival="2024-02-%02d" % day, nights="1", **kw) for i in range(n)]
+
+
+def _t3_rows():
+    """Seventeen nights in a twenty-room hotel, cut to twelve rooms.
+
+    Every row is booked on 31 January or 1 February.  The replay opens on the
+    first booking day, so 29 and 30 January are settled with nothing in them
+    and have no lead-0 snapshot at all, while 31 January has one of nought.
+
+    Night by night, with the capped history's settled figure and lead-0
+    snapshot, and 11.64 rooms the capped hotel's censoring line:
+
+    - 2 Feb, eight singles and a two-night stay over the 2nd and 3rd booked a
+      day later.  The 3rd is full by then, so the stay is refused whole: the
+      2nd sold 9 and keeps 8.  Cut, and not censored: its estimate is its
+      observation and its error is the one room the cut took.
+    - 3 Feb, three corporate and twelve retail singles.  Twelve are kept,
+      three corporate and nine retail, and the refused stay was on it too: 16
+      sold, 12 kept, censored.
+    - 4 Feb, twelve singles, one of them a no-show, then a single and a
+      cancelled two-night stay over the 4th and 5th booked a day later and
+      both refused.  The real night settles at 12.  The capped night has 12 in
+      its lead-0 snapshot and 11 once the no-show has gone: censored by the
+      snapshot, which is class_demand's flag, and not by the settled figure.
+    - 5 Feb, six singles.  The cancelled stay was refused on it, so the gross
+      cut touches it, and nothing it would have sold was lost.
+    - 9 Feb, nineteen singles: over 0.90 of twenty, so it and its neighbours
+      inside a window of one, the 8th and the 10th, are not clean.  The 10th
+      is fifteen singles cut to twelve, the same shape as the 3rd, and is
+      scored only if the window is dropped.
+    - every other night a handful of singles, never cut.
+    """
+    rows = []
+    rows += _t3_singles(1, 5, "D01-")
+    rows += _t3_singles(2, 8, "D02-")
+    rows += _t3_singles(3, 3, "D03C", segment="CORP", rate="96")
+    rows += _t3_singles(3, 12, "D03-")
+    rows += _t3_singles(4, 1, "D04N", status="no_show")
+    rows += _t3_singles(4, 11, "D04-")
+    for day, n in ((5, 6), (6, 7), (7, 4), (8, 10), (9, 19), (10, 15), (11, 6),
+                   (12, 5), (13, 9), (14, 3)):
+        rows += _t3_singles(day, n, "D%02d-" % day)
+    rows += [_row(booking_id="SPAN2", booked_on=T3_LATE, arrival="2024-02-02", nights="2"),
+             _row(booking_id="LATE4", booked_on=T3_LATE, arrival="2024-02-04", nights="1"),
+             _row(booking_id="CANC4", booked_on=T3_LATE, arrival="2024-02-04", nights="2",
+                  status="cancelled", status_date="2024-02-02")]
+    return rows
+
+
+# The capped history as class_demand sees it, worked out by hand from the
+# rows above: (rooms sold, censored) for every night with a lead-0 snapshot,
+# in date order.  The 4th sold 11 and is censored, because its snapshot held
+# 12.  Every night is here, clean or not, because the unconstrainer is handed
+# the whole cut history.
+T3_SAMPLE = [(0.0, False), (5.0, False), (8.0, False), (12.0, True), (11.0, True),
+             (6.0, False), (7.0, False), (4.0, False), (10.0, False), (12.0, True),
+             (12.0, True), (6.0, False), (5.0, False), (9.0, False), (3.0, False)]
+T3_SAMPLE_NIGHTS = [dt.date(2024, 1, 31)] + [_feb(d) for d in range(1, 15)]
+
+
+class PerNightDemand(unittest.TestCase):
+    def tearDown(self):
+        _reset_config()
+
+    def _capped(self, rows, cap=12):
+        res = ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
+        kept, _cut = holdout.cut_history(res.bookings, cap, "sell_until_full",
+                                         dt.date(2024, 4, 30))
+        led, capped = holdout.capped_ledger(kept, res.hotel, cap,
+                                            dt.date(2024, 2, 1), dt.date(2024, 4, 30),
+                                            snapshot_horizon=0)
+        return res, led, capped
+
+    def _rows(self, rate="120"):
+        """Sixty nights from Thursday 1 February: every Monday and Tuesday
+        fourteen rooms, every other night six.  Cut to twelve, so eight
+        Mondays and eight Tuesdays sit at the cap and are censored, and every
+        other night is left open."""
+        rows = []
+        for day in range(60):
+            d = dt.date(2024, 2, 1) + dt.timedelta(days=day)
+            sold = 14 if day % 7 in (4, 5) else 6
+            for i in range(sold):
+                rows.append(_row(booking_id="R%03d%02d" % (day, i),
+                                 booked_on=(d - dt.timedelta(days=20)).isoformat(),
+                                 arrival=d.isoformat(), nights="1", rate=rate))
+        return rows
+
+    def test_an_uncensored_night_is_left_alone(self):
+        _res, led, capped = self._capped(self._rows())
+        nights = sorted(led.settled)
+        est = holdout.per_night_demand(led, capped, nights)
+        quiet = [d for d in nights if d.month in (2, 3) and led.settled[d]["rooms_sold"] == 6]
+        self.assertEqual(len(quiet), 44)
+        for d in quiet:
+            self.assertEqual(est[d], 6.0)
+
+    def test_a_censored_night_is_lifted_by_its_own_class_once_the_class_has_eight(self):
+        """Each of the two full weekdays is a class of exactly eight nights,
+        all at twelve and all censored, which is MIN_CLASS_OBS: the class is
+        trusted and the house series is not consulted.  With no open night in
+        the class, project_detruncate starts from mean 12 and deviation 1, so
+        its first pass lifts every night to the mean of a normal above its own
+        mean, 12 + sqrt(2/pi), and the deviation of eight equal values is 0,
+        which holds it there.  Read off the house series instead, the 44 open
+        sixes and April's thirty empty nights would pull it somewhere else."""
+        _res, led, capped = self._capped(self._rows())
+        nights = sorted(led.settled)
+        est = holdout.per_night_demand(led, capped, nights)
+        full = [d for d in nights if led.settled[d]["rooms_sold"] == 12]
+        self.assertEqual([d.weekday() for d in full], [0, 1] * 8)
+        for d in full:
+            self.assertEqual(led.snapshots[d][0], 12)
+            self.assertAlmostEqual(est[d], 12.0 + math.sqrt(2.0 / math.pi), places=9)
+
+    def test_the_estimate_does_not_move_when_the_rates_move(self):
+        """The price term is out. class_demand divides each segment by its
+        acceptance at the rate charged, which is exactly what must not be
+        scored here."""
+        _r1, led_cheap, capped = self._capped(self._rows(rate="90"))
+        _r2, led_dear, _capped2 = self._capped(self._rows(rate="180"))
+        nights = sorted(led_cheap.settled)
+        cheap = holdout.per_night_demand(led_cheap, capped, nights)
+        dear = holdout.per_night_demand(led_dear, capped, nights)
+        self.assertEqual(sorted(cheap), sorted(dear))
+        self.assertEqual(len(cheap), len(nights))
+        for d in nights:
+            self.assertEqual(cheap[d], dear[d])
+
+    def test_the_capped_replay_settles_and_snapshots_lead_0_the_same_without_the_rest(self):
+        """The flag reads the lead-0 snapshot, so a thin replay has to agree
+        with a full one on that as well as on the settled figures.  The shared
+        synthetic history has cancellations on the booking day and later,
+        no-shows and multi-night stays, and 18 of its nights settle below
+        their lead-0 snapshot, so the snapshot is not the settled figure under
+        another name.  The replay snapshots every day from the first booking
+        day, 28 November, so there are lead-0 snapshots for 34 days before the
+        window opens as well as for its 120 nights."""
+        res = ingest.load(_csv(history_rows(FIRST_ARRIVAL, 120)), FIXTURE_HOTEL, seed=1)
+        last = FIRST_ARRIVAL + dt.timedelta(days=119)
+        kept, _ = holdout.cut_history(res.bookings, 12, "sell_until_full", last)
+        thin, thin_hotel = holdout.capped_ledger(kept, res.hotel, 12, FIRST_ARRIVAL, last,
+                                                 snapshot_horizon=0)
+        thick, thick_hotel = holdout.capped_ledger(kept, res.hotel, 12, FIRST_ARRIVAL, last,
+                                                   snapshot_horizon=res.hotel.max_lead)
+        self.assertEqual((thin_hotel.max_lead, thick_hotel.max_lead), (0, 40))
+        self.assertEqual({d: r["rooms_sold"] for d, r in thin.settled.items()},
+                         {d: r["rooms_sold"] for d, r in thick.settled.items()})
+        lead0 = dict((d, s[0]) for d, s in thin.snapshots.items() if 0 in s)
+        self.assertEqual(lead0, dict((d, s[0]) for d, s in thick.snapshots.items() if 0 in s))
+        self.assertEqual((min(lead0), len(lead0)), (dt.date(2023, 11, 28), 154))
+        self.assertEqual(set(len(s) for s in thin.snapshots.values()), {1})
+        self.assertEqual(sum(1 for d, r in thin.settled.items() if r["rooms_sold"] < lead0[d]),
+                         18)
+
+    def test_left_out_the_horizon_is_the_hotel_s_own_as_it_was_before_table_3(self):
+        res = ingest.load(_csv(self._rows()), FIXTURE_HOTEL, seed=1)
+        kept, _ = holdout.cut_history(res.bookings, 12, "sell_until_full", dt.date(2024, 4, 30))
+        led, capped = holdout.capped_ledger(kept, res.hotel, 12, dt.date(2024, 2, 1),
+                                            dt.date(2024, 4, 30))
+        self.assertEqual(capped.max_lead, 40)
+        self.assertEqual(sorted(led.snapshots[dt.date(2024, 3, 1)]), list(range(0, 41)))
+
+
+class Table3Night(unittest.TestCase):
+    """One combination scored by hand: threshold 0.90, cap 0.60, sell until
+    full, window 1, over the seventeen nights of `_t3_rows`."""
+
+    def setUp(self):
+        self.res = ingest.load(_csv(_t3_rows()), FIXTURE_HOTEL, seed=1,
+                               first_stay=T3_FIRST, last_stay=T3_LAST)
+        self.kept, self.cut = holdout.cut_history(self.res.bookings, 12, "sell_until_full",
+                                                  T3_LAST)
+        self.led, self.capped = holdout.capped_ledger(self.kept, self.res.hotel, 12,
+                                                      T3_FIRST, T3_LAST, snapshot_horizon=0)
+        from pace.unconstrain import project_detruncate
+        _mu, _sigma, imputed = project_detruncate(T3_SAMPLE)
+        self.expected = dict(zip(T3_SAMPLE_NIGHTS, imputed))
+
+    def tearDown(self):
+        _reset_config()
+
+    def _combo(self, window=1):
+        return holdout.score_combo(self.res.bookings, self.res.hotel, self.res.ledger,
+                                   T3_FIRST, T3_LAST, 0.90, 0.60, "sell_until_full", window)
+
+    def test_the_fixture_is_the_one_described(self):
+        self.assertEqual(self.capped.rooms, 12)
+        self.assertEqual({d: self.res.ledger.settled[d]["rooms_sold"]
+                          for d in (_feb(2), _feb(3), _feb(4), _feb(5), _feb(9), _feb(10))},
+                         {_feb(2): 9, _feb(3): 16, _feb(4): 12, _feb(5): 6, _feb(9): 19,
+                          _feb(10): 15})
+        self.assertEqual(self.led.settled[_feb(4)]["rooms_sold"], 11)
+        self.assertEqual(self.led.snapshots[_feb(4)][0], 12)
+        self.assertEqual(self.led.seg_rooms[_feb(3)]["CORP"], 3)
+        self.assertEqual(self.led.seg_rooms[_feb(3)]["RETAIL"], 9)
+        self.assertNotIn(dt.date(2024, 1, 30), self.led.snapshots)
+        self.assertEqual(self.led.snapshots[dt.date(2024, 1, 31)], {0: 0})
+        self.assertEqual(self.cut, {_feb(2): 1, _feb(3): 4, _feb(4): 2, _feb(5): 1,
+                                    _feb(9): 7, _feb(10): 3})
+
+    def test_the_observation_is_what_sold_and_the_flag_is_the_lead_0_snapshot_s(self):
+        nights = sorted(self.led.settled)
+        seen = holdout.observations(self.led, self.capped, nights)
+        self.assertEqual([seen[d] for d in sorted(seen)], T3_SAMPLE)
+        self.assertEqual(sorted(seen), T3_SAMPLE_NIGHTS)
+
+    def test_a_logged_denial_is_demand_seen_and_censors_the_night(self):
+        """class_demand adds the denials it could log to the observation and
+        treats any of them as censoring.  A replay logs none, so this one is
+        entered by hand on a night far below the line."""
+        self.led.deny(_feb(1), ingest._Req(0, "RETAIL", 2, _feb(7), 1), "capacity")
+        seen = holdout.observations(self.led, self.capped, [_feb(6), _feb(7)])
+        self.assertEqual(seen, {_feb(6): (7.0, False), _feb(7): (6.0, True)})
+
+    def test_every_night_of_the_cut_history_is_in_the_sample_and_none_without_a_snapshot(self):
+        nights = sorted(self.led.settled)
+        est = holdout.per_night_demand(self.led, self.capped, nights)
+        self.assertEqual(sorted(est), T3_SAMPLE_NIGHTS)
+        for d in T3_SAMPLE_NIGHTS:
+            self.assertAlmostEqual(est[d], self.expected[d], places=9)
+        self.assertEqual(est[_feb(2)], 8.0)
+        self.assertEqual(est[dt.date(2024, 1, 31)], 0.0)
+
+    def test_a_settled_night_the_snapshot_cannot_speak_for_is_left_out(self):
+        """`class_demand` skips a night with no lead-0 snapshot rather than
+        reading the settled figure in its place, and so does this.
+
+        Both of its guards are unreachable through `capped_ledger`, because the
+        replay writes a lead-0 snapshot on every day it walks, so this is the
+        only way to reach them: one night is handed over with a snapshot that
+        holds a deeper lead and no lead 0, another with no snapshot at all.
+        They are kept because `observations` takes a ledger rather than a
+        replay, and a caller that builds one another way would otherwise have a
+        night scored off a figure the unconstrainer never reads.
+        """
+        nights = sorted(self.led.settled)
+        before = holdout.observations(self.led, self.capped, nights)
+        self.assertIn(_feb(3), before)
+        self.assertIn(_feb(4), before)
+        self.led.snapshots[_feb(3)] = {1: 12}      # snapshotted, but never at lead 0
+        self.led.snapshots[_feb(4)] = {}           # never snapshotted at all
+        after = holdout.observations(self.led, self.capped, nights)
+        self.assertNotIn(_feb(3), after)
+        self.assertNotIn(_feb(4), after)
+        self.assertEqual(sorted(after),
+                         [d for d in sorted(before) if d not in (_feb(3), _feb(4))])
+        self.assertEqual(sorted(holdout.per_night_demand(self.led, self.capped, nights)),
+                         [d for d in T3_SAMPLE_NIGHTS if d not in (_feb(3), _feb(4))])
+
+    def test_every_scored_night_carries_the_capped_ledger_s_flag(self):
+        combo = self._combo()
+        got = [(r["date"], r["known"], r["capped"], r["censored"], r["cut_rooms"], r["bucket"])
+               for r in combo["nights"]]
+        self.assertEqual(got, [
+            ("2024-02-02", 9.0, 8.0, False, 1.0, holdout.BUCKETS[1]),
+            ("2024-02-03", 16.0, 12.0, True, 4.0, holdout.BUCKETS[2]),
+            ("2024-02-04", 12.0, 11.0, True, 1.0, holdout.BUCKETS[1]),
+        ])
+        by_date = dict((r["date"], r) for r in combo["nights"])
+        self.assertEqual(by_date["2024-02-02"]["estimate"], 8.0)
+        self.assertAlmostEqual(by_date["2024-02-03"]["estimate"], self.expected[_feb(3)], places=9)
+        self.assertAlmostEqual(by_date["2024-02-04"]["estimate"], self.expected[_feb(4)], places=9)
+
+    def test_the_counts_beside_the_cell(self):
+        """Fourteen clean nights: the 29th to the 7th and the 11th to the
+        14th.  Two of them censored in the capped history, the 3rd and the
+        4th.  Three lost rooms on the settled figure, the 2nd to the 4th; the
+        5th was reached by the gross cut and lost nothing.  Eighteen room
+        nights refused gross, cancellations and the busy nights included."""
+        combo = self._combo()
+        self.assertEqual(
+            dict((k, combo[k]) for k in ("clean_nights", "censored_clean", "cut_nights",
+                                         "cut_room_nights_gross", "scored",
+                                         "censored_scored", "uncensored_scored", "cap_rooms")),
+            {"clean_nights": 14, "censored_clean": 2, "cut_nights": 3,
+             "cut_room_nights_gross": 18, "scored": 3, "censored_scored": 2,
+             "uncensored_scored": 1, "cap_rooms": 12})
+        self.assertEqual(combo["uncensored"], {"n": 1, "mean_rooms_cut": 1.0})
+
+    def test_the_unconstrainer_s_error_is_over_the_censored_nights_only(self):
+        e3, e4 = self.expected[_feb(3)], self.expected[_feb(4)]
+        overall = self._combo()["overall"]
+        self.assertEqual(overall["n"], 2)
+        self.assertAlmostEqual(overall["known"], 14.0, places=9)
+        self.assertAlmostEqual(overall["estimate"], (e3 + e4) / 2, places=9)
+        self.assertAlmostEqual(overall["mae"], (abs(e3 - 16) + abs(e4 - 12)) / 2, places=9)
+        self.assertAlmostEqual(overall["bias"], ((e3 - 16) + (e4 - 12)) / 2, places=9)
+
+    def test_the_buckets_hold_censored_nights_and_an_empty_one_prints_nothing(self):
+        e3, e4 = self.expected[_feb(3)], self.expected[_feb(4)]
+        buckets = self._combo()["buckets"]
+        self.assertEqual(sorted(buckets), sorted(holdout.BUCKETS))
+        under, mid, over = (buckets[b] for b in holdout.BUCKETS)
+        self.assertEqual((under["n"], under["mae"], under["known"], under["estimate"]),
+                         (0, None, None, None))
+        self.assertEqual(under["by_segment"]["RETAIL"], {"n": 0, "mae": None, "bias": None})
+        self.assertEqual((mid["n"], over["n"]), (1, 1))
+        self.assertAlmostEqual(mid["mae"], abs(e4 - 12), places=9)
+        self.assertAlmostEqual(over["mae"], abs(e3 - 16), places=9)
+
+    def test_the_segments_split_the_estimate_by_the_capped_mix(self):
+        """The 3rd kept three corporate rooms of twelve, so a quarter of its
+        estimate is corporate, against the three it really sold; the 4th is
+        all retail."""
+        e3, e4 = self.expected[_feb(3)], self.expected[_feb(4)]
+        seg = self._combo()["by_segment"]
+        self.assertEqual(seg["CORP"]["n"], 2)
+        self.assertAlmostEqual(seg["CORP"]["bias"], (e3 * 0.25 - 3) / 2, places=9)
+        self.assertAlmostEqual(seg["CORP"]["mae"], abs(e3 * 0.25 - 3) / 2, places=9)
+        self.assertAlmostEqual(seg["RETAIL"]["bias"], ((e3 * 0.75 - 13) + (e4 - 12)) / 2,
+                               places=9)
+        self.assertEqual(seg["OTA"], {"n": 2, "mae": 0.0, "bias": 0.0})
+
+    def test_the_grid_replays_without_the_snapshots_it_never_reads(self):
+        """The answer is the same at any horizon, which is what the test on
+        the thin replay proves, so only a spy can see the horizon asked for."""
+        seen = []
+        real = holdout.capped_ledger
+
+        def spy(*a, **kw):
+            seen.append(kw.get("snapshot_horizon"))
+            return real(*a, **kw)
+
+        holdout.capped_ledger = spy
+        try:
+            self._combo()
+        finally:
+            holdout.capped_ledger = real
+        self.assertEqual(seen, [0])
+
+    def test_the_neighbour_window_is_the_one_handed_in(self):
+        """Without it the 8th and the 10th come back clean and the 10th, cut
+        from fifteen to twelve, is scored and censored."""
+        combo = self._combo(window=0)
+        self.assertEqual((combo["clean_nights"], combo["censored_clean"],
+                          combo["censored_scored"]), (16, 3, 3))
+
+
+def _t3_blocks(n):
+    """`n` three-night blocks from 1 February: a night of eight singles, a
+    night of fifteen, a night of five, and a two-night stay over the first two
+    booked a day after everything else.  Cut to twelve, the second night is
+    censored and loses four rooms, the first loses the refused stay and is not
+    censored, and the third is untouched.  Every night is clean at 0.85 and
+    at 0.90 with no window, so a grid of those two thresholds and one cap
+    scores n censored and n uncensored nights per combination."""
+    rows = []
+    for i in range(n):
+        d0 = dt.date(2024, 2, 1) + dt.timedelta(days=3 * i)
+        for k, count in enumerate((8, 15, 5)):
+            d = d0 + dt.timedelta(days=k)
+            rows += [_row(booking_id="K%02d%d%02d" % (i, k, j), booked_on="2024-01-20",
+                          arrival=d.isoformat(), nights="1") for j in range(count)]
+        rows.append(_row(booking_id="K%02dspan" % i, booked_on="2024-01-21",
+                         arrival=d0.isoformat(), nights="2"))
+    return rows
+
+
+class Grid(unittest.TestCase):
+    def tearDown(self):
+        _reset_config()
+
+    def test_buckets_split_at_five_and_fifteen_percent(self):
+        self.assertEqual(holdout.bucket_of(0.0), holdout.BUCKETS[0])
+        self.assertEqual(holdout.bucket_of(0.0499), holdout.BUCKETS[0])
+        self.assertEqual(holdout.bucket_of(0.05), holdout.BUCKETS[1])
+        self.assertEqual(holdout.bucket_of(1 / 20.0), holdout.BUCKETS[1])
+        self.assertEqual(holdout.bucket_of(0.1499), holdout.BUCKETS[1])
+        self.assertEqual(holdout.bucket_of(0.15), holdout.BUCKETS[1])
+        self.assertEqual(holdout.bucket_of(3 / 20.0), holdout.BUCKETS[1])
+        self.assertEqual(holdout.bucket_of(0.1501), holdout.BUCKETS[2])
+        self.assertEqual(holdout.bucket_of(1.0), holdout.BUCKETS[2])
+
+    def _t3_grid(self, **kw):
+        res = ingest.load(_csv(_t3_rows()), FIXTURE_HOTEL, seed=1,
+                          first_stay=T3_FIRST, last_stay=T3_LAST)
+        return holdout.run_grid(res.bookings, res.hotel, res.ledger, T3_FIRST, T3_LAST,
+                                window=1, **kw)
+
+    def test_only_caps_below_the_threshold_are_run(self):
+        grid = self._t3_grid()
+        seen = collections.Counter((c["threshold"], c["cap"]) for c in grid["combos"])
+        self.assertEqual(seen, collections.Counter(dict(
+            ((t, c), 3) for t, c in ((0.80, 0.60), (0.80, 0.70), (0.85, 0.60), (0.85, 0.70),
+                                     (0.85, 0.80), (0.90, 0.60), (0.90, 0.70), (0.90, 0.80)))))
+        self.assertEqual(len(grid["combos"]), 24)
+        self.assertEqual([c["rule"] for c in grid["combos"][:3]], list(holdout.RULES))
+
+    def test_an_empty_bucket_prints_zero_and_is_never_merged(self):
+        grid = self._t3_grid()
+        for combo in grid["combos"]:
+            self.assertEqual(sorted(combo["buckets"]), sorted(holdout.BUCKETS))
+            for name, block in combo["buckets"].items():
+                if block["n"] == 0:
+                    self.assertIsNone(block["mae"])
+        text = " ".join(grid["notes"])
+        self.assertIn("never merged", text)
+        self.assertIn("assumed to vanish", text)
+        self.assertIn("censoring_uplift", text)
+        self.assertIn("measure the cut and say nothing about the unconstrainer", text)
+
+    def test_the_gate_is_twenty_censored_nights_in_one_combination(self):
+        """Twenty blocks and one combination: twenty censored nights in the
+        cell that would quote the estimate, so the estimate is quoted."""
+        res = ingest.load(_csv(_t3_blocks(20)), FIXTURE_HOTEL, seed=1)
+        grid = holdout.run_grid(res.bookings, res.hotel, res.ledger, dt.date(2024, 2, 1),
+                                dt.date(2024, 4, 1), window=0, thresholds=(0.90,),
+                                caps=(0.60,), rules=("sell_until_full",))
+        self.assertEqual([(c["censored_scored"], c["scorable"]) for c in grid["combos"]],
+                         [(20, True)])
+        self.assertEqual(grid["scorable_combos"], 1)
+        self.assertTrue(grid["scorable"])
+        self.assertNotIn("No combination in this grid produced a scorable sample", " ".join(grid["notes"]))
+
+    def test_two_combinations_of_ten_are_not_a_sample_of_twenty(self):
+        """The same twenty nights, ten of them censored, run under two
+        thresholds.  Their censored counts sum to twenty, and the sum is not a
+        sample: it is ten nights counted once per combination they appear in,
+        and neither cell has enough to quote a mean of its own.
+
+        A grid-wide gate passes this, which is why the gate is per combination.
+        """
+        res = ingest.load(_csv(_t3_blocks(10)), FIXTURE_HOTEL, seed=1)
+        grid = holdout.run_grid(res.bookings, res.hotel, res.ledger, dt.date(2024, 2, 1),
+                                dt.date(2024, 3, 1), window=0, thresholds=(0.85, 0.90),
+                                caps=(0.60,), rules=("sell_until_full",))
+        self.assertEqual([(c["censored_scored"], c["scorable"]) for c in grid["combos"]],
+                         [(10, False), (10, False)])
+        self.assertEqual(grid["censored_scored_total"], 20)
+        self.assertEqual(grid["censored_distinct_nights"], 10)
+        self.assertEqual(grid["best_combo_censored"], 10)
+        self.assertEqual(grid["scorable_combos"], 0)
+        self.assertFalse(grid["scorable"])
+        sentence = grid["notes"][-1]
+        self.assertIn("the largest reached 10", sentence)
+        self.assertIn("sum to 20 across the grid, but that is 10 nights", sentence)
+
+    def test_uncensored_nights_do_not_count_towards_the_gate(self):
+        """Nine blocks: thirty-six scored nights, far past twenty, and only
+        eighteen of them censored, so the table has no sample."""
+        res = ingest.load(_csv(_t3_blocks(9)), FIXTURE_HOTEL, seed=1)
+        grid = holdout.run_grid(res.bookings, res.hotel, res.ledger, dt.date(2024, 2, 1),
+                                dt.date(2024, 2, 27), window=0, thresholds=(0.85, 0.90),
+                                caps=(0.60,), rules=("sell_until_full",))
+        self.assertEqual((grid["censored_scored_total"], grid["scored_total"]), (18, 36))
+        self.assertFalse(grid["scorable"])
+        sentence = grid["notes"][-1]
+        self.assertEqual(sentence, holdout.NO_SAMPLE % (20, 2, 9, 18, 9))
+        for words in ("No combination in this grid produced a scorable sample", "the largest reached 9",
+                      "sum to 18 across the grid, but that is 9 nights",
+                      "stayed below the clean threshold", "a cap only binds on a busy night",
+                      "not a defect of this engine's unconstrainer",
+                      "neither confirms nor refutes"):
+            self.assertIn(words, sentence)
+
+    def test_a_grid_that_cuts_nothing_says_so_rather_than_quoting_a_number(self):
+        """Five rooms of twenty every night: below every clean threshold, above
+        no cap, so every night is clean and none of them is ever cut."""
+        rows = []
+        for day in range(40):
+            d = FIRST_ARRIVAL + dt.timedelta(days=day)
+            for i in range(5):
+                rows.append(_row(booking_id="Q%03d%02d" % (day, i),
+                                 booked_on=(d - dt.timedelta(days=10)).isoformat(),
+                                 arrival=d.isoformat(), nights="1"))
+        res = ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
+        grid = holdout.run_grid(res.bookings, res.hotel, res.ledger, FIRST_ARRIVAL,
+                                FIRST_ARRIVAL + dt.timedelta(days=39), window=2)
+        self.assertEqual((grid["scored_total"], grid["censored_scored_total"]), (0, 0))
+        self.assertFalse(grid["scorable"])
+        self.assertEqual(len(grid["combos"]), 24)
+        self.assertEqual(grid["notes"][-1], holdout.NO_SAMPLE % (20, 24, 0, 0, 0))
+        for combo in grid["combos"]:
+            self.assertEqual((combo["clean_nights"], combo["censored_clean"],
+                              combo["cut_nights"], combo["cut_room_nights_gross"]),
+                             (40, 0, 0, 0))
+            self.assertIsNone(combo["overall"]["mae"])

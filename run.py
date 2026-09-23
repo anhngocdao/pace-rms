@@ -126,7 +126,7 @@ def main(argv):
         try:
             payload = pilot.run_one(args[0], args[1], settings, out_dir,
                                     score_first=first, score_last=last, progress=90,
-                                    label=label)
+                                    label=label, with_holdout="--quick" not in args)
         except (ingest.IngestError, ConfigError, pilot.PilotError) as exc:
             print(exc)
             return 1

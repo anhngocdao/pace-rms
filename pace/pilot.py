@@ -468,12 +468,16 @@ def _prepare_out_dir(out_dir: str, path: str) -> None:
 def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: str,
             score_first: dt.date = SCORE_FIRST, score_last: dt.date = SCORE_LAST,
             warmup_end: dt.date = WARMUP_END, progress: Optional[int] = None,
-            label: str = "") -> dict:
-    """Ingest, walk, score table 1, write the payload.  One hotel, one process.
+            label: str = "", with_holdout: bool = True) -> dict:
+    """Ingest, walk, score tables 1 to 3, write the payload.  One hotel, one process.
 
     `label` marks a run that did not score the whole pre-registered window:
     it is written into the file name and into the payload, so a partial run
     can neither overwrite a real one nor be read back as if it were one.
+
+    `with_holdout` False leaves table 3 as None.  `--quick` passes it, because
+    the holdout is 24 cut replays of the whole history and a wiring check has
+    no use for them.
 
     Everything that can be checked cheaply is checked before the process is
     claimed and before the walk starts.  A hotel gets one run; a typo in a
@@ -487,6 +491,7 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
     # the other, and a top-level `from . import score` here passes in every
     # import order -- so this deferral is a choice that keeps the orchestrator
     # out of its own parts' imports, not a necessity.
+    from . import holdout
     from . import ratecheck
     from . import score as scoring
 
@@ -593,6 +598,16 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
         out, res.bookings, res.nonrev, res.hotel, code,
         {int(k): v for k, v in table1["season_of_month"].items()},
         score_first, score_last)
+    if with_holdout:
+        # The neighbour window is the 90th percentile of length of stay: 8
+        # nights at H1 and 5 at H2.  A stay spanning a full night is refused for
+        # all of its nights, so a clean night needs clean neighbours.
+        window = int(percentile([float(b.nights) for b in ledger_rows(res.bookings)], 0.90))
+        if progress:
+            print("    table 3: %d cut replays of the history, neighbour window %d"
+                  % (8 * len(holdout.RULES), window), flush=True)
+        payload["table3"] = holdout.run_grid(res.bookings, res.hotel, out.ledger,
+                                             first_stay, last_stay, window)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
     payload["_json_path"] = path

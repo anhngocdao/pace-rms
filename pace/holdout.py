@@ -16,12 +16,16 @@ rooms never reaches 0.97 of 187.
 import dataclasses
 import datetime as dt
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from statistics import fmean
+from typing import Dict, List, Optional, Tuple
 
 from . import ingest
 from . import pilot
-from .config import Hotel
+from .calendar import demand_class
+from .config import SEGMENT_ORDER, Hotel
 from .ledger import Ledger
+from .otb import GLOBAL_KEY
+from .unconstrain import project_detruncate
 
 RULES = ("sell_until_full", "close_cheap_first", "close_cheap_first_ota")
 RULE_NAMES = {
@@ -279,7 +283,7 @@ def net_cut(bookings, kept, first: dt.date, last: dt.date) -> Dict[dt.date, int]
 
 
 def capped_ledger(kept, hotel: Hotel, cap_rooms: int, first: dt.date, last: dt.date,
-                  rep=None) -> Tuple[Ledger, Hotel]:
+                  rep=None, snapshot_horizon: Optional[int] = None) -> Tuple[Ledger, Hotel]:
     """Replay the cut history into a hotel that really has `cap_rooms` rooms.
 
     The second half of the cap.  `ingest.replay` reads its sell-out and its walk
@@ -287,7 +291,300 @@ def capped_ledger(kept, hotel: Hotel, cap_rooms: int, first: dt.date, last: dt.d
     censoring test off the same room count, so a capped history replayed into
     the full-size hotel is a history where no night is ever censored and there
     is nothing for table 3 to score.
+
+    `snapshot_horizon` is how many days ahead the replay freezes the books each
+    day.  Left out, it is the hotel's own max_lead, as in every other replay.
+    Table 3 passes 0: it reads this ledger through the settled figures and the
+    lead-0 snapshot and through nothing else, and the grid replays the history
+    24 times, so a 298-lead snapshot on each pass at H1 is most of the cost for
+    numbers nothing reads.  A test asserts that the settled rooms and the lead-0
+    snapshots are identical at 0 and at the hotel's real max_lead.
     """
-    capped = dataclasses.replace(hotel, rooms=int(cap_rooms))
+    changes = {"rooms": int(cap_rooms)}
+    if snapshot_horizon is not None:
+        changes["max_lead"] = int(snapshot_horizon)
+    capped = dataclasses.replace(hotel, **changes)
     rep = ingest.Report() if rep is None else rep
     return ingest.replay(kept, capped, first, last, rep), capped
+
+
+MIN_CLASS_OBS = 8        # the gate PaceCurves uses before it trusts a class
+MIN_SCORED = 20
+BUCKETS = ("under 5 percent", "5 to 15 percent", "over 15 percent")
+THRESHOLDS = (0.80, 0.85, 0.90)    # settings.json holdout_clean_thresholds
+CAPS = (0.60, 0.70, 0.80)          # settings.json holdout_caps
+
+WHY_NOT_UPLIFT = (
+    "censoring_uplift is not the quantity scored here. It divides a mean that has "
+    "been both price restated and detruncated by a raw lead-0 count, so scoring it "
+    "against a known answer would charge the price restatement to the "
+    "unconstrainer, and closing the cheap channels first would make that worse by "
+    "raising the realised rate and lowering modelled acceptance with no censoring "
+    "involved. This table runs the observation loop of class_demand with the price "
+    "term removed, flags a night censored exactly as class_demand does, off its "
+    "lead-0 snapshot, and calls project_detruncate directly, so what is measured is "
+    "the censoring correction on its own.")
+UNCENSORED_NOTE = (
+    "Only nights the capped history flags as censored enter the unconstrainer's "
+    "error. On a scored night it does not flag, project_detruncate hands the "
+    "observation back unchanged, so the estimate is exactly what the capped history "
+    "sold and the error is exactly the rooms the cut took. Those nights measure the "
+    "cut and say nothing about the unconstrainer, so they are counted apart, beside "
+    "the rooms cut on them, and left out of every error, every bucket and every "
+    "segment figure.")
+EMPTY_BUCKET_NOTE = (
+    "A bucket with no nights in it prints as zero nights and no estimate. Buckets "
+    "are never merged and never widened to find a sample: an empty bucket is a "
+    "result about this history, not a gap to be filled. A combination whose three "
+    "buckets are all empty prints its clean-night count beside its cut-night "
+    "count and its count of clean nights the capped history flags as censored, so "
+    "a reader can see whether the cut missed the clean nights, reached them "
+    "without censoring them, or censored them and took nothing. A cut night is a "
+    "clean night that sold fewer rooms in the capped history than in the real "
+    "one, after cancellations and no-shows, which is the scale the known answer is "
+    "on; the room nights the cap refused before any of them cancelled are printed "
+    "apart, under a name that says they are gross.")
+SETTINGS_NOTE = (
+    "Every combination of clean threshold, cap and cutting rule is printed, not a "
+    "chosen one. If the estimate moves a lot across them, the settings are deciding "
+    "the result and the table should be read as a sensitivity analysis rather than "
+    "as a measurement.")
+VANISH_NOTE = (
+    "Refused guests are assumed to vanish. Some of them would have moved to "
+    "another night of the same hotel, so the known answer is a lower bound on the "
+    "demand the cut destroyed and the unconstrainer is being asked an easier "
+    "question than the real one.")
+NO_SAMPLE = (
+    "No combination in this grid produced a scorable sample, so no estimate of "
+    "the unconstrainer's error is quoted from this table. The gate is %d censored "
+    "nights in one combination, because a combination is where an estimate is "
+    "formed; of the %d run, the largest reached %d. Their censored nights sum to "
+    "%d across the grid, but that is %d nights counted once per combination they "
+    "appear in, not a sample of that size. The reason is in how the sample is "
+    "built. A clean night is by definition one whose occupancy stayed below the "
+    "clean threshold, which is what makes its demand observable, and a cap only "
+    "binds on a busy night, so the nights whose answer is known are almost never "
+    "nights the cap censored. That is a property of any holdout built this way on "
+    "a history of this shape, not a defect of this engine's unconstrainer, which "
+    "this table therefore neither confirms nor refutes.")
+
+
+def observations(ledger, hotel: Hotel, nights) -> Dict[dt.date, Tuple[float, bool]]:
+    """The observation and the censoring flag per night, as class_demand makes them.
+
+    `unconstrain.class_demand` skips a night with no lead-0 snapshot, and flags
+    a night censored when that snapshot reaches `rooms * sellout_threshold` or
+    the ledger logged a denial for it.  It does not read the settled figure for
+    the flag, and the two can fall either side of the line: a no-show stands in
+    the lead-0 snapshot and leaves before settlement, so a full night with one
+    in it is censored by the snapshot and would not be by the settled figure.
+    The two figures differ on 108 of H1's 427 scoring nights (table 1 reads the
+    settled one for that reason).  This flag is class_demand's.
+
+    The observation is class_demand's with the price term taken out: the rooms
+    the night sold, with nothing divided by an acceptance, plus any logged
+    denial.  class_demand sums the settled segment mix, which is the settled
+    room count; a replayed ledger logs no denials, so on this path the
+    observation is the settled rooms sold.
+    """
+    out: Dict[dt.date, Tuple[float, bool]] = {}
+    cut = hotel.rooms * hotel.sellout_threshold
+    for d in nights:
+        snaps = ledger.snapshots.get(d)
+        if not snaps:
+            continue
+        final = snaps.get(0)
+        if final is None:
+            continue
+        row = ledger.settled.get(d)
+        if row is None:
+            continue
+        regrets = ledger.observable_denials(d)
+        out[d] = (float(row["rooms_sold"] + regrets), (final >= cut) or regrets > 0)
+    return out
+
+
+def per_night_demand(ledger, hotel: Hotel, nights) -> Dict[dt.date, float]:
+    """Unconstrained demand per night, censoring correction only.
+
+    `observations` gives each night's value and flag, and project_detruncate
+    returns one imputed value per observation, so keeping the dates in the
+    order they went in gives a per-night estimate rather than a class mean.  A
+    night the flag leaves open comes back as its own observation.  A class
+    thinner than MIN_CLASS_OBS falls back to the house series, which is the
+    same gate PaceCurves uses.  A night with no lead-0 snapshot is not in the
+    sample and not in the answer, as in class_demand.
+    """
+    order: Dict[tuple, List[dt.date]] = defaultdict(list)
+    obs: Dict[tuple, List[Tuple[float, bool]]] = defaultdict(list)
+    seen = observations(ledger, hotel, nights)
+    for d in nights:
+        if d not in seen:
+            continue
+        for key in (demand_class(d), GLOBAL_KEY):
+            obs[key].append(seen[d])
+            order[key].append(d)
+    est: Dict[tuple, Dict[dt.date, float]] = {}
+    for key, rows in obs.items():
+        _mu, _sigma, imputed = project_detruncate(rows)
+        est[key] = dict(zip(order[key], imputed))
+    house = est.get(GLOBAL_KEY, {})
+    out: Dict[dt.date, float] = {}
+    for d in nights:
+        key = demand_class(d)
+        if len(obs.get(key, ())) >= MIN_CLASS_OBS and d in est.get(key, {}):
+            out[d] = est[key][d]
+        elif d in house:
+            out[d] = house[d]
+    return out
+
+
+def bucket_of(share: float) -> str:
+    if share < 0.05:
+        return BUCKETS[0]
+    if share <= 0.15:
+        return BUCKETS[1]
+    return BUCKETS[2]
+
+
+def _agg(rows) -> dict:
+    if not rows:
+        return {"n": 0, "known": None, "estimate": None, "mae": None, "bias": None}
+    errs = [r["estimate"] - r["known"] for r in rows]
+    return {"n": len(rows),
+            "known": fmean([r["known"] for r in rows]),
+            "estimate": fmean([r["estimate"] for r in rows]),
+            "mae": fmean([abs(e) for e in errs]),
+            "bias": fmean(errs)}
+
+
+def _agg_segments(rows) -> dict:
+    out = {}
+    for code in SEGMENT_ORDER:
+        pairs = [(r["segments"][code]["estimate"], r["segments"][code]["known"]) for r in rows]
+        if not pairs:
+            out[code] = {"n": 0, "mae": None, "bias": None}
+            continue
+        errs = [e - k for e, k in pairs]
+        out[code] = {"n": len(pairs), "mae": fmean([abs(x) for x in errs]),
+                     "bias": fmean(errs)}
+    return out
+
+
+def score_combo(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.date,
+                threshold: float, cap_share: float, rule: str, window: int) -> dict:
+    """One cut, one capped replay, and the unconstrainer scored on the clean nights.
+
+    The unconstrainer is handed every night of the capped history, as the
+    engine's own class_demand is handed every completed night, and only then
+    are the clean nights picked out of its answer.  Handing it the clean nights
+    alone would hand it the real history's verdict on which nights were quiet,
+    which is the one thing the cut history is meant to hide from it.
+
+    Every scored night carries the capped ledger's censoring flag, and the
+    unconstrainer's figures, overall, by bucket and by segment, are over the
+    censored ones only (UNCENSORED_NOTE says why).
+    """
+    cap_rooms = int(round(cap_share * hotel.rooms))
+    kept, cut = cut_history(bookings, cap_rooms, rule, last)
+    led, capped = capped_ledger(kept, hotel, cap_rooms, first, last, snapshot_horizon=0)
+    clean = [d for d in clean_nights(bookings, hotel, first, last, threshold, window)
+             if d in full_ledger.settled]
+    history = sorted(d for d in led.settled if first <= d <= last)
+    flags = dict((d, c) for d, (_v, c) in observations(led, capped, history).items())
+    est = per_night_demand(led, capped, history)
+
+    rows = []
+    cut_nights = 0
+    for d in clean:
+        got_row = led.settled.get(d)
+        if got_row is None:
+            continue
+        known = float(full_ledger.settled[d]["rooms_sold"])
+        got = float(got_row["rooms_sold"])
+        lost = known - got
+        if lost > 0:
+            cut_nights += 1
+        if lost <= 0 or known <= 0 or d not in est:
+            continue
+        mix = led.seg_rooms.get(d, {})
+        total = float(sum(max(0, v) for v in mix.values()))
+        segments = {}
+        for code in SEGMENT_ORDER:
+            share = (max(0, mix.get(code, 0)) / total) if total > 0 else 0.0
+            segments[code] = {
+                "known": float(full_ledger.seg_rooms.get(d, {}).get(code, 0)),
+                "estimate": est[d] * share,
+            }
+        rows.append({"date": d.isoformat(), "known": known, "capped": got,
+                     "estimate": est[d], "censored": flags[d], "cut_rooms": lost,
+                     "cut_share": lost / known, "bucket": bucket_of(lost / known),
+                     "segments": segments})
+
+    censored = [r for r in rows if r["censored"]]
+    open_rows = [r for r in rows if not r["censored"]]
+    scorable = len(censored) >= MIN_SCORED
+    buckets = {}
+    for name in BUCKETS:
+        inside = [r for r in censored if r["bucket"] == name]
+        buckets[name] = _agg(inside)
+        buckets[name]["by_segment"] = _agg_segments(inside)
+    return {
+        "threshold": threshold, "cap": cap_share, "cap_rooms": cap_rooms, "rule": rule,
+        "rule_name": RULE_NAMES[rule],
+        "clean_nights": len(clean),
+        "censored_clean": sum(1 for d in clean if flags.get(d)),
+        "cut_nights": cut_nights,
+        "cut_room_nights_gross": sum(cut.values()),
+        "scored": len(rows),
+        "censored_scored": len(censored),
+        "uncensored_scored": len(open_rows),
+        "scorable": scorable,
+        "overall": _agg(censored), "by_segment": _agg_segments(censored),
+        "buckets": buckets,
+        "uncensored": {"n": len(open_rows),
+                       "mean_rooms_cut": (fmean([r["cut_rooms"] for r in open_rows])
+                                          if open_rows else None)},
+        "nights": rows,
+    }
+
+
+def run_grid(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.date,
+             window: int, thresholds=THRESHOLDS, caps=CAPS, rules=RULES) -> dict:
+    """Every pre-registered combination whose cap sits below its threshold.
+
+    MIN_SCORED is applied to one combination at a time, because a combination is
+    where an estimate is formed: the error, the buckets and the segment figures
+    are all means over one combination's censored nights, and no number in this
+    table is ever a mean over the grid.  Summing the censored nights of 24
+    combinations would count one night up to 24 times and report a sample that
+    does not exist; at H1 the sum is 81 and no single combination reaches 9.
+    Both totals are returned, each saying what it counts.
+    """
+    combos = []
+    for threshold in thresholds:
+        for cap in caps:
+            if cap >= threshold:
+                continue
+            for rule in rules:
+                combos.append(score_combo(bookings, hotel, full_ledger, first, last,
+                                          threshold, cap, rule, window))
+    scored_total = sum(c["scored"] for c in combos)
+    censored_total = sum(c["censored_scored"] for c in combos)
+    distinct = set()
+    for c in combos:
+        distinct.update(r["date"] for r in c["nights"] if r["censored"])
+    best = max((c["censored_scored"] for c in combos), default=0)
+    scorable = [c for c in combos if c["scorable"]]
+    notes = [WHY_NOT_UPLIFT, UNCENSORED_NOTE, VANISH_NOTE, SETTINGS_NOTE,
+             EMPTY_BUCKET_NOTE, NO_RATE_CODES_NOTE]
+    if not scorable:
+        notes.append(NO_SAMPLE % (MIN_SCORED, len(combos), best,
+                                  censored_total, len(distinct)))
+    return {"window": window, "thresholds": list(thresholds), "caps": list(caps),
+            "rules": list(rules), "combos": combos, "min_scored": MIN_SCORED,
+            "scored_total": scored_total, "censored_scored_total": censored_total,
+            "censored_distinct_nights": len(distinct),
+            "best_combo_censored": best,
+            "scorable_combos": len(scorable), "scorable": bool(scorable),
+            "notes": notes}
