@@ -3913,15 +3913,41 @@ class Table3Night(unittest.TestCase):
     def test_the_segments_split_the_estimate_by_the_capped_mix(self):
         """The 3rd kept three corporate rooms of twelve, so a quarter of its
         estimate is corporate, against the three it really sold; the 4th is
-        all retail."""
+        all retail, so it is one retail observation and no corporate one.
+        The fixture has no OTA and no GROUP row, so those segments have no
+        night at all: n 0 and no estimate, not two nights of a perfect zero
+        error, which is what counting a pair of zeros would print.  On H1
+        that was six GROUP night-segments scored perfectly on nights with no
+        group business, on H2 seven."""
         e3, e4 = self.expected[_feb(3)], self.expected[_feb(4)]
         seg = self._combo()["by_segment"]
-        self.assertEqual(seg["CORP"]["n"], 2)
-        self.assertAlmostEqual(seg["CORP"]["bias"], (e3 * 0.25 - 3) / 2, places=9)
-        self.assertAlmostEqual(seg["CORP"]["mae"], abs(e3 * 0.25 - 3) / 2, places=9)
+        self.assertEqual(seg["CORP"]["n"], 1)
+        self.assertAlmostEqual(seg["CORP"]["bias"], e3 * 0.25 - 3, places=9)
+        self.assertAlmostEqual(seg["CORP"]["mae"], abs(e3 * 0.25 - 3), places=9)
+        self.assertEqual(seg["RETAIL"]["n"], 2)
         self.assertAlmostEqual(seg["RETAIL"]["bias"], ((e3 * 0.75 - 13) + (e4 - 12)) / 2,
                                places=9)
-        self.assertEqual(seg["OTA"], {"n": 2, "mae": 0.0, "bias": 0.0})
+        self.assertEqual(seg["OTA"], {"n": 0, "mae": None, "bias": None})
+        self.assertEqual(seg["GROUP"], {"n": 0, "mae": None, "bias": None})
+
+    def test_a_segment_the_cut_emptied_is_still_an_observation(self):
+        """A pair with rooms on one side only is kept.  One retail row on the
+        3rd made into an OTA row: the real night sold one OTA room, the cut
+        refused it, so the capped mix has no OTA and the estimate is zero
+        against a known of one.  That is the cut emptying a segment, and an
+        error the segment table has to show.  The 4th still has no OTA in
+        either history and is still not an OTA observation, so n is one."""
+        rows = _t3_rows()
+        idx = [i for i, r in enumerate(rows) if r[0] == "D03-11"]
+        self.assertEqual(len(idx), 1)
+        rows[idx[0]] = _row(booking_id="D03-11", booked_on=T3_LATE, arrival="2024-02-03",
+                            nights="1", segment="BOOKING")
+        res = ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1, first_stay=T3_FIRST, last_stay=T3_LAST)
+        combo = holdout.score_combo(res.bookings, res.hotel, res.ledger, T3_FIRST, T3_LAST,
+                                    0.90, 0.60, "sell_until_full", 1)
+        third = dict((r["date"], r) for r in combo["nights"])["2024-02-03"]
+        self.assertEqual(third["segments"]["OTA"], {"known": 1.0, "estimate": 0.0})
+        self.assertEqual(combo["by_segment"]["OTA"], {"n": 1, "mae": 1.0, "bias": -1.0})
 
     def test_the_grid_replays_without_the_snapshots_it_never_reads(self):
         """The answer is the same at any horizon, which is what the test on
@@ -4007,6 +4033,7 @@ class Grid(unittest.TestCase):
                     self.assertIsNone(block["mae"])
         text = " ".join(grid["notes"])
         self.assertIn("never merged", text)
+        self.assertIn("one count under two names", text)
         self.assertIn("assumed to vanish", text)
         self.assertIn("censoring_uplift", text)
         self.assertIn("measure the cut and say nothing about the unconstrainer", text)

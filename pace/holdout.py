@@ -343,7 +343,13 @@ EMPTY_BUCKET_NOTE = (
     "clean night that sold fewer rooms in the capped history than in the real "
     "one, after cancellations and no-shows, which is the scale the known answer is "
     "on; the room nights the cap refused before any of them cancelled are printed "
-    "apart, under a name that says they are gross.")
+    "apart, under a name that says they are gross. Through capped_ledger the "
+    "cut-night count and the scored count are one count under two names: a scored "
+    "night is a cut night with a lead-0 snapshot, and the only settled nights the "
+    "capped replay leaves without one lie before the first booking day, where "
+    "nothing was sold in either history and nothing was cut. They part only for a "
+    "ledger built another way, without lead-0 snapshots on nights the cut "
+    "reached.")
 SETTINGS_NOTE = (
     "Every combination of clean threshold, cap and cutting rule is printed, not a "
     "chosen one. If the estimate moves a lot across them, the settings are deciding "
@@ -478,9 +484,24 @@ def _agg(rows) -> dict:
 
 
 def _agg_segments(rows) -> dict:
+    """The unconstrainer's error by segment, over the nights the segment traded.
+
+    The estimate is split by the capped mix, so a segment with no rooms in the
+    capped history has an estimate of exactly zero, and a segment with no rooms
+    in the real history has a known of zero.  A pair that is zero on both sides
+    is a night the segment did no business on in either history, and its error
+    of zero is not an observation of the unconstrainer: counted, it reports a
+    perfect score for a segment on nights it did not trade, six GROUP
+    night-segments at H1 and seven at H2.  Such pairs are left out of the
+    segment's n, its mae and its bias, and a segment with no pair left prints as
+    n 0 and no estimate, like an empty bucket.  A pair with rooms on one side
+    only is kept: that is a segment the cut emptied, or one the unconstrainer
+    invented, and either is an error worth printing.
+    """
     out = {}
     for code in SEGMENT_ORDER:
         pairs = [(r["segments"][code]["estimate"], r["segments"][code]["known"]) for r in rows]
+        pairs = [(e, k) for e, k in pairs if not (e == 0 and k == 0)]
         if not pairs:
             out[code] = {"n": 0, "mae": None, "bias": None}
             continue
@@ -503,6 +524,17 @@ def score_combo(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.da
     Every scored night carries the capped ledger's censoring flag, and the
     unconstrainer's figures, overall, by bucket and by segment, are over the
     censored ones only (UNCENSORED_NOTE says why).
+
+    `cut_nights` and `scored` are the same count on this path.  A night is
+    scored when it lost rooms and has an estimate, and per_night_demand has one
+    for every night with a lead-0 snapshot; through capped_ledger the only
+    settled nights without one lie before the first booking day, where both
+    histories sold nothing and nothing was cut.  Both fields stay, because
+    `observations` takes any ledger and a caller that builds one without lead-0
+    snapshots would see them part: a cut night the snapshot cannot speak for is
+    then counted as cut and not scored.  A mutation setting cut_nights to the
+    row count survives every fixture built through capped_ledger, and this
+    paragraph is why that is not a defect.
 
     `censorable_band_nights` counts the window's settled nights whose physical
     occupancy sits in [cap_rooms * sellout_threshold, threshold * rooms): high
