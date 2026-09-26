@@ -3779,11 +3779,38 @@ class Table3Night(unittest.TestCase):
         self.assertEqual(
             dict((k, combo[k]) for k in ("clean_nights", "censored_clean", "cut_nights",
                                          "cut_room_nights_gross", "scored",
-                                         "censored_scored", "uncensored_scored", "cap_rooms")),
+                                         "censored_scored", "uncensored_scored", "cap_rooms",
+                                         "censorable_band_nights", "censorable_band_clean")),
             {"clean_nights": 14, "censored_clean": 2, "cut_nights": 3,
              "cut_room_nights_gross": 18, "scored": 3, "censored_scored": 2,
-             "uncensored_scored": 1, "cap_rooms": 12})
+             "uncensored_scored": 1, "cap_rooms": 12,
+             "censorable_band_nights": 3, "censorable_band_clean": 2})
         self.assertEqual(combo["uncensored"], {"n": 1, "mean_rooms_cut": 1.0})
+
+    def test_the_band_the_cap_can_censor_is_counted_with_and_without_the_window(self):
+        """The band is physical occupancy from the capped hotel's censoring
+        line, 11.64 rooms, up to the clean threshold of 18: the 3rd at 16, the
+        4th at 12 and the 10th at 15.  The 10th sits beside the 9th's nineteen,
+        so at a window of one it is in the band and not clean, and with the
+        window dropped it is both.  A count that read the clean list for the
+        band, or the band for the clean list, would give 2 and 2 or 3 and 3 at
+        window 1."""
+        at_one = self._combo(window=1)
+        at_zero = self._combo(window=0)
+        self.assertEqual((at_one["censorable_band_nights"], at_one["censorable_band_clean"]),
+                         (3, 2))
+        self.assertEqual((at_zero["censorable_band_nights"], at_zero["censorable_band_clean"]),
+                         (3, 3))
+        clean_at_one = holdout.clean_nights(self.res.bookings, self.res.hotel, T3_FIRST, T3_LAST,
+                                            0.90, 1)
+        self.assertNotIn(_feb(10), clean_at_one)
+        self.assertIn(_feb(10), holdout.clean_nights(self.res.bookings, self.res.hotel, T3_FIRST,
+                                                     T3_LAST, 0.90, 0))
+        occ = ingest.physical_occupancy(self.res.bookings)
+        self.assertEqual([occ[d] for d in (_feb(3), _feb(4), _feb(10))], [16, 12, 15])
+        self.assertEqual([d for d in sorted(occ) if T3_FIRST <= d <= T3_LAST
+                          and 12 * 0.97 <= occ[d] < 18],
+                         [_feb(3), _feb(4), _feb(10)])
 
     def test_the_unconstrainer_s_error_is_over_the_censored_nights_only(self):
         e3, e4 = self.expected[_feb(3)], self.expected[_feb(4)]
@@ -3953,13 +3980,60 @@ class Grid(unittest.TestCase):
         self.assertEqual((grid["censored_scored_total"], grid["scored_total"]), (18, 36))
         self.assertFalse(grid["scorable"])
         sentence = grid["notes"][-1]
-        self.assertEqual(sentence, holdout.NO_SAMPLE % (20, 2, 9, 18, 9))
+        # Both combinations hold the same nine censored nights and the same
+        # band, the nine second nights at sixteen rooms, so the first of them
+        # is named.  With no window the band is left whole, so the sentence
+        # must not blame the window.
+        self.assertEqual(sentence, holdout.NO_SAMPLE_WINDOW_TOOK_NOTHING % dict(
+            gate=20, combos=2, best=9, summed=18, distinct=9, window=0, threshold=0.85,
+            cap_rooms=12, rule="sell until full", band=9, band_clean=9, lo=11.64, hi=17.0))
         for words in ("No combination in this grid produced a scorable sample", "the largest reached 9",
                       "sum to 18 across the grid, but that is 9 nights",
-                      "stayed below the clean threshold", "a cap only binds on a busy night",
+                      "9 nights of the window sit in the band",
+                      "The window took nothing from that band",
                       "not a defect of this engine's unconstrainer",
                       "neither confirms nor refutes"):
             self.assertIn(words, sentence)
+        self.assertNotIn("What empties the sample is that window", sentence)
+
+    def test_the_no_sample_sentence_names_the_window_and_what_it_took_from_the_band(self):
+        """The seventeen-night fixture at a window of one.  The largest
+        combination is the first at cap twelve with two censored nights, the 3rd
+        and the 4th, at threshold 0.85 (0.90 ties it on every count and comes
+        later); its band holds the 3rd, the 4th and the 10th, and the window
+        takes the 10th, which sits beside the 9th's nineteen rooms.  Summed over
+        the grid: two censored nights in each of the six cells at cap twelve
+        under 0.85 and 0.90, one (the 3rd) in each of the six at cap fourteen,
+        none at cap sixteen where the 3rd is censored but loses nothing, and
+        none under 0.80 where the 3rd is busy and takes the 2nd and 4th with
+        it."""
+        grid = self._t3_grid()
+        self.assertEqual((grid["best_combo_censored"], grid["censored_scored_total"],
+                          grid["censored_distinct_nights"]), (2, 18, 2))
+        sentence = grid["notes"][-1]
+        self.assertEqual(sentence, holdout.NO_SAMPLE % dict(
+            gate=20, combos=24, best=2, summed=18, distinct=2, window=1, threshold=0.85,
+            cap_rooms=12, rule="sell until full", band=3, band_clean=2, lo=11.64, hi=17.0))
+        for words in ("neighbour window at 0 all 3 of them are clean",
+                      "with the window of 1 nights 2 are",
+                      "What empties the sample is that window, not the cap",
+                      "no busy night within 1 nights on either side",
+                      "The window is the pre-registered one",
+                      "neither confirms nor refutes"):
+            self.assertIn(words, sentence)
+        self.assertNotIn("property of any holdout", sentence)
+
+    def test_a_grid_with_no_cap_below_any_threshold_is_refused_in_a_sentence(self):
+        res = ingest.load(_csv(_t3_rows()), FIXTURE_HOTEL, seed=1,
+                          first_stay=T3_FIRST, last_stay=T3_LAST)
+        with self.assertRaises(pilot.PilotError) as ctx:
+            holdout.run_grid(res.bookings, res.hotel, res.ledger, T3_FIRST, T3_LAST, window=1,
+                             thresholds=(0.60,), caps=(0.60, 0.70))
+        self.assertIn("no combination in the grid has a cap below its threshold", str(ctx.exception))
+        self.assertEqual(holdout.grid_cells(), [(t, c, r) for t in (0.80, 0.85, 0.90)
+                                                for c in (0.60, 0.70, 0.80) if c < t
+                                                for r in holdout.RULES])
+        self.assertEqual(len(holdout.grid_cells()), 24)
 
     def test_a_grid_that_cuts_nothing_says_so_rather_than_quoting_a_number(self):
         """Five rooms of twenty every night: below every clean threshold, above
@@ -3977,9 +4051,15 @@ class Grid(unittest.TestCase):
         self.assertEqual((grid["scored_total"], grid["censored_scored_total"]), (0, 0))
         self.assertFalse(grid["scorable"])
         self.assertEqual(len(grid["combos"]), 24)
-        self.assertEqual(grid["notes"][-1], holdout.NO_SAMPLE % (20, 24, 0, 0, 0))
+        # Every combination is alike, so the first is named: threshold 0.80
+        # and cap twelve, whose band runs from 11.64 to under 16 rooms and
+        # holds nothing at five.
+        self.assertEqual(grid["notes"][-1], holdout.NO_SAMPLE_WINDOW_TOOK_NOTHING % dict(
+            gate=20, combos=24, best=0, summed=0, distinct=0, window=2, threshold=0.80,
+            cap_rooms=12, rule="sell until full", band=0, band_clean=0, lo=11.64, hi=16.0))
         for combo in grid["combos"]:
             self.assertEqual((combo["clean_nights"], combo["censored_clean"],
-                              combo["cut_nights"], combo["cut_room_nights_gross"]),
-                             (40, 0, 0, 0))
+                              combo["cut_nights"], combo["cut_room_nights_gross"],
+                              combo["censorable_band_nights"], combo["censorable_band_clean"]),
+                             (40, 0, 0, 0, 0, 0))
             self.assertIsNone(combo["overall"]["mae"])

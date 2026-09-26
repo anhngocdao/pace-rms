@@ -354,19 +354,38 @@ VANISH_NOTE = (
     "another night of the same hotel, so the known answer is a lower bound on the "
     "demand the cut destroyed and the unconstrainer is being asked an easier "
     "question than the real one.")
-NO_SAMPLE = (
+# Filled by name from run_grid: the gate, the grid's counts, the neighbour
+# window, and the largest combination's band counts with and without it.
+_NO_SAMPLE_HEAD = (
     "No combination in this grid produced a scorable sample, so no estimate of "
-    "the unconstrainer's error is quoted from this table. The gate is %d censored "
-    "nights in one combination, because a combination is where an estimate is "
-    "formed; of the %d run, the largest reached %d. Their censored nights sum to "
-    "%d across the grid, but that is %d nights counted once per combination they "
-    "appear in, not a sample of that size. The reason is in how the sample is "
-    "built. A clean night is by definition one whose occupancy stayed below the "
-    "clean threshold, which is what makes its demand observable, and a cap only "
-    "binds on a busy night, so the nights whose answer is known are almost never "
-    "nights the cap censored. That is a property of any holdout built this way on "
-    "a history of this shape, not a defect of this engine's unconstrainer, which "
-    "this table therefore neither confirms nor refutes.")
+    "the unconstrainer's error is quoted from this table. The gate is %(gate)d "
+    "censored nights in one combination, because a combination is where an "
+    "estimate is formed; of the %(combos)d run, the largest reached %(best)d. "
+    "Their censored nights sum to %(summed)d across the grid, but that is "
+    "%(distinct)d nights counted once per combination they appear in, not a "
+    "sample of that size. In the largest combination, threshold %(threshold).2f "
+    "and cap %(cap_rooms)d rooms under %(rule)s, %(band)d nights of the window "
+    "sit in the band a cap of that size can censor and the clean threshold does "
+    "not exclude, physical occupancy from %(lo).1f to under %(hi).1f rooms; with "
+    "the neighbour window at 0 all %(band)d of them are clean, and with the "
+    "window of %(window)d nights %(band_clean)d are. ")
+NO_SAMPLE = _NO_SAMPLE_HEAD + (
+    "What empties the sample is that window, not the cap: a stay spanning a busy "
+    "night is refused for all of its nights, so a clean night may have no busy "
+    "night within %(window)d nights on either side, and the moderately busy "
+    "nights a cap censors sit inside busy weeks. The window is the pre-registered "
+    "one, the 90th percentile of length of stay, and it is not moved here, so the "
+    "empty sample is this history under that window and not a defect of this "
+    "engine's unconstrainer, which this table therefore neither confirms nor "
+    "refutes.")
+# The same grid on a history where the window left the largest combination's
+# band whole: then it is not the window that emptied the sample, and the
+# sentence must not say it was.
+NO_SAMPLE_WINDOW_TOOK_NOTHING = _NO_SAMPLE_HEAD + (
+    "The window took nothing from that band, so it is not what emptied this "
+    "sample: of those %(band)d clean nights the capped history flagged and "
+    "scored %(best)d. That is not a defect of this engine's unconstrainer, "
+    "which this table therefore neither confirms nor refutes.")
 
 
 def observations(ledger, hotel: Hotel, nights) -> Dict[dt.date, Tuple[float, bool]]:
@@ -484,6 +503,16 @@ def score_combo(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.da
     Every scored night carries the capped ledger's censoring flag, and the
     unconstrainer's figures, overall, by bucket and by segment, are over the
     censored ones only (UNCENSORED_NOTE says why).
+
+    `censorable_band_nights` counts the window's settled nights whose physical
+    occupancy sits in [cap_rooms * sellout_threshold, threshold * rooms): high
+    enough for a cap of this size to censor and below the clean threshold.
+    `censorable_band_clean` is how many of them the neighbour window leaves
+    clean.  With the window at 0 the two are equal by construction, so the pair
+    is the sample this window left against the one no window would have.  At
+    H1, threshold 0.90 and cap 112, the band holds 195 nights and the window of
+    8 leaves 16 of them clean; that gap, not the cap, is why table 3 has no
+    sample there.
     """
     cap_rooms = int(round(cap_share * hotel.rooms))
     kept, cut = cut_history(bookings, cap_rooms, rule, last)
@@ -491,6 +520,18 @@ def score_combo(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.da
     clean = [d for d in clean_nights(bookings, hotel, first, last, threshold, window)
              if d in full_ledger.settled]
     history = sorted(d for d in led.settled if first <= d <= last)
+
+    # The band a cap of this size can censor and the clean threshold does not
+    # exclude: physical occupancy from the capped hotel's censoring line up to,
+    # and not including, the clean threshold.  Every night in it is clean with
+    # no neighbour window, so the two counts are the sample the window leaves
+    # and the sample it would have left.  The band is read off physical
+    # occupancy, as clean_nights reads the threshold, so a comp room counts.
+    occ = ingest.physical_occupancy(bookings)
+    lo, hi = cap_rooms * hotel.sellout_threshold, threshold * hotel.rooms
+    band = [d for d in full_ledger.settled if first <= d <= last and lo <= occ.get(d, 0) < hi]
+    clean_set = set(clean)
+    band_clean = [d for d in band if d in clean_set]
     flags = dict((d, c) for d, (_v, c) in observations(led, capped, history).items())
     est = per_night_demand(led, capped, history)
 
@@ -534,6 +575,8 @@ def score_combo(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.da
         "rule_name": RULE_NAMES[rule],
         "clean_nights": len(clean),
         "censored_clean": sum(1 for d in clean if flags.get(d)),
+        "censorable_band_nights": len(band),
+        "censorable_band_clean": len(band_clean),
         "cut_nights": cut_nights,
         "cut_room_nights_gross": sum(cut.values()),
         "scored": len(rows),
@@ -549,6 +592,16 @@ def score_combo(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.da
     }
 
 
+def grid_cells(thresholds=THRESHOLDS, caps=CAPS, rules=RULES) -> List[Tuple[float, float, str]]:
+    """The combinations the grid runs, in the order it runs them: every cap
+    below its threshold, under every rule.  Eight pairs and 24 cells on the
+    pre-registered values.  run_one reads the count off this rather than
+    carrying its own copy of the arithmetic."""
+    return [(threshold, cap, rule)
+            for threshold in thresholds for cap in caps if cap < threshold
+            for rule in rules]
+
+
 def run_grid(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.date,
              window: int, thresholds=THRESHOLDS, caps=CAPS, rules=RULES) -> dict:
     """Every pre-registered combination whose cap sits below its threshold.
@@ -558,29 +611,51 @@ def run_grid(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.date,
     are all means over one combination's censored nights, and no number in this
     table is ever a mean over the grid.  Summing the censored nights of 24
     combinations would count one night up to 24 times and report a sample that
-    does not exist; at H1 the sum is 81 and no single combination reaches 9.
-    Both totals are returned, each saying what it counts.
+    does not exist; at H1 the sum is 81 and no single combination reaches the
+    gate of 20; the largest reaches 9.  Both totals are returned, each saying
+    what it counts.
+
+    When no combination is scorable the sentence appended to the notes names
+    the largest one, the combination with the most censored scored nights, and
+    among equals the one with the most band nights left clean by the window and
+    then the most band nights, and prints its censorable band with and without
+    the neighbour window (score_combo says what the band is).  NO_SAMPLE says
+    the window is what emptied the sample, and is used only when the window
+    took something from that band; NO_SAMPLE_WINDOW_TOOK_NOTHING is the same
+    sentence for a history where it did not, because a note must not name a
+    cause the counts beside it refute.  A grid with no cell at all, every cap
+    at or above every threshold, has nothing to say and is refused in a
+    sentence.
     """
-    combos = []
-    for threshold in thresholds:
-        for cap in caps:
-            if cap >= threshold:
-                continue
-            for rule in rules:
-                combos.append(score_combo(bookings, hotel, full_ledger, first, last,
-                                          threshold, cap, rule, window))
+    cells = grid_cells(thresholds, caps, rules)
+    if not cells:
+        raise pilot.PilotError("no combination in the grid has a cap below its threshold "
+                               "(thresholds %s, caps %s), so there is nothing to run"
+                               % (list(thresholds), list(caps)))
+    combos = [score_combo(bookings, hotel, full_ledger, first, last, threshold, cap, rule, window)
+              for threshold, cap, rule in cells]
     scored_total = sum(c["scored"] for c in combos)
     censored_total = sum(c["censored_scored"] for c in combos)
     distinct = set()
     for c in combos:
         distinct.update(r["date"] for r in c["nights"] if r["censored"])
-    best = max((c["censored_scored"] for c in combos), default=0)
+    largest = max(combos, key=lambda c: (c["censored_scored"], c["censorable_band_clean"],
+                                         c["censorable_band_nights"]))
+    best = largest["censored_scored"]
     scorable = [c for c in combos if c["scorable"]]
     notes = [WHY_NOT_UPLIFT, UNCENSORED_NOTE, VANISH_NOTE, SETTINGS_NOTE,
              EMPTY_BUCKET_NOTE, NO_RATE_CODES_NOTE]
     if not scorable:
-        notes.append(NO_SAMPLE % (MIN_SCORED, len(combos), best,
-                                  censored_total, len(distinct)))
+        took = largest["censorable_band_clean"] < largest["censorable_band_nights"]
+        notes.append((NO_SAMPLE if took else NO_SAMPLE_WINDOW_TOOK_NOTHING) % {
+            "gate": MIN_SCORED, "combos": len(combos), "best": best,
+            "summed": censored_total, "distinct": len(distinct), "window": window,
+            "threshold": largest["threshold"], "cap_rooms": largest["cap_rooms"],
+            "rule": largest["rule_name"].lower(),
+            "band": largest["censorable_band_nights"],
+            "band_clean": largest["censorable_band_clean"],
+            "lo": largest["cap_rooms"] * hotel.sellout_threshold,
+            "hi": largest["threshold"] * hotel.rooms})
     return {"window": window, "thresholds": list(thresholds), "caps": list(caps),
             "rules": list(rules), "combos": combos, "min_scored": MIN_SCORED,
             "scored_total": scored_total, "censored_scored_total": censored_total,
