@@ -535,6 +535,41 @@ class WalkValidation(unittest.TestCase):
                        score_first=FIRST_ARRIVAL + dt.timedelta(days=5), score_last=FIRST_ARRIVAL,
                        marks=(1,), drive_from=FIRST_ARRIVAL)
 
+    def test_the_walk_reports_wall_clock_and_cpu_time_off_the_clocks_it_reads(self):
+        """Both figures are the difference of two readings, wall clock from
+        time.time and CPU from time.process_time, each read once before the
+        day loop and once after it.  A stub hands each clock exactly two
+        readings, so a walk that read either clock a third time, read the
+        same clock for both figures, or reported one under the other's name
+        would come back with a different pair, or with no reading left.
+        984 and 21 are what this machine recorded for identical code on two
+        runs, which is why the CPU figure is published beside the wall clock."""
+        class Clock:
+            def __init__(self, wall, cpu):
+                self.wall, self.cpu = iter(wall), iter(cpu)
+
+            def time(self):
+                return next(self.wall)
+
+            def process_time(self):
+                return next(self.cpu)
+
+        rows = [_row(booking_id="W%d" % i, booked_on="2024-01-01",
+                     arrival=(FIRST_ARRIVAL + dt.timedelta(days=1 + i)).isoformat(), nights="1")
+                for i in range(5)]
+        res = ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
+        real = pilot.time
+        pilot.time = Clock([100.0, 1084.0], [5.0, 26.0])
+        try:
+            out = pilot.walk(res.bookings, res.hotel, self.cal,
+                             first_stay=FIRST_ARRIVAL, last_stay=FIRST_ARRIVAL + dt.timedelta(days=10),
+                             score_first=FIRST_ARRIVAL, score_last=FIRST_ARRIVAL + dt.timedelta(days=10),
+                             marks=(1,), drive_from=FIRST_ARRIVAL + dt.timedelta(days=9))
+        finally:
+            pilot.time = real
+        self.assertEqual((out.seconds, out.cpu_seconds), (984.0, 21.0))
+        self.assertEqual(out.days, 11)
+
 
 class Windows(unittest.TestCase):
     def tearDown(self):
@@ -1789,6 +1824,10 @@ class RunOne(unittest.TestCase):
         self.assertEqual(w["fits"], 10)
         self.assertGreater(w["solves"], 0)
         self.assertGreater(w["seconds"], 0)
+        # Both clocks are published, each rounded to a tenth; WalkValidation
+        # pins their exact values against a stub clock.
+        self.assertEqual(w["cpu_seconds"], round(self.payload["walk"]["cpu_seconds"], 1))
+        self.assertIsInstance(w["cpu_seconds"], float)
 
     def test_the_progress_line_counts_the_cut_replays_the_grid_runs(self):
         """The line a hotel reads while table 3 runs says how many cut replays
@@ -3664,22 +3703,23 @@ class PerNightDemand(unittest.TestCase):
     def tearDown(self):
         _reset_config()
 
-    def _capped(self, rows, cap=12):
+    def _capped(self, rows, cap=12, last=dt.date(2024, 4, 30)):
         res = ingest.load(_csv(rows), FIXTURE_HOTEL, seed=1)
         kept, _cut = holdout.cut_history(res.bookings, cap, "sell_until_full",
                                          dt.date(2024, 4, 30))
         led, capped = holdout.capped_ledger(kept, res.hotel, cap,
-                                            dt.date(2024, 2, 1), dt.date(2024, 4, 30),
+                                            dt.date(2024, 2, 1), last,
                                             snapshot_horizon=0)
         return res, led, capped
 
-    def _rows(self, rate="120"):
+    def _rows(self, rate="120", days=60):
         """Sixty nights from Thursday 1 February: every Monday and Tuesday
         fourteen rooms, every other night six.  Cut to twelve, so eight
         Mondays and eight Tuesdays sit at the cap and are censored, and every
-        other night is left open."""
+        other night is left open.  Fifty-three nights stop one Monday and one
+        Tuesday short of the gate."""
         rows = []
-        for day in range(60):
+        for day in range(days):
             d = dt.date(2024, 2, 1) + dt.timedelta(days=day)
             sold = 14 if day % 7 in (4, 5) else 6
             for i in range(sold):
@@ -3714,6 +3754,36 @@ class PerNightDemand(unittest.TestCase):
         for d in full:
             self.assertEqual(led.snapshots[d][0], 12)
             self.assertAlmostEqual(est[d], 12.0 + math.sqrt(2.0 / math.pi), places=9)
+
+    def test_a_class_one_night_short_of_the_gate_is_read_off_the_house_series(self):
+        """Fifty-three nights, replayed to the last of them: seven Mondays and
+        seven Tuesdays at the cap, censored, one short of MIN_CLASS_OBS.  The
+        replay has to stop there, because an empty trough Monday inside it is
+        a night of that class too and would make the eighth.  Each class's own
+        fit would lift its nights to 12 + sqrt(2/pi), exactly as the
+        eight-night class above is lifted; the house series, with 39 open
+        sixes in it, lifts them to somewhere else, and that is the value table
+        3 prints.  The engine's own ClassDemand.mean has no such gate and
+        would have used the seven-night fit; a gate that read the engine's
+        rule, or one set below eight, prints the class's own value here and
+        is red."""
+        _res, led, capped = self._capped(self._rows(days=53), last=dt.date(2024, 3, 24))
+        nights = sorted(led.settled)
+        self.assertEqual((min(nights), max(nights), len(nights)),
+                         (dt.date(2024, 2, 1), dt.date(2024, 3, 24), 53))
+        est = holdout.per_night_demand(led, capped, nights)
+        full = [d for d in nights if led.settled[d]["rooms_sold"] == 12]
+        self.assertEqual([d.weekday() for d in full], [0, 1] * 7)
+        from pace.unconstrain import project_detruncate
+        seen = holdout.observations(led, capped, nights)
+        order = [d for d in nights if d in seen]
+        _mu, _sigma, imputed = project_detruncate([seen[d] for d in order])
+        house = dict(zip(order, imputed))
+        own = 12.0 + math.sqrt(2.0 / math.pi)
+        for d in full:
+            self.assertAlmostEqual(est[d], house[d], places=9)
+            self.assertNotAlmostEqual(est[d], own, places=3)
+        self.assertEqual(holdout.MIN_CLASS_OBS, 8)
 
     def test_the_estimate_does_not_move_when_the_rates_move(self):
         """The price term is out. class_demand divides each segment by its

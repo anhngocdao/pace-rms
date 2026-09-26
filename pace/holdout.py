@@ -310,7 +310,12 @@ def capped_ledger(kept, hotel: Hotel, cap_rooms: int, first: dt.date, last: dt.d
     return ingest.replay(kept, capped, first, last, rep), capped
 
 
-MIN_CLASS_OBS = 8        # the gate PaceCurves uses before it trusts a class
+# Table 3's own gate before it reads a class's fit instead of the house's.  The
+# engine has none: forecast.py reads ClassDemand.mean(key), which falls back to
+# the house only when the class is absent.  per_night_demand says why this
+# table departs from it; 8 is the count PaceCurves (otb.py, min_obs) asks for
+# before it trusts a class's pace curve.
+MIN_CLASS_OBS = 8
 MIN_SCORED = 20
 BUCKETS = ("under 5 percent", "5 to 15 percent", "over 15 percent")
 THRESHOLDS = (0.80, 0.85, 0.90)    # settings.json holdout_clean_thresholds
@@ -437,10 +442,20 @@ def per_night_demand(ledger, hotel: Hotel, nights) -> Dict[dt.date, float]:
     `observations` gives each night's value and flag, and project_detruncate
     returns one imputed value per observation, so keeping the dates in the
     order they went in gives a per-night estimate rather than a class mean.  A
-    night the flag leaves open comes back as its own observation.  A class
-    thinner than MIN_CLASS_OBS falls back to the house series, which is the
-    same gate PaceCurves uses.  A night with no lead-0 snapshot is not in the
-    sample and not in the answer, as in class_demand.
+    night the flag leaves open comes back as its own observation.  A night with
+    no lead-0 snapshot is not in the sample and not in the answer, as in
+    class_demand.
+
+    A class thinner than MIN_CLASS_OBS is read off the house series instead of
+    its own.  That is this table's choice and not the engine's: forecast.py
+    reads ClassDemand.mean(key), which has no count gate and falls back to the
+    house only when the class is absent, so the engine would trust a class of
+    one night.  A class of one night is not an estimate, and a table scoring
+    the unconstrainer must not print one as though it were, so the count
+    PaceCurves asks for before it trusts a class's pace curve is asked for
+    here too.  The gate never fires on H1 or H2, whose 21 classes each hold at
+    least 24 nights, so no published number moves on it; a test on a
+    seven-night class says which series is used when it does.
     """
     order: Dict[tuple, List[dt.date]] = defaultdict(list)
     obs: Dict[tuple, List[Tuple[float, bool]]] = defaultdict(list)

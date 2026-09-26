@@ -88,7 +88,12 @@ class WalkResult:
     engine: PaceEngine
     records: Dict[Tuple[dt.date, int], WalkRecord] = field(default_factory=dict)
     days: int = 0
+    # Wall clock and this process's CPU time, both over the whole walk.  The
+    # wall clock is what a hotel waits for and the CPU time is what the code
+    # costs: this machine recorded 984 s and 21 s of wall clock for identical
+    # code, and only the second figure says which of the two changed.
     seconds: float = 0.0
+    cpu_seconds: float = 0.0
     report: Optional[Report] = None
 
 
@@ -142,6 +147,7 @@ def walk(bookings: List[Booking], hotel: Hotel, cal: EventCalendar,
     rid = 0
     days = 0
     started = time.time()
+    started_cpu = time.process_time()
 
     while day <= last_stay:
         driving = day >= drive_from
@@ -204,7 +210,8 @@ def walk(bookings: List[Booking], hotel: Hotel, cal: EventCalendar,
         day += dt.timedelta(days=1)
 
     return WalkResult(ledger=ledger, engine=engine, records=records, days=days,
-                      seconds=time.time() - started, report=rep)
+                      seconds=time.time() - started,
+                      cpu_seconds=time.process_time() - started_cpu, report=rep)
 
 
 FULL_NIGHT_NOTE = (
@@ -578,6 +585,7 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
                    "settings_path": settings_path,
                    "sha256_matches_the_recorded_one": digest == PREREG_SHA256},
         "walk": {"days": out.days, "seconds": round(out.seconds, 1),
+                 "cpu_seconds": round(out.cpu_seconds, 1),
                  "fits": len(out.engine.fit_log), "records": len(out.records),
                  "marks": [int(m) for m in marks], "solves": out.engine.solves,
                  "over_capacity": walk_warnings},
