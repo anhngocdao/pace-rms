@@ -18,3 +18,7 @@ Outputs `h1-bookings.csv`, `h2-bookings.csv`, `h1-hotel.json`, `h2-hotel.json`
 and `audit.md`, all ignored by git.
 
 Pre-registration commit: d23024c
+
+The sha256 `pace/pilot.py` records, `f59937ba...`, is of the file at 5d58422
+(2026-09-19), whose only additions after the download are inside the block
+labelled `_added_after_the_download`.
