@@ -4222,6 +4222,7 @@ class Grid(unittest.TestCase):
                       "sum to 18 across the grid, but that is 9 nights",
                       "9 nights of the window sit in the band",
                       "The window took nothing from that band",
+                      "scored 9 censored nights against the gate of 20",
                       "not a defect of this engine's unconstrainer",
                       "neither confirms nor refutes"):
             self.assertIn(words, sentence)

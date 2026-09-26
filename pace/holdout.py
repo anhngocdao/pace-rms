@@ -396,9 +396,9 @@ NO_SAMPLE = _NO_SAMPLE_HEAD + (
 # sentence must not say it was.
 NO_SAMPLE_WINDOW_TOOK_NOTHING = _NO_SAMPLE_HEAD + (
     "The window took nothing from that band, so it is not what emptied this "
-    "sample: of those %(band)d clean nights the capped history flagged and "
-    "scored %(best)d. That is not a defect of this engine's unconstrainer, "
-    "which this table therefore neither confirms nor refutes.")
+    "sample: the combination scored %(best)d censored nights against the gate "
+    "of %(gate)d. That is not a defect of this engine's unconstrainer, which "
+    "this table therefore neither confirms nor refutes.")
 
 
 def observations(ledger, hotel: Hotel, nights) -> Dict[dt.date, Tuple[float, bool]]:
