@@ -210,3 +210,7 @@ show what the optimizer wanted before policy touched it.
 Drop a file into `plugins/` and it loads on the next run. Nothing else to
 register. Two worked examples ship in the box; the interfaces are in
 [EXTENDING.md](EXTENDING.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
