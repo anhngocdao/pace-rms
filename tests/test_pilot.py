@@ -1,6 +1,7 @@
 import collections
 import contextlib
 import csv
+import dataclasses
 import datetime as dt
 import hashlib
 import io
@@ -626,6 +627,37 @@ class Windows(unittest.TestCase):
         # the settled figure agree on both full nights: the snapshot-based
         # count lands on the same night as the settled-based one here, even
         # though the two reads can disagree on real data.
+        self.assertEqual(gap["full_but_uncensored_by_snapshot"], 1)
+
+    def test_the_snapshot_count_reads_the_snapshot_and_not_the_settled_figure(self):
+        """The two counts read two figures, and a fixture where the figures
+        agree cannot tell a function that reads the settled figure twice from
+        one that reads each once.  Here they part: 02-01 has nineteen stayed
+        singles, one no-show and one comp room, so the house is physically
+        full at twenty, the lead-0 snapshot holds twenty because the no-show
+        is still on the books when it is taken, and the settlement, which
+        releases the no-show, records nineteen.  Full but invisible by the
+        settled figure; censored, and so not in the second count, by the
+        snapshot.  02-02 is nineteen stayed and one comp room, short of the
+        cut in both reads, and 02-03 is twenty stayed, full in both.  So the
+        settled count is two nights and the snapshot count is one; a second
+        count that re-read the settled figure would say two."""
+        rows = [_row(booking_id="S%d" % i, arrival="2024-02-01", nights="1") for i in range(19)]
+        rows += [_row(booking_id="N1", arrival="2024-02-01", nights="1", status="no_show"),
+                 _row(booking_id="C1", segment="COMP", rate="0", arrival="2024-02-01", nights="1")]
+        rows += [_row(booking_id="T%d" % i, arrival="2024-02-02", nights="1") for i in range(19)]
+        rows += [_row(booking_id="C2", segment="COMP", rate="0", arrival="2024-02-02", nights="1")]
+        rows += [_row(booking_id="V%d" % i, arrival="2024-02-03", nights="1") for i in range(20)]
+        res = self._bookings(rows)
+        night = dt.date(2024, 2, 1)
+        self.assertEqual(ingest.physical_occupancy(res.bookings)[night], 20)
+        self.assertEqual(res.ledger.snapshots[night][0], 20)
+        self.assertEqual(res.ledger.settled[night]["rooms_sold"], 19)
+        gap = pilot.full_night_gap(res.bookings, res.ledger, res.hotel,
+                                   dt.date(2024, 2, 1), dt.date(2024, 2, 3))
+        self.assertEqual(gap["nights"], 3)
+        self.assertEqual(gap["physically_full"], 3)
+        self.assertEqual(gap["full_but_invisible"], 2)
         self.assertEqual(gap["full_but_uncensored_by_snapshot"], 1)
 
     def test_the_trim_is_measured_against_the_rows_that_reach_the_ledger(self):
@@ -3535,6 +3567,11 @@ def _t3_rows():
       inside a window of one, the 8th and the 10th, are not clean.  The 10th
       is fifteen singles cut to twelve, the same shape as the 3rd, and is
       scored only if the window is dropped.
+    - 12 Feb, twelve singles: exactly the cap, so nothing is refused and the
+      capped history sells what the real one sold, and its lead-0 snapshot of
+      twelve is over the censoring line.  Clean, censored, and not scored,
+      because the cut took nothing from it: the one night that tells
+      censored_clean from censored_scored.
     - every other night a handful of singles, never cut.
     """
     rows = []
@@ -3545,7 +3582,7 @@ def _t3_rows():
     rows += _t3_singles(4, 1, "D04N", status="no_show")
     rows += _t3_singles(4, 11, "D04-")
     for day, n in ((5, 6), (6, 7), (7, 4), (8, 10), (9, 19), (10, 15), (11, 6),
-                   (12, 5), (13, 9), (14, 3)):
+                   (12, 12), (13, 9), (14, 3)):
         rows += _t3_singles(day, n, "D%02d-" % day)
     rows += [_row(booking_id="SPAN2", booked_on=T3_LATE, arrival="2024-02-02", nights="2"),
              _row(booking_id="LATE4", booked_on=T3_LATE, arrival="2024-02-04", nights="1"),
@@ -3557,11 +3594,12 @@ def _t3_rows():
 # The capped history as class_demand sees it, worked out by hand from the
 # rows above: (rooms sold, censored) for every night with a lead-0 snapshot,
 # in date order.  The 4th sold 11 and is censored, because its snapshot held
-# 12.  Every night is here, clean or not, because the unconstrainer is handed
-# the whole cut history.
+# 12; the 12th sold 12, at the cap with nothing refused, and is censored too.
+# Every night is here, clean or not, because the unconstrainer is handed the
+# whole cut history.
 T3_SAMPLE = [(0.0, False), (5.0, False), (8.0, False), (12.0, True), (11.0, True),
              (6.0, False), (7.0, False), (4.0, False), (10.0, False), (12.0, True),
-             (12.0, True), (6.0, False), (5.0, False), (9.0, False), (3.0, False)]
+             (12.0, True), (6.0, False), (12.0, True), (9.0, False), (3.0, False)]
 T3_SAMPLE_NIGHTS = [dt.date(2024, 1, 31)] + [_feb(d) for d in range(1, 15)]
 
 
@@ -3694,11 +3732,14 @@ class Table3Night(unittest.TestCase):
     def test_the_fixture_is_the_one_described(self):
         self.assertEqual(self.capped.rooms, 12)
         self.assertEqual({d: self.res.ledger.settled[d]["rooms_sold"]
-                          for d in (_feb(2), _feb(3), _feb(4), _feb(5), _feb(9), _feb(10))},
+                          for d in (_feb(2), _feb(3), _feb(4), _feb(5), _feb(9), _feb(10),
+                                    _feb(12))},
                          {_feb(2): 9, _feb(3): 16, _feb(4): 12, _feb(5): 6, _feb(9): 19,
-                          _feb(10): 15})
+                          _feb(10): 15, _feb(12): 12})
         self.assertEqual(self.led.settled[_feb(4)]["rooms_sold"], 11)
         self.assertEqual(self.led.snapshots[_feb(4)][0], 12)
+        self.assertEqual((self.led.settled[_feb(12)]["rooms_sold"], self.led.snapshots[_feb(12)][0]),
+                         (12, 12))
         self.assertEqual(self.led.seg_rooms[_feb(3)]["CORP"], 3)
         self.assertEqual(self.led.seg_rooms[_feb(3)]["RETAIL"], 9)
         self.assertNotIn(dt.date(2024, 1, 30), self.led.snapshots)
@@ -3771,46 +3812,82 @@ class Table3Night(unittest.TestCase):
 
     def test_the_counts_beside_the_cell(self):
         """Fourteen clean nights: the 29th to the 7th and the 11th to the
-        14th.  Two of them censored in the capped history, the 3rd and the
-        4th.  Three lost rooms on the settled figure, the 2nd to the 4th; the
-        5th was reached by the gross cut and lost nothing.  Eighteen room
-        nights refused gross, cancellations and the busy nights included."""
+        14th.  Three of them censored in the capped history, the 3rd, the 4th
+        and the 12th, and only the first two scored: the 12th sold the cap
+        exactly and lost nothing, so censored_clean is three against a
+        censored_scored of two, and a count of clean censored nights taken
+        from the scored rows would say two.  Three lost rooms on the settled
+        figure, the 2nd to the 4th; the 5th was reached by the gross cut and
+        lost nothing.  Eighteen room nights refused gross, cancellations and
+        the busy nights included.  Four nights in the band the cap can
+        censor, the 3rd, 4th, 10th and 12th, three of them clean at this
+        window."""
         combo = self._combo()
         self.assertEqual(
             dict((k, combo[k]) for k in ("clean_nights", "censored_clean", "cut_nights",
                                          "cut_room_nights_gross", "scored",
                                          "censored_scored", "uncensored_scored", "cap_rooms",
                                          "censorable_band_nights", "censorable_band_clean")),
-            {"clean_nights": 14, "censored_clean": 2, "cut_nights": 3,
+            {"clean_nights": 14, "censored_clean": 3, "cut_nights": 3,
              "cut_room_nights_gross": 18, "scored": 3, "censored_scored": 2,
              "uncensored_scored": 1, "cap_rooms": 12,
-             "censorable_band_nights": 3, "censorable_band_clean": 2})
+             "censorable_band_nights": 4, "censorable_band_clean": 3})
         self.assertEqual(combo["uncensored"], {"n": 1, "mean_rooms_cut": 1.0})
+        self.assertNotIn("2024-02-12", [r["date"] for r in combo["nights"]])
+
+    def test_the_cut_share_is_over_the_real_night_and_not_the_capped_one(self):
+        """The 3rd sold sixteen and the cap left twelve, so the cut is a
+        quarter of the night, 4 of 16, and not a third of what was left, 4 of
+        12.  On H1 twelve night-rows change bucket between the two."""
+        by_date = dict((r["date"], r) for r in self._combo()["nights"])
+        third = by_date["2024-02-03"]
+        self.assertEqual((third["known"], third["capped"], third["cut_rooms"]), (16.0, 12.0, 4.0))
+        self.assertEqual(third["cut_share"], 4 / 16.0)
+        self.assertNotEqual(third["cut_share"], 4 / 12.0)
+        for row in by_date.values():
+            self.assertEqual(row["cut_share"], row["cut_rooms"] / row["known"])
+            self.assertEqual(row["bucket"], holdout.bucket_of(row["cut_rooms"] / row["known"]))
+
+    def test_the_cap_is_rounded_to_the_nearest_room_and_not_truncated(self):
+        """Every fixture hotel has twenty rooms and every pre-registered cap
+        of it is a whole number, so truncation is invisible until the room
+        count is one whose products are not: 21 rooms give 12.6 and 14.7,
+        which round to 13 and 15 and truncate to 12 and 14.  At H1's 187
+        rooms truncation moves the 0.70 cap from 131 to 130 and the 0.80 cap
+        from 150 to 149, sixteen of the twenty-four combinations."""
+        hotel = dataclasses.replace(self.res.hotel, rooms=21)
+        caps = {}
+        for cap in (0.60, 0.70):
+            combo = holdout.score_combo(self.res.bookings, hotel, self.res.ledger,
+                                        T3_FIRST, T3_LAST, 0.90, cap, "sell_until_full", 1)
+            caps[cap] = combo["cap_rooms"]
+        self.assertEqual(caps, {0.60: 13, 0.70: 15})
+        self.assertEqual([int(round(c * 187)) for c in holdout.CAPS], [112, 131, 150])
 
     def test_the_band_the_cap_can_censor_is_counted_with_and_without_the_window(self):
         """The band is physical occupancy from the capped hotel's censoring
         line, 11.64 rooms, up to the clean threshold of 18: the 3rd at 16, the
-        4th at 12 and the 10th at 15.  The 10th sits beside the 9th's nineteen,
-        so at a window of one it is in the band and not clean, and with the
-        window dropped it is both.  A count that read the clean list for the
-        band, or the band for the clean list, would give 2 and 2 or 3 and 3 at
-        window 1."""
+        4th at 12, the 10th at 15 and the 12th at 12.  The 10th sits beside the
+        9th's nineteen, so at a window of one it is in the band and not clean,
+        and with the window dropped it is both.  A count that read the clean
+        list for the band, or the band for the clean list, would give 3 and 3
+        or 4 and 4 at window 1."""
         at_one = self._combo(window=1)
         at_zero = self._combo(window=0)
         self.assertEqual((at_one["censorable_band_nights"], at_one["censorable_band_clean"]),
-                         (3, 2))
+                         (4, 3))
         self.assertEqual((at_zero["censorable_band_nights"], at_zero["censorable_band_clean"]),
-                         (3, 3))
+                         (4, 4))
         clean_at_one = holdout.clean_nights(self.res.bookings, self.res.hotel, T3_FIRST, T3_LAST,
                                             0.90, 1)
         self.assertNotIn(_feb(10), clean_at_one)
         self.assertIn(_feb(10), holdout.clean_nights(self.res.bookings, self.res.hotel, T3_FIRST,
                                                      T3_LAST, 0.90, 0))
         occ = ingest.physical_occupancy(self.res.bookings)
-        self.assertEqual([occ[d] for d in (_feb(3), _feb(4), _feb(10))], [16, 12, 15])
+        self.assertEqual([occ[d] for d in (_feb(3), _feb(4), _feb(10), _feb(12))], [16, 12, 15, 12])
         self.assertEqual([d for d in sorted(occ) if T3_FIRST <= d <= T3_LAST
                           and 12 * 0.97 <= occ[d] < 18],
-                         [_feb(3), _feb(4), _feb(10)])
+                         [_feb(3), _feb(4), _feb(10), _feb(12)])
 
     def test_the_unconstrainer_s_error_is_over_the_censored_nights_only(self):
         e3, e4 = self.expected[_feb(3)], self.expected[_feb(4)]
@@ -3868,7 +3945,7 @@ class Table3Night(unittest.TestCase):
         from fifteen to twelve, is scored and censored."""
         combo = self._combo(window=0)
         self.assertEqual((combo["clean_nights"], combo["censored_clean"],
-                          combo["censored_scored"]), (16, 3, 3))
+                          combo["censored_scored"]), (16, 4, 3))
 
 
 def _t3_blocks(n):
@@ -4000,8 +4077,10 @@ class Grid(unittest.TestCase):
         """The seventeen-night fixture at a window of one.  The largest
         combination is the first at cap twelve with two censored nights, the 3rd
         and the 4th, at threshold 0.85 (0.90 ties it on every count and comes
-        later); its band holds the 3rd, the 4th and the 10th, and the window
-        takes the 10th, which sits beside the 9th's nineteen rooms.  Summed over
+        later); its band holds the 3rd, the 4th, the 10th and the 12th, and the
+        window takes the 10th, which sits beside the 9th's nineteen rooms.  The
+        12th is in the band, clean and censored, and never scored, because at
+        exactly the cap it lost nothing.  Summed over
         the grid: two censored nights in each of the six cells at cap twelve
         under 0.85 and 0.90, one (the 3rd) in each of the six at cap fourteen,
         none at cap sixteen where the 3rd is censored but loses nothing, and
@@ -4013,9 +4092,9 @@ class Grid(unittest.TestCase):
         sentence = grid["notes"][-1]
         self.assertEqual(sentence, holdout.NO_SAMPLE % dict(
             gate=20, combos=24, best=2, summed=18, distinct=2, window=1, threshold=0.85,
-            cap_rooms=12, rule="sell until full", band=3, band_clean=2, lo=11.64, hi=17.0))
-        for words in ("neighbour window at 0 all 3 of them are clean",
-                      "with the window of 1 nights 2 are",
+            cap_rooms=12, rule="sell until full", band=4, band_clean=3, lo=11.64, hi=17.0))
+        for words in ("neighbour window at 0 all 4 of them are clean",
+                      "with the window of 1 nights 3 are",
                       "What empties the sample is that window, not the cap",
                       "no busy night within 1 nights on either side",
                       "The window is the pre-registered one",
