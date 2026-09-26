@@ -154,8 +154,10 @@ def cut_history(bookings, cap_rooms: int, rule: str, last_stay: dt.date,
     taken, so it is held for the rest of that day and given back at the end of
     it; without that second pass a same-day cancellation would hold its room for
     the rest of the history and the cut would refuse hundreds of rows on
-    inventory nobody was ever in.  1,263 of H1's 10,831 dated cancellations fall
-    on their own booking day.  `ingest.replay` cancels after the day's bookings
+    inventory nobody was ever in.  Of the rows this function decides, 1,256 of
+    H1's 10,796 dated cancellations fall on their own booking day; the file
+    holds 10,831 and 1,263, the other 35 being NONREV and zero-night rows that
+    are handed back undecided.  `ingest.replay` cancels after the day's bookings
     for every cancellation and not only for the same-day ones, so the two agree
     on the same-day case and differ on the ordinary one, on purpose: the replay
     books every row it is handed and the order only moves a snapshot, while this

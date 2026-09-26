@@ -17,7 +17,11 @@ the engine alone forecasts they are 39.0, 16.3 and 50.4 percent. A method
 rescued by the clamp has to be visible as one.
 
 Lead 1 is on its own line and measures late cancellations and no-shows, which
-is an overbooking question and not a demand question.
+is an overbooking question and not a demand question.  Its note carries the
+run's own count of scoring nights that finished below their lead-1 on the
+books, computed by below_lead1 rather than typed in: at H1 that is 41 of 427,
+9.6 percent, with the engine's bias at lead 1 +1.19 over those 427 nights and
++1.20 over the 415 the table prints.
 """
 import datetime as dt
 from collections import defaultdict
@@ -45,12 +49,13 @@ TABLE1_NOTE = (
     "a night, and no rate other than the one that was charged was ever offered to "
     "a guest. Errors are in rooms and as a share of mean capacity, and capacity is "
     "sellable rooms minus the comp rooms already entered on the forecast day.")
+# Filled by score() from below_lead1: the share, the count and the population.
 LEAD1_NOTE = (
     "Lead 1 measures late cancellations and no-shows, an overbooking question and "
     "not a demand question. The engine floors every forecast at rooms on the books "
-    "(forecast.py:91), so it cannot forecast a decline; at H1, 7.5 percent of "
-    "scoring nights finish below their lead-1 on the books and the bias on this "
-    "line is that floor, not an error better forecasting would remove.")
+    "(forecast.py:91), so it cannot forecast a decline; on this run %.1f percent of "
+    "scoring nights (%d of %d) finish below their lead-1 on the books, and the bias "
+    "on this line is that floor, not an error better forecasting would remove.")
 SEASON_NOTE = (
     "High, shoulder and low are terciles of monthly occupancy in the warm-up year "
     "alone, four months each. They are not hotel.json's demand_season_band, which "
@@ -102,6 +107,30 @@ def cell(raw: List[float], clamped: List[float], actual: List[float],
             "mae_share": (mae / cap_mean) if cap_mean > 0 else None,
             "bias": fmean(errs),
             "clamp_share": sum(1 for r, c in zip(raw, capacity) if r > c) / float(n)}
+
+
+def below_lead1(walk_result, first: dt.date, last: dt.date) -> Dict[str, object]:
+    """Scoring nights that settled below their lead-1 on the books.
+
+    The population is every night of the window with a lead-1 record, a lead-1
+    on-the-books figure and a settled actual, which at H1 is all 427; the
+    table's own lead-1 row is the narrower 415 every method forecasts.  A
+    night finishes below its books when the rooms that stayed are fewer than
+    the rooms on the books the day before: the late cancellations and the
+    no-shows the floor at forecast.py:91 cannot forecast.
+    """
+    below = nights = 0
+    d = first
+    while d <= last:
+        rec = walk_result.records.get((d, pilot.LATE_MARK))
+        act = baselines.actual(walk_result.ledger, d)
+        if rec is not None and rec.otb is not None and act is not None:
+            nights += 1
+            if act < rec.otb:
+                below += 1
+        d += dt.timedelta(days=1)
+    return {"nights": nights, "below": below,
+            "share": (below / float(nights)) if nights else None}
 
 
 def _blank():
@@ -186,11 +215,14 @@ def score(walk_result, hotel, bookings, nonrev, marks, score_first: dt.date,
                      "best_single": best if beats else None,
                      "best_single_mae": singles[best] if beats else None}
 
+    late = below_lead1(walk_result, score_first, score_last)
+    lead1_note = LEAD1_NOTE % (100.0 * (late["share"] or 0.0), late["below"], late["nights"])
     return {"leads": [str(m) for m in leads], "late_lead": str(pilot.LATE_MARK),
             "methods": list(METHODS),
             "season_of_month": {str(m): s for m, s in seasons.items()},
             "overall": overall,
             "cuts": cuts,
             "headline": head,
-            "notes": [TABLE1_NOTE, LEAD1_NOTE, SEASON_NOTE, EVENT_NOTE,
+            "below_lead1_books": late,
+            "notes": [TABLE1_NOTE, lead1_note, SEASON_NOTE, EVENT_NOTE,
                       baselines.BASELINE_NOTE]}

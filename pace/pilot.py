@@ -6,7 +6,7 @@ and `seg_revenue` the same way; `asof` sets the lead and nothing else.  Handed
 the finished ledger and swept backwards it answers a question about March with
 the books of August, and it does not raise, warn or return None.  Measured on
 H1 stay date 2016-08-13, which finished at 183 rooms: at lead 120 it was handed
-183 when 131 were really on the books, and forecast 275.
+183 when 131 were really on the books.
 
 So the pilot owns the day loop.  One Ledger is mutated forward through time and
 the engine is called inside it.  Controls come first, on the books as they
@@ -605,7 +605,7 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
         window = int(percentile([float(b.nights) for b in ledger_rows(res.bookings)], 0.90))
         if progress:
             print("    table 3: %d cut replays of the history, neighbour window %d"
-                  % (8 * len(holdout.RULES), window), flush=True)
+                  % (len(holdout.grid_cells()), window), flush=True)
         payload["table3"] = holdout.run_grid(res.bookings, res.hotel, out.ledger,
                                              first_stay, last_stay, window)
     with open(path, "w", encoding="utf-8") as fh:

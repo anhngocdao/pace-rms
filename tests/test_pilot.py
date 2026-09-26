@@ -1301,6 +1301,47 @@ class Scoring(unittest.TestCase):
         # LEAD1_NOTE do not contain it).
         self.assertIn("nothing in this table prices a night", text)
 
+    def test_the_lead_1_note_counts_the_nights_that_finished_below_their_books(self):
+        """The note's number is computed from the walk, never typed in, so it
+        cannot go stale; this test counts the same nights again from the
+        walk's own lead-1 records and the ledger's settled rows, and pins the
+        fixture's count as a literal beside that, the way RunOne pins its
+        record counts.  On this history 20 of the 89 scoring nights settle
+        below their lead-1 on the books and the other 69 settle exactly on it,
+        which is what a count that took `at or below` would get wrong.
+
+        H1's own figure is 41 of 427, 9.6 percent, measured on the real walk
+        and quoted in the write-up; the fixture cannot reproduce it, so the
+        template is formatted with it here to pin the sentence the write-up
+        quotes to the arithmetic that produces it."""
+        res, out = walked()
+        table = S.score(out, res.hotel, res.bookings, res.nonrev, TEST_MARKS,
+                        SCORE_FIRST, SCORE_LAST, FIRST_ARRIVAL,
+                        SCORE_FIRST - dt.timedelta(days=1))
+        below = nights = on_the_books = 0
+        d = SCORE_FIRST
+        while d <= SCORE_LAST:
+            rec = out.records.get((d, 1))
+            row = out.ledger.settled.get(d)
+            if rec is not None and rec.otb is not None and row is not None:
+                nights += 1
+                below += 1 if row["rooms_sold"] < rec.otb else 0
+                on_the_books += 1 if row["rooms_sold"] == rec.otb else 0
+            d += dt.timedelta(days=1)
+        self.assertEqual((nights, below, on_the_books), (89, 20, 69))
+        self.assertEqual(table["below_lead1_books"], {"nights": 89, "below": 20, "share": 20 / 89.0})
+        self.assertEqual(table["below_lead1_books"]["below"], below)
+        self.assertEqual(table["below_lead1_books"]["nights"], nights)
+        note = [n for n in table["notes"] if "cannot forecast a decline" in n]
+        self.assertEqual(len(note), 1)
+        self.assertIn("on this run 22.5 percent of scoring nights (20 of 89) finish below "
+                      "their lead-1 on the books", note[0])
+        self.assertIn("%.1f percent of scoring nights (%d of %d)" % (100.0 * below / nights,
+                                                                      below, nights), note[0])
+        self.assertIn("9.6 percent of scoring nights (41 of 427)",
+                      S.LEAD1_NOTE % (100.0 * 41 / 427, 41, 427))
+        self.assertNotIn("7.5 percent", S.LEAD1_NOTE)
+
 
 def _payload_rows():
     """The whole-run fixture: the shared synthetic history, plus two rows the
@@ -1656,9 +1697,15 @@ class RunOne(unittest.TestCase):
         cls.csv_path = _csv(cls.rows)
         cls.out_dir = tempfile.mkdtemp()
         cls.settings_path = _fixture_settings(os.path.join(cls.out_dir, "settings.json"))
-        cls.payload = pilot.run_one(cls.csv_path, FIXTURE_HOTEL, cls.settings_path, cls.out_dir,
-                                    score_first=SCORE_FIRST, score_last=SCORE_LAST,
-                                    warmup_end=SCORE_FIRST - dt.timedelta(days=1))
+        # Run with a progress interval and its stdout kept, so the lines a
+        # hotel watches during a run can be checked against what was run.
+        cls.printed = io.StringIO()
+        with contextlib.redirect_stdout(cls.printed):
+            cls.payload = pilot.run_one(cls.csv_path, FIXTURE_HOTEL, cls.settings_path,
+                                        cls.out_dir, score_first=SCORE_FIRST,
+                                        score_last=SCORE_LAST,
+                                        warmup_end=SCORE_FIRST - dt.timedelta(days=1),
+                                        progress=90)
         cls.written = os.path.join(cls.out_dir, "pilot-pilot.json")
         with open(cls.written, "rb") as fh:
             cls.on_disk = fh.read()
@@ -1742,6 +1789,16 @@ class RunOne(unittest.TestCase):
         self.assertEqual(w["fits"], 10)
         self.assertGreater(w["solves"], 0)
         self.assertGreater(w["seconds"], 0)
+
+    def test_the_progress_line_counts_the_cut_replays_the_grid_runs(self):
+        """The line a hotel reads while table 3 runs says how many cut replays
+        are coming: the pre-registered grid's own count, eight pairs of
+        threshold and cap under three rules, and the neighbour window read off
+        the CSV, not a number typed into the line."""
+        lines = [l for l in self.printed.getvalue().splitlines() if "table 3" in l]
+        self.assertEqual(lines, ["    table 3: 24 cut replays of the history, neighbour window 2"])
+        self.assertEqual(len(self.back["table3"]["combos"]), 24)
+        self.assertEqual(len(holdout.grid_cells()), 24)
 
     def test_the_ingest_block_carries_what_the_ingest_found(self):
         """The block is labelled `ingest`, so it says what ingest found.
