@@ -31,6 +31,13 @@ Its forecasts came out 275, 250, 219, 197, 192, 189 and 184 rooms. Any pilot
 written the obvious way would have produced a full set of plausible tables
 describing nothing.
 
+Corrected 26 September 2026, when the table was re-run at HEAD. The
+handed-versus-real half reproduces exactly, 183 against 131 at lead 120. The
+forecast row does not: the fit it came from was not recorded, and a fit over
+the whole history gives 245.5 at lead 120, not 275. The row stands as a dated
+record of what one unrecorded fit produced. The leak is the finding, and it is
+the half that reproduces; nothing in the plan depends on the forecast row.
+
 The consequence is structural: the pilot must own a day loop that mutates one
 `Ledger` forward through time and calls the engine inside it. `ingest.replay`
 has no hook of any kind, so that loop is roughly thirty lines the pilot writes
@@ -76,6 +83,16 @@ as-of series and is complete after one `ingest.load`: 335,995 entries across
    inside lead 14, so a recommendation read at lead 120 may have been computed
    at lead 133. The published rate is still right; the label is not.
 
+Corrected 26 September 2026, from a full H1 payload at HEAD, for traps 3 and
+4. Trap 3: 41 of 427 scoring nights, 9.6 percent, finish below their lead-1 on
+the books and the lead-1 bias is +1.19 rooms, not 7.5 percent and +0.9. Trap 4:
+on all 427 scoring nights lead 120 gives 38.96 raw, 16.33 clamped and 50.4
+percent above capacity, and lead 90 gives 31.90, 15.26 and 50.4; on the 415
+nights table 1 prints, which is the population the report quotes, lead 120
+gives 37.22, 16.58 and 48.9 and lead 90 gives 30.61, 15.48 and 48.9. The clamp
+still does half the work; the figures above were measured before the walk
+existed.
+
 ## Three things the design asks for that the code cannot give yet
 
 - **The meal plan does not survive the converter.** The booking-log schema has
@@ -94,6 +111,17 @@ as-of series and is complete after one `ingest.load`: 335,995 entries across
   to the unconstrainer. Closing the cheap channels first makes it worse, because
   removing the cheapest rows raises the realised rate, lowers modelled
   acceptance and raises the price-restated demand independently of any censoring.
+
+Corrected 26 September 2026, from a full H1 payload at HEAD. Table 2 scores
+the pinned share per mark: 155 of 346 at lead 60, 181 of 374 at 30, 171 of 388
+at 14 and 148 of 390 at 7, which is 655 of 1,498 over the four marks and 37.9
+to 48.4 percent per mark. The 168 of 413 above was measured before the walk
+existed and does not reproduce on a HEAD payload. The 5.7 percent named no
+population and reproduces on none tried (13.6 percent of priced occupied rows,
+6.8 of room type A); the reproducible figure is the converter's
+`rate_out_of_range` warning, 5,555 of H1's 40,060 rows and 6,965 of H2's
+79,330, priced outside the band on either side. The conclusion stands: table 2
+at H1 is dominated by the band.
 
 ## What the holdout actually needs
 
@@ -116,6 +144,20 @@ measured again. Those six numbers are right for every night the export covers,
 one `pilot.stay_window` returns, and over that window the counts are 45, 94 and
 109 at H1 and 144, 171 and 222 at H2. The survey's window, not its arithmetic,
 is what differs.
+
+Corrected 26 September 2026, when table 3 had run on both hotels. At H1 the
+sample is not small but empty: no combination reaches the gate of 20 censored
+nights, the largest reaches 9, and the ten censored nights of the whole grid
+are the same ten under different caps. What empties it is the pre-registered
+neighbour window, not the clean nights being quiet. At threshold 0.90 and cap
+112, 195 nights are censorable and below the clean threshold; with the window
+at 0 all 195 are clean and the combination is scorable (81 censored nights,
+MAE 25.4, bias -24.4); with the window of 8 only 16 are clean and 9 censored,
+because a stay spanning a busy night is refused for all its nights and the
+moderately busy nights a cap censors sit inside busy weeks. The result is H1's.
+At H2, with a window of 5, two of 24 combinations are scorable: 0.90/0.60 sell
+until full, n 26, MAE 25.63, bias -13.34; and 0.90/0.60 close cheap first,
+n 22, MAE 24.78, bias -14.29.
 
 ## Measured costs
 
