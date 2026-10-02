@@ -342,3 +342,68 @@ class Bands(unittest.TestCase):
         weeks = [(D(2024, 3, 25), D(2024, 3, 31))]
         self.assertTrue(handover.excluded(D(2024, 3, 27), weeks))
         self.assertFalse(handover.excluded(D(2024, 4, 1), weeks))
+
+
+class Scores(unittest.TestCase):
+    def tearDown(self):
+        _reset_config()
+
+    def _scored(self):
+        res, out = walked()
+        rows = handover.forecast_rows(res, out, res.hotel)
+        nights = [d for d in sorted({k[0] for k in rows}) if d < SCORE_FIRST]
+        score = [d for d in sorted({k[0] for k in rows}) if SCORE_FIRST <= d <= SCORE_LAST]
+        table = handover.bands(handover.errors(rows, res, nights))
+        return res, out, rows, table, score
+
+    def test_a_rate_is_not_printed_below_thirty_nights(self):
+        self.assertIsNone(handover.rate(3, 4))
+        self.assertAlmostEqual(handover.rate(24, 30), 0.8)
+
+    def test_the_alarm_fires_on_the_top_of_the_band_against_the_same_cut_as_the_event(self):
+        res, out, rows, table, score = self._scored()
+        a = handover.alarm_scores(rows, res, table, score)
+        self.assertEqual(a["nights"], len(score))
+        self.assertEqual(sum(1 for d in score if handover.sold_out(res, d)), a["events"])
+        for lead, cell in a["per_lead"].items():
+            self.assertLessEqual(cell["hits"], cell["warned"])
+            self.assertLessEqual(cell["hits"], cell["events"])
+
+    def test_notice_is_censored_at_fourteen_and_counted(self):
+        warned = {lead: True for lead in handover.LEADS}
+        self.assertEqual(handover.notice_of(warned), (14, True))
+        warned[9] = False
+        self.assertEqual(handover.notice_of(warned), (8, False))
+        warned[0] = False
+        self.assertEqual(handover.notice_of(warned), (None, False))
+
+    def test_the_kitchen_tiers_are_scored_as_promises(self):
+        band = {"n": 40, "p10": -6.0, "p50": -1.0, "p90": 4.0}
+        fc = 100.0        # band_of: lo 96, mid 101, hi 106
+        acts = [95.0, 102.0, 107.0, 99.0]
+        cov = handover.tier_scores(fc, band, acts)
+        self.assertEqual(cov["covering"]["short"], 1)          # 107 > 106
+        self.assertAlmostEqual(cov["covering"]["over_mean"], ((106 - 95) + (106 - 102) + (106 - 99)) / 3)
+        self.assertEqual(cov["balanced"]["short"], 2)          # 102 and 107 > 101
+        self.assertAlmostEqual(cov["balanced"]["over_mean"], ((101 - 95) + (101 - 99)) / 2)
+
+    def test_housekeeping_errors_are_kept_apart_and_the_roster_reads_the_bottom(self):
+        band = {"n": 40, "p10": -3.0, "p50": 0.0, "p90": 3.0}
+        self.assertEqual(handover.roster_short(20.0, band, [19.0, 18.0, 16.0]), (2, 1.5))  # bottom 17: 19 and 18 are short by 2 and 1
+
+    def test_the_count_the_log_cannot_speak_for_is_the_pilots_own(self):
+        res, out, rows, table, score = self._scored()
+        a = handover.alarm_scores(rows, res, table, score)
+        gap = pilot.full_night_gap(res.bookings, res.ledger, res.hotel, score[0], score[-1])
+        self.assertEqual(a["cannot_speak"], gap["full_but_invisible"])
+
+    def test_kitchen_and_housekeeping_scores_cover_every_lead_with_a_band(self):
+        res, out, rows, table, score = self._scored()
+        k = handover.kitchen_scores(rows, res, table, score)
+        h = handover.housekeeping_scores(rows, res, table, score)
+        for lead in handover.LEADS:
+            if table.get(("breakfast", lead)) is not None:
+                self.assertIsNotNone(k["breakfast"][lead], lead)
+                self.assertGreaterEqual(k["breakfast"][lead]["mae"], 0.0)
+            self.assertIn("departures", h[lead])
+            self.assertIn("stayovers", h[lead])

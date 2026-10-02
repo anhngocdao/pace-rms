@@ -441,3 +441,182 @@ def coverage(rows, res, band_table, nights, actual_of=_actual_of) -> Dict[Tuple[
                 n_in[1] += 1
     return {key: {"n": n, "inside": k, "share": (k / n) if n else None}
             for key, (n, k) in counts.items()}
+
+
+MIN_RATE_NIGHTS = 30
+
+
+def rate(k: int, n: int) -> Optional[float]:
+    """k of n, or None below the same 30-night floor that governs bands: a
+    recall of 3 of 4 is a number about four nights, not about the hotel."""
+    if n < MIN_RATE_NIGHTS:
+        return None
+    return k / n
+
+
+def sellout_cut(res, night: dt.date, asof: Optional[dt.date] = None) -> float:
+    """sellout_threshold x capacity_on, the pre-registered cut (spec 7.1)."""
+    return res.hotel.sellout_threshold * pilot.capacity_on(res.hotel, res.nonrev, night, asof)
+
+
+def sold_out(res, night: dt.date) -> bool:
+    a = baselines.actual(res.ledger, night)
+    return a is not None and a >= sellout_cut(res, night)
+
+
+def notice_of(warned: Dict[int, bool]) -> Tuple[Optional[int], bool]:
+    """The deepest lead L such that the warning was on at every lead from L
+    down to 0; (None, False) when it was off at lead 0; (14, True) when it was
+    on all the way, which is censored: the walk records nothing deeper."""
+    if not warned.get(0):
+        return None, False
+    deepest = 0
+    for lead in LEADS[1:]:
+        if warned.get(lead):
+            deepest = lead
+        else:
+            break
+    return deepest, deepest == HORIZON
+
+
+def alarm_scores(rows, res, band_table, nights) -> dict:
+    """Spec 7.1: precision, recall and notice of the sell-out warning, the
+    event count, and the nights the log cannot speak for."""
+    scored = sorted(set(nights))
+    events = {d: sold_out(res, d) for d in scored}
+    per_lead = {}
+    warned_by_night: Dict[dt.date, Dict[int, bool]] = {d: {} for d in scored}
+    for lead in LEADS:
+        warned = hits = n_events = 0
+        for d in scored:
+            row = rows.get((d, lead))
+            band = band_table.get(("rooms", lead))
+            if row is None or band is None:
+                continue
+            _, _, hi = band_of(row["rooms"], band)
+            on = hi >= sellout_cut(res, d, row["asof"])
+            warned_by_night[d][lead] = on
+            if events[d]:
+                n_events += 1
+            if on:
+                warned += 1
+                if events[d]:
+                    hits += 1
+        per_lead[lead] = {"warned": warned, "hits": hits, "events": n_events,
+                          "precision": rate(hits, warned), "recall": rate(hits, n_events)}
+    values, censored = [], 0
+    for d in scored:
+        if not events[d] or not warned_by_night[d]:
+            continue
+        n, cens = notice_of(warned_by_night[d])
+        if n is None:
+            continue
+        values.append(n)
+        censored += 1 if cens else 0
+    gap = (pilot.full_night_gap(res.bookings, res.ledger, res.hotel, scored[0], scored[-1])
+           if scored else {"full_but_invisible": 0})
+    return {
+        "threshold": res.hotel.sellout_threshold,
+        "nights": len(scored),
+        "events": sum(1 for d in scored if events[d]),
+        "per_lead": per_lead,
+        "notice": {"median": (pilot.percentile([float(v) for v in values], 0.5) if values else None),
+                   "censored": censored, "scored": len(values), "values": values},
+        "cannot_speak": gap["full_but_invisible"],
+    }
+
+
+def tier_scores(point: float, band: dict, actuals_list: List[float]) -> dict:
+    """Both tiers scored as promises: short share, and mean over-prep on the
+    days that were not short (spec 7.2)."""
+    _, mid, hi = band_of(point, band)
+    out = {}
+    for name, tier in (("covering", hi), ("balanced", mid)):
+        short = [a for a in actuals_list if a > tier]
+        over = [tier - a for a in actuals_list if a <= tier]
+        out[name] = {"tier": tier, "short": len(short), "n": len(actuals_list),
+                     "short_share": rate(len(short), len(actuals_list)),
+                     "over_mean": (fmean(over) if over else None)}
+    return out
+
+
+def kitchen_scores(rows, res, band_table, nights) -> dict:
+    """Spec 7.2: MAE in covers per meal per lead, and both tiers as promises."""
+    scored = sorted(set(nights))
+    out = {}
+    for meal in ("breakfast", "dinner"):
+        out[meal] = {}
+        for lead in LEADS:
+            band = band_table.get((meal, lead))
+            pairs = []
+            for d in scored:
+                row = rows.get((d, lead))
+                if row is None or row.get(meal) is None or band is None:
+                    continue
+                a = _actual_of(res, d, meal)
+                if a is None:
+                    continue
+                pairs.append((row[meal], float(a)))
+            if not pairs:
+                out[meal][lead] = None
+                continue
+            short_c = short_b = 0
+            over_c = over_b = 0.0
+            nc = nb = 0
+            for f, a in pairs:
+                _, mid, hi = band_of(f, band)
+                if a > hi:
+                    short_c += 1
+                else:
+                    over_c += hi - a
+                    nc += 1
+                if a > mid:
+                    short_b += 1
+                else:
+                    over_b += mid - a
+                    nb += 1
+            n = len(pairs)
+            out[meal][lead] = {
+                "n": n, "mae": fmean(abs(f - a) for f, a in pairs),
+                "covering": {"short": short_c, "short_share": rate(short_c, n),
+                             "over_mean": (over_c / nc) if nc else None},
+                "balanced": {"short": short_b, "short_share": rate(short_b, n),
+                             "over_mean": (over_b / nb) if nb else None},
+            }
+    return out
+
+
+def roster_short(point: float, band: dict, actuals_list: List[float]) -> Tuple[int, Optional[float]]:
+    """Rostering at the bottom of the band: days short-staffed, and by how
+    many rooms on those days."""
+    lo, _, _ = band_of(point, band)
+    short = [a - lo for a in actuals_list if a > lo]
+    return len(short), (fmean(short) if short else None)
+
+
+def housekeeping_scores(rows, res, band_table, nights) -> dict:
+    """Spec 7.3: departures and stayovers scored apart, and the p10 roster
+    line on departures, the expensive half."""
+    scored = sorted(set(nights))
+    out = {}
+    for lead in LEADS:
+        cell = {}
+        for q in ("departures", "stayovers"):
+            band = band_table.get((q, lead))
+            pairs = []
+            for d in scored:
+                row = rows.get((d, lead))
+                if row is None or row.get(q) is None:
+                    continue
+                a = _actual_of(res, d, q)
+                if a is None:
+                    continue
+                pairs.append((row[q], float(a)))
+            cell[q] = {"n": len(pairs), "mae": (fmean(abs(f - a) for f, a in pairs) if pairs else None)}
+            if q == "departures" and band is not None and pairs:
+                gaps = [a - band_of(f, band)[0] for f, a in pairs if a > band_of(f, band)[0]]
+                cell["roster"] = {"n": len(pairs), "short": len(gaps),
+                                  "short_share": rate(len(gaps), len(pairs)),
+                                  "short_rooms_mean": (fmean(gaps) if gaps else None)}
+        out[lead] = cell
+    return out
