@@ -18,6 +18,7 @@ from pace import holdout
 from pace import hotelconfig as HC
 from pace import ingest
 from pace import pilot
+from pace import pilotreport
 from pace import ratecheck
 from pace import score as S
 from pace.elasticity import acceptance as _price_acceptance
@@ -1778,10 +1779,10 @@ class RunOne(unittest.TestCase):
         self.assertEqual(self.payload["_json_path"], os.path.join(self.out_dir, "pilot-pilot.json"))
 
     def test_what_is_on_disk_is_the_payload_that_was_returned(self):
-        """Minus the path itself, which is added after the write and is the
-        one key the file cannot carry."""
+        """Minus the two paths, which are added after the write and are the
+        keys the file cannot carry."""
         self.assertEqual(self.back,
-                         {k: v for k, v in self.payload.items() if k != "_json_path"})
+                         {k: v for k, v in self.payload.items() if not k.startswith("_")})
 
     def test_the_windows_are_the_ones_the_run_was_asked_for(self):
         w = self.back["windows"]
@@ -2115,8 +2116,11 @@ class RunOne(unittest.TestCase):
         self.assertEqual(self.quick["windows"]["scoring_nights"], self.QUICK_NIGHTS)
         # The whole run's payload is untouched by the partial one.
         self.assertEqual(self.on_disk, self.on_disk_after_quick)
+        # The markdown beside each JSON carries the label the same way, so the
+        # quick run's report cannot overwrite the full run's either.
         self.assertEqual(sorted(f for f in os.listdir(self.out_dir) if f.startswith("pilot-")),
-                         ["pilot-pilot-quick.json", "pilot-pilot.json"])
+                         ["pilot-pilot-quick.json", "pilot-pilot-quick.md",
+                          "pilot-pilot.json", "pilot-pilot.md"])
 
 
 class RunOneErrors(unittest.TestCase):
@@ -2237,13 +2241,15 @@ class Switchboard(unittest.TestCase):
             "label": "full",
             "hotel": {"name": "H1 Resort Hotel", "code": "H1", "rooms": 187,
                       "rooms_inferred": True},
-            "walk": {"days": 898, "seconds": 16.1, "fits": 22, "records": 434},
+            "walk": {"days": 898, "seconds": 16.1, "cpu_seconds": 15.2, "fits": 22,
+                     "records": 434},
             "full_night_gap": {"nights": 414, "physically_full": 86,
                                "full_but_invisible": 25, "share_of_full_nights": 25 / 86.0},
             "table1": {"leads": ["30"], "late_lead": "1",
                        "overall": {"30": {"n": 62, "methods": methods},
                                    "1": {"n": 0, "methods": {"engine": {"mae": None}}}}},
             "_json_path": "/tmp/out/pilot-h1.json",
+            "_md_path": "/tmp/out/pilot-h1.md",
         }
 
     def test_the_pilot_command_needs_both_paths(self):
@@ -2326,7 +2332,11 @@ class Switchboard(unittest.TestCase):
         code, text = self._main(["pilot", "b.csv", "h.json"])
         self.assertEqual(code, 0)
         self.assertIn("H1 Resort Hotel (H1), 187 rooms, inferred", text)
-        self.assertIn("walked 898 days in 16.1 s, 22 fits, 434 forecasts recorded", text)
+        # Wall clock and CPU are printed side by side: on this machine I/O wait
+        # once made 984 s and 21 s out of identical code.
+        self.assertIn("walked 898 days in 16.1 s of wall clock and 15.2 s of CPU, 22 fits, "
+                      "434 forecasts recorded", text)
+        self.assertIn("wrote /tmp/out/pilot-h1.md", text)
         self.assertIn("nights physically full 86 of 414 in the window", text)
         self.assertIn("25 invisible to the ledger (29% of the full nights)", text)
         self.assertIn("lead 30   n=62   engine MAE   3.50 (clamped   25%), average   6.50", text)
@@ -4297,3 +4307,348 @@ class Grid(unittest.TestCase):
                               combo["censorable_band_nights"], combo["censorable_band_clean"]),
                              (40, 0, 0, 0, 0, 0))
             self.assertIsNone(combo["overall"]["mae"])
+
+
+def _payload_for_report(table2=None, table3=None, label="full"):
+    """A payload with the shape run_one writes at HEAD and numbers chosen by hand.
+
+    The gap block is run_one's real key set: two counts and two shares, each
+    naming its denominator, and no unlabelled "share".  ReportWriter checks
+    every key set here against a real quick run, so this fixture cannot
+    drift from the payload without a test saying so.
+    """
+    lead = {"n": 100, "capacity_mean": 186.0,
+            "methods": {"engine": {"n": 100, "mae": 12.0, "mae_share": 0.064,
+                                   "bias": -1.0, "clamp_share": 0.25},
+                        "pickup_add": {"n": 100, "mae": 11.0, "mae_share": 0.059,
+                                       "bias": 0.5, "clamp_share": 0.0},
+                        "pickup_mult": {"n": 100, "mae": 30.0, "mae_share": 0.161,
+                                        "bias": 9.0, "clamp_share": 0.4},
+                        "stly_add": {"n": 100, "mae": 15.0, "mae_share": 0.081,
+                                     "bias": 2.0, "clamp_share": 0.0},
+                        "average": {"n": 100, "mae": 11.5, "mae_share": 0.062,
+                                    "bias": 1.2, "clamp_share": 0.0}}}
+    return {
+        "label": label,
+        "hotel": {"code": "H1", "name": "H1 Resort Hotel, Algarve", "city": "Algarve",
+                  "currency": "EUR", "rooms": 187, "rooms_inferred": True,
+                  "peak_night": "2016-03-25", "nights_within_2pct": 29,
+                  "second_highest": 186, "per_year_max": {"2015": 185, "2016": 187, "2017": 185},
+                  "rates_include_tax": "unknown", "base_rate": 72.79, "rate_floor": 32.02,
+                  "rate_ceiling": 189.09, "rate_step": 2.0, "top_rung": 188.02,
+                  "max_lead": 297, "max_los": 14, "sellout_threshold": 0.97,
+                  "variable_cost": 5.82, "walk_cost": 218.36,
+                  "demand_season_band": {"1": "trough"}, "segment_rate_ratio": {"CORP": 0.6275}},
+        "windows": {"first_stay": "2015-07-15", "last_stay": "2017-08-31",
+                    "warmup_end": "2016-06-30", "score_first": "2016-07-01",
+                    "score_last": "2017-08-31", "drive_from": "2016-01-03",
+                    "trim_nights": 14, "scoring_nights": 427},
+        "prereg": {"commit": "d23024c2b135e0a4af3dd5d4723b7c3fe604d618",
+                   "settings_sha256": "f59937ba6b768fab3f4eb5707ce5579ef15f99c7ccf16d4d957e7255c8e94a2b",
+                   "settings_path": "data/antonio/settings.json",
+                   "sha256_matches_the_recorded_one": True},
+        "walk": {"days": 1263, "seconds": 55.5, "cpu_seconds": 21.0, "fits": 22,
+                 "records": 2982, "marks": [120, 90, 60, 30, 14, 7], "solves": 51234,
+                 "over_capacity": {"over_capacity_nights": 3}},
+        "ingest": {"rows": 40060, "bookings": 39402, "cancels": 10796, "nonrev_rows": 658,
+                   "warnings": {"rate_nonpositive": 752, "rate_out_of_range": 5555},
+                   "notes": ["sellable_rooms inferred as 187 from the busiest night"]},
+        "full_night_gap": {"nights": 778, "physically_full": 86, "full_but_invisible": 25,
+                           "full_but_uncensored_by_snapshot": 23,
+                           "share_of_nights": 25 / 778.0, "share_of_full_nights": 25 / 86.0,
+                           "threshold_rooms": 181.39, "rooms": 187},
+        "table1": {"leads": ["90"], "late_lead": "1", "methods": list(S.METHODS),
+                   "season_of_month": {str(m): "high" for m in range(1, 13)},
+                   "overall": {"90": lead, "1": lead},
+                   "cuts": {"season": {"high": {"90": lead}}, "event": {"none": {"90": lead}},
+                            "full": {"full": {"90": lead}}},
+                   "headline": {"90": {"engine_mae": 12.0, "average_mae": 11.5,
+                                       "engine_better_by": -0.5, "best_single": "pickup_add",
+                                       "best_single_mae": 11.0},
+                                "1": {"engine_mae": 12.0, "average_mae": 11.5,
+                                      "engine_better_by": -0.5, "best_single": None,
+                                      "best_single_mae": None}},
+                   "below_lead1_books": {"below": 41, "nights": 427, "share": 41 / 427.0},
+                   "notes": ["not evidence of revenue"]},
+        "table2": table2,
+        "table3": table3,
+        "notes": [pilot.NO_LIFT_NOTE, pilot.FULL_NIGHT_NOTE],
+    }
+
+
+def _table2_for_report():
+    """Table 2 with ratecheck.table2's key set and one hand-chosen cell everywhere.
+
+    The meals carry the literal "Undefined", which is what the 1,169 H1 rows
+    whose board the export never recorded reach table2.meals as.
+    """
+    cell = {"n": 40, "median_published": 150.0, "median_realised": 140.0,
+            "median_gap": 10.0, "p25": 4.0, "p75": 16.0}
+    marks = ["60", "30", "14", "7"]
+    return {
+        "marks": marks,
+        "windows": {"60": [75, 45], "30": [40, 21], "14": [21, 7], "7": [10, 4]},
+        "room_type": "A", "room_type_share": 0.62, "meals": ["BB", "HB", "Undefined"],
+        "top_rung": 188.02, "rate_ceiling": 189.09, "rate_floor": 32.02,
+        "cells": {m: {"all": dict(cell),
+                      "by_meal": {"BB": dict(cell), "HB": dict(cell), "Undefined": dict(cell)},
+                      "by_season": {"high": dict(cell)},
+                      "nonrev_nights": dict(cell), "clean_nights": dict(cell)} for m in marks},
+        "pinned": {m: {"n": 40, "n_pinned": 18, "share": 0.45} for m in marks},
+        "pinned_overall": {"n": 160, "n_pinned": 72, "share": 0.45},
+        "band_note": "72 of 160 scored nights are pinned on the top rung.",
+        "solve_age_days": {m: {"median": 2.0, "max": 6, "n": 40} for m in marks},
+        "notes": ["a comparison of two prices, not evidence of revenue"],
+    }
+
+
+def _table3_for_report(censored_scored=9, scorable=False, rooms=187):
+    """A grid with holdout.run_grid's key set, every combination carrying the
+    same hand-chosen counts, and one censored night repeated so the renderer
+    has a night to list.  The MAE 23.45 appears nowhere else in any fixture,
+    so its absence from a report is the absence of every estimate."""
+    agg = {"n": censored_scored, "known": 150.0, "estimate": 140.0, "mae": 23.45, "bias": -13.21}
+    empty = {"n": 0, "known": None, "estimate": None, "mae": None, "bias": None}
+    seg = {"RETAIL": {"n": censored_scored, "mae": 5.0, "bias": -4.0}}
+    night = {"date": "2016-12-03", "known": 124.0, "capped": 112.0, "estimate": 118.0,
+             "censored": True, "cut_rooms": 12.0, "cut_share": 12 / 124.0,
+             "bucket": holdout.BUCKETS[1], "class": "trough Sat",
+             "segments": {"RETAIL": {"known": 80.0, "estimate": 76.0}}}
+    combos = []
+    for threshold in holdout.THRESHOLDS:
+        for cap in holdout.CAPS:
+            if cap >= threshold:
+                continue
+            for rule in holdout.RULES:
+                combos.append({
+                    "threshold": threshold, "cap": cap, "cap_rooms": int(round(cap * rooms)),
+                    "rule": rule, "rule_name": holdout.RULE_NAMES[rule],
+                    "clean_nights": 45, "censored_clean": censored_scored,
+                    "censorable_band_nights": 195, "censorable_band_clean": 16,
+                    "cut_nights": 40, "cut_room_nights_gross": 900,
+                    "scored": 40, "censored_scored": censored_scored,
+                    "uncensored_scored": 40 - censored_scored, "scorable": scorable,
+                    "overall": dict(agg), "by_segment": dict(seg),
+                    "buckets": {holdout.BUCKETS[0]: dict(empty, by_segment={}),
+                                holdout.BUCKETS[1]: dict(agg, by_segment=dict(seg)),
+                                holdout.BUCKETS[2]: dict(empty, by_segment={})},
+                    "uncensored": {"n": 40 - censored_scored, "mean_rooms_cut": 6.5},
+                    "nights": ([dict(night)] * censored_scored
+                               + [dict(night, censored=False)] * (40 - censored_scored)),
+                })
+    n = len(combos)
+    return {"window": 8, "thresholds": list(holdout.THRESHOLDS), "caps": list(holdout.CAPS),
+            "rules": list(holdout.RULES), "combos": combos, "min_scored": holdout.MIN_SCORED,
+            "scored_total": 40 * n, "censored_scored_total": censored_scored * n,
+            "censored_distinct_nights": 1, "best_combo_censored": censored_scored,
+            "scorable_combos": n if scorable else 0, "scorable": scorable,
+            "notes": ["censoring_uplift is not the quantity scored here"]}
+
+
+def _full_payload_for_report(code="H1", name="H1 Resort Hotel, Algarve", table3=None):
+    """What pilot-report accepts: label full, both tables dicts."""
+    p = _payload_for_report(table2=_table2_for_report(),
+                            table3=table3 if table3 is not None else _table3_for_report())
+    p["hotel"] = dict(p["hotel"], code=code, name=name)
+    return p
+
+
+class ReportWriter(unittest.TestCase):
+    """The renderer against the fixture, and the fixture against a real quick
+    run, so the two cannot drift apart without a test going red."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pace import plugins as _plugins
+        _plugins.reset()
+        out_dir = tempfile.mkdtemp()
+        settings = _fixture_settings(os.path.join(out_dir, "settings.json"))
+        cls.quick = pilot.run_one(_csv(_payload_rows()), FIXTURE_HOTEL, settings, out_dir,
+                                  score_first=SCORE_FIRST,
+                                  score_last=SCORE_FIRST + dt.timedelta(days=20),
+                                  warmup_end=SCORE_FIRST - dt.timedelta(days=1),
+                                  label="quick", with_holdout=False)
+
+    def tearDown(self):
+        _reset_config()
+
+    def test_the_fixture_has_the_shape_run_one_writes(self):
+        real = self.quick
+        mine = _payload_for_report(table2=_table2_for_report())
+        self.assertEqual(real["label"], "quick")
+        # _json_path and _md_path are in-memory handles run_one hands back,
+        # not fields of the payload it wrote; the file on disk has neither.
+        self.assertEqual(set(mine), {k for k in real if not k.startswith("_")})
+        for key in real:
+            if isinstance(real[key], dict):
+                self.assertEqual(set(mine[key]), set(real[key]), key)
+        lead = real["table1"]["leads"][0]
+        self.assertEqual(set(mine["table1"]["overall"]["90"]),
+                         set(real["table1"]["overall"][lead]))
+        self.assertEqual(set(mine["table1"]["overall"]["90"]["methods"]["engine"]),
+                         set(real["table1"]["overall"][lead]["methods"]["engine"]))
+        self.assertEqual(set(mine["table1"]["headline"]["90"]),
+                         set(real["table1"]["headline"][lead]))
+        self.assertEqual(set(mine["table1"]["below_lead1_books"]),
+                         set(real["table1"]["below_lead1_books"]))
+        mark = real["table2"]["marks"][0]
+        for block in ("cells", "pinned", "solve_age_days"):
+            self.assertEqual(set(mine["table2"][block]["60"]),
+                             set(real["table2"][block][mark]), block)
+        self.assertEqual(set(mine["table2"]["cells"]["60"]["all"]),
+                         set(real["table2"]["cells"][mark]["all"]))
+
+    def test_the_table3_fixture_has_the_shape_run_grid_writes(self):
+        res = ingest.load(_csv(_t3_rows()), FIXTURE_HOTEL, seed=1,
+                          first_stay=T3_FIRST, last_stay=T3_LAST)
+        real = holdout.run_grid(res.bookings, res.hotel, res.ledger, T3_FIRST, T3_LAST, window=1)
+        mine = _table3_for_report()
+        self.assertEqual(set(mine), set(real))
+        self.assertEqual(set(mine["combos"][0]), set(real["combos"][0]))
+        self.assertEqual(set(mine["combos"][0]["buckets"][holdout.BUCKETS[0]]),
+                         set(real["combos"][0]["buckets"][holdout.BUCKETS[0]]))
+        rows = [r for c in real["combos"] for r in c["nights"]]
+        self.assertTrue(rows)
+        self.assertEqual(set(mine["combos"][0]["nights"][0]), set(rows[0]))
+        self.assertIn("class", rows[0])
+
+    def test_the_report_opens_with_the_three_lines(self):
+        text = pilotreport.render(_payload_for_report(),
+                                  "# Audit H1\n\n## Meal check\n\n"
+                                  "- median adr HB 94.25 vs BB 66.00 (same hotel)\n")
+        head = text.split("\n\n")[:6]
+        joined = "\n".join(head)
+        self.assertIn("inferred", joined)
+        self.assertIn("29 nights within 2 percent", joined)
+        self.assertIn("94.25", joined)
+        self.assertIn("no booking change history", joined.lower())
+
+    def test_a_loss_is_printed_as_a_loss(self):
+        text = pilotreport.render(_payload_for_report())
+        self.assertIn("worse by 0.50", text)
+        self.assertNotIn("better by -", text)
+
+    def test_a_beaten_average_names_the_single_baseline_beside_it(self):
+        text = pilotreport.render(_payload_for_report())
+        self.assertIn("Additive pickup", text)
+
+    def test_a_table_that_was_not_run_says_so_rather_than_printing_nothing(self):
+        text = pilotreport.render(_payload_for_report())
+        self.assertIn("Table 2 was not run", text)
+        self.assertIn("Table 3 was not run", text)
+
+    def test_the_revenue_lift_refusal_is_in_the_report(self):
+        text = pilotreport.render(_payload_for_report())
+        self.assertIn("No number in this report is a revenue lift", text)
+
+    def test_the_pre_registration_hash_is_printed(self):
+        text = pilotreport.render(_payload_for_report())
+        self.assertIn("d23024c2b135e0a4af3dd5d4723b7c3fe604d618", text)
+        self.assertIn("f59937ba6b768fab3f4eb5707ce5579ef15f99c7ccf16d4d957e7255c8e94a2b", text)
+
+    def test_the_gap_prints_both_counts_and_both_shares_with_their_denominators(self):
+        text = pilotreport.render(_payload_for_report())
+        self.assertIn("86 of 778 nights", text)
+        self.assertIn("On 25 of them", text)
+        self.assertIn("of all 778 nights", text)
+        self.assertIn("of the 86 full ones", text)
+        self.assertIn("On 23 the lead-0 snapshot", text)
+
+    def test_the_ingest_block_and_the_walks_own_warnings_are_printed(self):
+        text = pilotreport.render(_payload_for_report())
+        self.assertIn("40060 rows", text)
+        self.assertIn("rate_out_of_range 5555", text)
+        self.assertIn("over_capacity_nights 3", text)
+        self.assertIn("sellable_rooms inferred", text)
+        self.assertIn("21.0 of CPU", text)
+
+    def test_the_undefined_board_is_labelled_as_not_recorded(self):
+        text = pilotreport.render(_payload_for_report(table2=_table2_for_report()))
+        self.assertIn("board not recorded (Undefined in the export)", text)
+        self.assertNotIn("| Undefined |", text)
+
+    def test_a_grid_below_the_gate_quotes_no_estimate(self):
+        grid = _table3_for_report(censored_scored=9, scorable=False)
+        text = pilotreport.render(_payload_for_report(table3=grid))
+        self.assertIn("reached 9 against a gate of 20", text)
+        self.assertIn("0 of 24 combinations scorable", text)
+        self.assertIn("below the gate of 20", text)
+        self.assertNotIn("23.45", text)
+        self.assertNotIn("MAE", text.split("## Table 3")[1])
+
+    def test_a_scorable_combination_prints_its_estimate_and_its_buckets(self):
+        grid = _table3_for_report(censored_scored=26, scorable=True)
+        text = pilotreport.render(_payload_for_report(table3=grid))
+        self.assertIn("24 of 24 combinations scorable", text)
+        self.assertIn("MAE 23.45", text)
+        self.assertIn("%s: n 26, MAE 23.45" % holdout.BUCKETS[1], text)
+        self.assertNotIn("below the gate", text)
+
+    def test_the_censored_nights_are_listed_once_each_with_their_class(self):
+        text = pilotreport.render(_payload_for_report(table3=_table3_for_report()))
+        self.assertIn("| 2016-12-03 | trough Sat | 124.00 | 24 of 24 | 112.00 to 112.00 |", text)
+        self.assertEqual(text.count("| 2016-12-03 |"), 1)
+
+    def test_a_quick_run_is_named_in_its_title_and_refused_by_the_pair(self):
+        quick = _payload_for_report(label="quick")
+        text = pilotreport.render(quick)
+        self.assertIn("(quick run)", text.splitlines()[0])
+        self.assertIn("did not score the pre-registered window", text)
+        with self.assertRaises(pilot.PilotError) as ctx:
+            pilotreport.check_full(quick, "out/pilot-h1-quick.json")
+        self.assertIn("out/pilot-h1-quick.json", str(ctx.exception))
+        with self.assertRaises(pilot.PilotError):
+            pilotreport.render_pair([quick])
+        with self.assertRaises(pilot.PilotError):
+            pilotreport.check_full(_payload_for_report(table2=_table2_for_report()))
+        self.assertIsNone(pilotreport.check_full(_full_payload_for_report()))
+
+    def test_the_real_quick_payload_is_refused(self):
+        with self.assertRaises(pilot.PilotError):
+            pilotreport.check_full(self.quick)
+
+    def test_the_quick_run_wrote_a_markdown_file_beside_its_json(self):
+        md = self.quick["_md_path"]
+        code = self.quick["hotel"]["code"].lower()
+        self.assertTrue(md.endswith("pilot-%s-quick.md" % code), md)
+        self.assertEqual(os.path.dirname(md), os.path.dirname(self.quick["_json_path"]))
+        self.assertTrue(os.path.exists(md))
+        with open(md, encoding="utf-8") as fh:
+            first = fh.readline()
+        self.assertIn("(quick run)", first)
+
+    def test_the_pair_report_says_which_hotel_is_missing(self):
+        text = pilotreport.render_pair([_full_payload_for_report()])
+        self.assertIn("H1", text)
+        self.assertIn("was not run", text)
+
+    def test_the_pair_report_puts_both_hotels_in_one_row(self):
+        one = _full_payload_for_report()
+        two = _full_payload_for_report(code="H2", name="H2 City Hotel, Lisbon")
+        text = pilotreport.render_pair([one, two])
+        self.assertIn("H1 Resort Hotel, Algarve", text)
+        self.assertIn("H2 City Hotel, Lisbon", text)
+        self.assertIn("| 90 | Pace engine |", text)
+
+    def test_a_lead_one_hotel_never_scored_prints_as_not_scored_rather_than_failing(self):
+        """H1's export reaches lead 120 and H2's does not; the real pair hit a
+        KeyError here the first time it was built."""
+        one = _full_payload_for_report()
+        one["table1"] = dict(one["table1"], leads=["120", "90"])
+        one["table1"]["overall"] = dict(one["table1"]["overall"], **{"120": one["table1"]["overall"]["90"]})
+        one["table1"]["headline"] = dict(one["table1"]["headline"], **{"120": one["table1"]["headline"]["90"]})
+        two = _full_payload_for_report(code="H2", name="H2 City Hotel, Lisbon")
+        text = pilotreport.render_pair([two, one])
+        self.assertIn("| 120 | Pace engine | 12.00 | n/a |", text)
+        self.assertIn("- lead 120: not scored at this hotel", text.split("**H2**")[1])
+        self.assertNotIn("not scored at this hotel", text.split("**H1**")[1].split("**H2**")[0])
+
+    def test_the_pair_puts_a_quoted_estimate_beside_a_hotel_that_cannot_quote_one(self):
+        one = _full_payload_for_report()
+        two = _full_payload_for_report(code="H2", name="H2 City Hotel, Lisbon",
+                                       table3=_table3_for_report(censored_scored=26, scorable=True))
+        text = pilotreport.render_pair([one, two])
+        block = text.split("## Table 3, per hotel")[1]
+        self.assertIn("H1: no combination reached the gate", block)
+        self.assertIn("MAE 23.45", block)
+        self.assertEqual(block.count("MAE 23.45"), 24)

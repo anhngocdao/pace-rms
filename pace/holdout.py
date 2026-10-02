@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import ingest
 from . import pilot
-from .calendar import demand_class
+from .calendar import class_label, demand_class
 from .config import SEGMENT_ORDER, Hotel
 from .ledger import Ledger
 from .otb import GLOBAL_KEY
@@ -606,7 +606,11 @@ def score_combo(bookings, hotel: Hotel, full_ledger, first: dt.date, last: dt.da
                 "known": float(full_ledger.seg_rooms.get(d, {}).get(code, 0)),
                 "estimate": est[d] * share,
             }
-        rows.append({"date": d.isoformat(), "known": known, "capped": got,
+        # The class is knowable only in the process that applied the hotel,
+        # because demand_class reads the module seasonality; the report never
+        # computes it, it reads it from here.
+        rows.append({"date": d.isoformat(), "class": class_label(demand_class(d)),
+                     "known": known, "capped": got,
                      "estimate": est[d], "censored": flags[d], "cut_rooms": lost,
                      "cut_share": lost / known, "bucket": bucket_of(lost / known),
                      "segments": segments})

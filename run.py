@@ -12,6 +12,8 @@
   python3 run.py ingest      replay a real booking log into the ledger
   python3 run.py pilot data/antonio/h1-bookings.csv data/antonio/h1-hotel.json
                              score the engine on a real booking log
+  python3 run.py pilot-report out/pilot-h1.json out/pilot-h2.json
+                             both hotels side by side, from two full runs
   python3 run.py test        run the checks
 """
 
@@ -134,8 +136,9 @@ def main(argv):
         w = payload["walk"]
         print("\n%s (%s), %d rooms%s" % (h["name"], h["code"], h["rooms"],
                                          ", inferred" if h["rooms_inferred"] else ""))
-        print("walked %d days in %.1f s, %d fits, %d forecasts recorded"
-              % (w["days"], w["seconds"], w["fits"], w["records"]))
+        print("walked %d days in %.1f s of wall clock and %.1f s of CPU, %d fits, "
+              "%d forecasts recorded"
+              % (w["days"], w["seconds"], w["cpu_seconds"], w["fits"], w["records"]))
         gap = payload["full_night_gap"]
         # Both counts say which population they are a share of: the invisible
         # nights are a share of the full nights, never of the window.
@@ -153,6 +156,26 @@ def main(argv):
                   % (lead, block["n"], m["engine"]["mae"], 100 * m["engine"]["clamp_share"],
                      m["average"]["mae"]))
         print("\n   wrote %s" % payload["_json_path"])
+        print("   wrote %s" % payload["_md_path"])
+        return 0
+
+    if cmd == "pilot-report":
+        if not args:
+            print("usage: python3 run.py pilot-report out/pilot-h1.json [out/pilot-h2.json]")
+            return 1
+        from pace import pilot
+        from pace import pilotreport
+        payloads = []
+        try:
+            for path in args:
+                with open(path, encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                pilotreport.check_full(payload, path)
+                payloads.append(payload)
+            print("wrote %s" % pilotreport.write_pair(os.path.join(HERE, "out"), payloads))
+        except (OSError, ValueError, pilot.PilotError) as exc:
+            print(exc)
+            return 1
         return 0
 
     if cmd == "test":

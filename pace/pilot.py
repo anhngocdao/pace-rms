@@ -397,16 +397,12 @@ def claim_process(hotel_json_path: str) -> None:
     key = os.path.realpath(hotel_json_path)
     held = _CLAIMED["hotel"]
     if held is not None and held != key:
-        # The command that joins the two files is described rather than named:
-        # `run.py pilot-report` does not exist until Task 10, and an error
-        # message that sends a hotel to a command which prints a usage dump is
-        # worse than one that says what to do.  Task 10 may name it here.
         raise PilotError(
             "this process already ran %s. hotelconfig.apply rebinds the engine's "
             "seasonality and rewrites its segment table in place, so %s has to run "
-            "in a process of its own: run the same command again for it, and the "
-            "report that stands two hotels side by side is built afterwards from "
-            "the two JSON files the two runs wrote." % (held, key))
+            "in a process of its own: run the same command again for it, and "
+            "`python3 run.py pilot-report out/pilot-h1.json out/pilot-h2.json` joins "
+            "the two files afterwards." % (held, key))
     _CLAIMED["hotel"] = key
 
 
@@ -619,4 +615,10 @@ def run_one(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: st
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
     payload["_json_path"] = path
+    # The markdown carries the label the way the JSON does, so a quick run
+    # writes pilot-<code>-quick.md and never overwrites a full one.  The audit
+    # the converter wrote sits beside the CSV it audited.
+    from . import pilotreport
+    audit_path = os.path.join(os.path.dirname(os.path.abspath(csv_path)), "audit.md")
+    payload["_md_path"] = pilotreport.write(out_dir, payload, audit_path)
     return payload
