@@ -36,7 +36,8 @@ ALL_BRANCHES = ("COMP", "GROUPS", "OFFLINE_TO_GROUP", "TP_CLUSTER", "ADR0", "DIR
                 "UNDEFINED_CH_DIRECT", "UNDEFINED_CH_CORPORATE", "UNDEFINED_CH_GDS",
                 "UNDEFINED_CH_TATO", "UNDEFINED_FALLBACK")
 OUT_COLUMNS = ["booking_id", "booked_on", "arrival", "nights", "rooms", "rate", "currency", "segment",
-               "rate_code", "source", "room_type", "meal", "company", "status", "status_date", "updated_on"]
+               "rate_code", "source", "room_type", "meal", "guests", "company", "status", "status_date",
+               "updated_on"]
 
 
 class ConvertStop(RuntimeError):
@@ -54,6 +55,20 @@ def _norm(v: str) -> str:
     against one file's spelling (Transient-party) must not go silently dead
     against another's (Transient-Party) or a stray leading space."""
     return (v or "").strip().lower()
+
+
+def guests_of(r: dict) -> Tuple[int, bool]:
+    """adults + children, babies excluded: a baby is not a cover.
+
+    children is the literal NA on four rows of the public file, all at the city
+    hotel; it is read as zero and the caller counts the reading, because a rule
+    applied without a count is a rule nobody can check.
+    """
+    adults = int(float(r["adults"] or 0))
+    raw = (r.get("children") or "").strip()
+    missing = _empty(raw)
+    children = 0 if missing else int(float(raw))
+    return adults + children, missing
 
 
 def arrival_of(r: dict) -> dt.date:
@@ -115,6 +130,7 @@ def branch_rows(rows: List[dict], settings: dict) -> Tuple[List[dict], Counter, 
     per_hotel = Counter()
     undefined_nights = Counter()
     total_nights = Counter()
+    children_missing = Counter()
     for i, r in enumerate(rows):
         seg, ct = r["market_segment"], r["customer_type"]
         status, status_date = status_of(r)
@@ -142,6 +158,9 @@ def branch_rows(rows: List[dict], settings: dict) -> Tuple[List[dict], Counter, 
         arrival = arrival_of(r)
         agent = "" if _empty(r["agent"]) else r["agent"].strip()
         company = "" if _empty(r["company"]) else r["company"].strip()
+        guests, missing = guests_of(r)
+        if missing:
+            children_missing[code] += 1
         out.append({
             "booking_id": "%s-%06d" % (code, per_hotel[code]),
             "booked_on": (arrival - dt.timedelta(days=int(r["lead_time"]))).isoformat(),
@@ -149,6 +168,7 @@ def branch_rows(rows: List[dict], settings: dict) -> Tuple[List[dict], Counter, 
             "rate": r["adr"], "currency": "EUR", "segment": branch, "rate_code": "",
             "source": r["distribution_channel"], "room_type": r["reserved_room_type"],
             "meal": r["meal"],
+            "guests": str(guests),
             "company": company or agent, "status": status, "status_date": status_date, "updated_on": "",
             "_branch": branch, "_raw": r,
         })
@@ -158,6 +178,8 @@ def branch_rows(rows: List[dict], settings: dict) -> Tuple[List[dict], Counter, 
             raise ConvertStop("%s: Undefined market segment is %.1f%% of stayed room nights; decide the mapping by hand"
                               % (code, 100 * share))
         notes.append("%s: Undefined share of stayed room nights %.3f%%" % (code, 100 * share))
+    for code in sorted(children_missing):
+        notes.append("%s: children NA on %d rows, read as zero" % (code, children_missing[code]))
     if counts["UNDEFINED_FALLBACK"]:
         notes.append("%d rows had Undefined segment and Undefined channel; mapped to RETAIL with a warning" % counts["UNDEFINED_FALLBACK"])
     return out, counts, notes

@@ -10,7 +10,7 @@ from pace import ingest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEADER = ["booking_id", "booked_on", "arrival", "nights", "rooms", "rate", "currency", "segment",
-          "rate_code", "source", "room_type", "company", "status", "status_date", "updated_on"]
+          "rate_code", "source", "room_type", "company", "status", "status_date", "updated_on", "guests"]
 
 
 def _csv(rows, header=HEADER):
@@ -30,7 +30,7 @@ def _cfg(**over):
 def _row(**kw):
     base = dict(booking_id="B1", booked_on="2025-01-01", arrival="2025-02-01", nights="2", rooms="1",
                 rate="120", currency="EUR", segment="WEB", rate_code="", source="", room_type="STD",
-                company="", status="stayed", status_date="", updated_on="")
+                company="", status="stayed", status_date="", updated_on="", guests="2")
     base.update(kw)
     return [base[h] for h in HEADER]
 
@@ -534,3 +534,38 @@ class BookingLogDocExample(unittest.TestCase):
             text = fh.read()
         self.assertIn("rooms_walked_off_the_actuals", text)
         self.assertIn("### Nights that go over the room count", text)
+
+
+class GuestsColumn(unittest.TestCase):
+    """guests is optional in the schema and None when absent, so the handover
+    can say 'no guests column' instead of inventing covers."""
+
+    def test_guests_is_read_as_an_integer(self):
+        bookings, rep = ingest.read_bookings(_csv([_row(booking_id="G1", guests="3")]), _cfg())
+        self.assertEqual(bookings[0].guests, 3)
+
+    def test_a_missing_column_leaves_guests_none(self):
+        header = [h for h in HEADER if h != "guests"]
+        rows = [[v for h, v in zip(HEADER, _row(booking_id="G1")) if h != "guests"]]
+        bookings, rep = ingest.read_bookings(_csv(rows, header), _cfg())
+        self.assertIsNone(bookings[0].guests)
+        self.assertNotIn("guests_zero", rep.warnings)
+
+    def test_a_revenue_row_with_no_guests_is_kept_and_counted(self):
+        rows = [_row(booking_id="G1", guests="0", rate="100"),
+                _row(booking_id="G2", guests="0", rate="0"),
+                _row(booking_id="G3", guests="2", rate="100")]
+        bookings, rep = ingest.read_bookings(_csv(rows), _cfg())
+        self.assertEqual(len(bookings), 3)
+        self.assertEqual(rep.warnings["guests_zero"], 1)
+
+    def test_a_negative_or_non_integer_guests_is_a_row_error(self):
+        rows = [_row(booking_id="G1", guests="-1"), _row(booking_id="G2", guests="two")]
+        bookings, rep = ingest.read_bookings(_csv(rows), _cfg())
+        self.assertEqual(bookings, [])
+        self.assertEqual(len(rep.errors), 2)
+        self.assertTrue(all(col == "guests" for _, col, _ in rep.errors))
+
+    def test_an_expanded_booking_splits_its_guests_across_its_rooms(self):
+        bookings, rep = ingest.read_bookings(_csv([_row(booking_id="G1", rooms="3", guests="7")]), _cfg())
+        self.assertEqual(sorted(b.guests for b in bookings), [2, 2, 3])

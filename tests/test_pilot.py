@@ -28,7 +28,7 @@ from pace.policy import PaceEngine
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_HOTEL = os.path.join(ROOT, "tests", "fixtures", "pilot-hotel.json")
 HEADER = ["booking_id", "booked_on", "arrival", "nights", "rooms", "rate", "currency",
-          "segment", "rate_code", "source", "room_type", "meal", "company", "status",
+          "segment", "rate_code", "source", "room_type", "meal", "guests", "company", "status",
           "status_date", "updated_on"]
 
 
@@ -44,7 +44,7 @@ def _csv(rows, header=HEADER):
 def _row(**kw):
     base = dict(booking_id="B1", booked_on="2024-01-01", arrival="2024-02-01", nights="1",
                 rooms="1", rate="120", currency="EUR", segment="WEB", rate_code="",
-                source="", room_type="STD", meal="BB", company="", status="stayed",
+                source="", room_type="STD", meal="BB", guests="2", company="", status="stayed",
                 status_date="", updated_on="")
     base.update(kw)
     return [base[h] for h in HEADER]

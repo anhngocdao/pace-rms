@@ -366,7 +366,8 @@ def marks_for(code: str, settings: dict, hotel: Hotel) -> Tuple[int, ...]:
 
 
 PREREG_COMMIT = "d23024c2b135e0a4af3dd5d4723b7c3fe604d618"
-PREREG_SHA256 = "f59937ba6b768fab3f4eb5707ce5579ef15f99c7ccf16d4d957e7255c8e94a2b"
+# Re-recorded 2026-10-02 when the guests entry joined _added_after_the_download.
+PREREG_SHA256 = "9a212efee410aad6fd6ecff5fe3ba3c1a93bbe4c7bd8de51078f474f540f913e"
 
 NO_LIFT_NOTE = (
     "No number in this report is a revenue lift. History records only what sold "
