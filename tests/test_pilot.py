@@ -3070,8 +3070,15 @@ class CutRules(unittest.TestCase):
         self.assertIn("Promotional", note)
         self.assertIn("non-refundable", note)
         self.assertIn("no rate codes at all", note)
-        for name in ("h1", "h2"):
-            path = os.path.join(ROOT, "data", "antonio", "%s-bookings.csv" % name)
+        # The converted logs are produced locally from the downloaded dataset
+        # and are not in the repository, so a clean checkout (CI) checks the
+        # note's wording above and skips the count below.
+        paths = {name: os.path.join(ROOT, "data", "antonio", "%s-bookings.csv" % name)
+                 for name in ("h1", "h2")}
+        missing = [name for name, path in paths.items() if not os.path.exists(path)]
+        if missing:
+            self.skipTest("converted log not on this machine: %s" % ", ".join(missing))
+        for name, path in paths.items():
             with open(path, newline="", encoding="utf-8-sig") as fh:
                 coded = sum(1 for r in csv.DictReader(fh) if (r["rate_code"] or "").strip())
             self.assertEqual(coded, 0, name)
