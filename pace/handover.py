@@ -94,3 +94,46 @@ def actuals(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
         "departures": _departures(phys_all, nxt),
         "arrivals": _arrivals(phys_all, nxt),
     }
+
+
+def on_books(rows: List[Booking], night: dt.date, asof: dt.date) -> List[Booking]:
+    """Revenue rows on the books for `night` at the end of day `asof`.
+
+    The walk books a row on its booked_on day, cancels it on its status_date
+    (only when that date is known; an undated cancellation is never cancelled
+    in the ledger either), snapshots after both, and releases a no-show only
+    when it settles the arrival night the next day. So: entered on or before
+    asof, covering the night, and not cancelled by a status_date on or before
+    asof. A no-show is released from every night of its stay when the walk
+    settles its arrival night, which happens at the end of the arrival day
+    after that day's snapshot: so it is on the books through asof == arrival
+    and off from the day after. The test ties the room count of this list to
+    Ledger.otb_at on every record of a walk, and found this rule.
+    """
+    out = []
+    for b in rows:
+        if b.booked_on > asof or not (b.arrival <= night < b.departure):
+            continue
+        if b.status == "cancelled" and b.status_date is not None and b.status_date <= asof:
+            continue
+        if b.status == "no_show" and asof > b.arrival:
+            continue
+        out.append(b)
+    return out
+
+
+def booked_parts(rows: List[Booking], nonrev: List[Booking], night: dt.date,
+                 asof: dt.date) -> Dict[str, Optional[float]]:
+    """The booked part of each quantity for `night`, gross, counted from the
+    rows' own board codes, guest counts and departure dates."""
+    rev = on_books(pilot.ledger_rows(rows), night, asof)
+    comps = [b for b in nonrev if b.occupies and b.nights > 0 and b.booked_on <= asof
+             and b.arrival <= night < b.departure]
+    return {
+        "rooms": sum(b.rooms for b in rev),
+        "breakfast": covers(rev, BREAKFAST_BOARDS),
+        "dinner": covers(rev, DINNER_BOARDS),
+        "stayovers": _stayovers(rev, night),
+        "nonrev_stayovers": _stayovers(comps, night),
+        "nonrev_rooms": sum(b.rooms for b in comps),
+    }

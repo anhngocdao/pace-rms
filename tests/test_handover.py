@@ -83,3 +83,85 @@ class DayConvention(unittest.TestCase):
         # rooms depart on the morning of night + 2 and on no other day.
         self.assertEqual(handover._departures(a_rows, night + dt.timedelta(days=1)), 0)
         self.assertEqual(handover._departures(a_rows, night + dt.timedelta(days=2)), 3)
+
+
+_WALK = {}
+
+
+def walked():
+    """One handover walk, built once: every lead 0 to 14, driven from the
+    first stay night, records on every night of the synthetic history."""
+    if "res" not in _WALK:
+        from pace import plugins as _plugins
+        _plugins.reset()
+        res = ingest.load(_csv(history_rows(FIRST_ARRIVAL, NIGHTS)), FIXTURE_HOTEL, seed=1)
+        cal = HC.event_calendar(res.cfg)
+        out = pilot.walk(res.bookings, res.hotel, cal,
+                         first_stay=res.first_stay, last_stay=res.last_stay,
+                         score_first=res.first_stay, score_last=res.last_stay,
+                         marks=handover.LEADS, drive_from=res.first_stay,
+                         warmup_nights=60)
+        _WALK["res"] = res
+        _WALK["walk"] = out
+    else:
+        HC.apply(_WALK["res"].cfg)
+    return _WALK["res"], _WALK["walk"]
+
+
+class OnTheBooks(unittest.TestCase):
+    def tearDown(self):
+        _reset_config()
+
+    def test_the_rooms_on_the_books_equal_the_ledgers_snapshot_at_every_lead(self):
+        """The leak guard for the booked part: what this module counts as on
+        the books on day asof is exactly what the ledger froze that day."""
+        res, out = walked()
+        rows = pilot.ledger_rows(res.bookings)
+        checked = 0
+        for (night, lead), rec in out.records.items():
+            if rec.otb is None:
+                continue
+            got = sum(b.rooms for b in handover.on_books(rows, night, rec.asof))
+            self.assertEqual(got, rec.otb, (night, lead))
+            checked += 1
+        self.assertGreater(checked, 3000)
+
+    def test_a_cancellation_dated_on_the_forecast_day_is_already_off_the_books(self):
+        n = D(2024, 3, 1)
+        rows = [_b(booking_id="C", arrival=n, nights=1, status="cancelled", status_date=D(2024, 2, 20)),
+                _b(booking_id="K", arrival=n, nights=1, status="stayed")]
+        self.assertEqual([b.booking_id for b in handover.on_books(rows, n, D(2024, 2, 20))], ["K"])
+        self.assertEqual([b.booking_id for b in handover.on_books(rows, n, D(2024, 2, 19))], ["C", "K"])
+
+    def test_a_booking_entered_after_the_forecast_day_is_not_on_the_books_yet(self):
+        n = D(2024, 3, 1)
+        rows = [_b(booking_id="L", booked_on=D(2024, 2, 25), arrival=n, nights=1)]
+        self.assertEqual(handover.on_books(rows, n, D(2024, 2, 24)), [])
+        self.assertEqual(len(handover.on_books(rows, n, D(2024, 2, 25))), 1)
+
+    def test_a_no_show_stays_on_the_books_through_its_arrival_night(self):
+        """The ledger releases a no-show when it settles the night, which is the
+        day after; at lead 0 it is still on the books, and so it is here."""
+        n = D(2024, 3, 1)
+        rows = [_b(booking_id="S", arrival=n, nights=3, status="no_show")]
+        self.assertEqual(len(handover.on_books(rows, n, n)), 1)
+        # The walk settles the arrival night at the end of the arrival day and
+        # releases the no-show from every night of its stay, so for the second
+        # night it is on the books at lead 1 and gone at lead 0.
+        n2 = n + dt.timedelta(days=1)
+        self.assertEqual(len(handover.on_books(rows, n2, n)), 1)
+        self.assertEqual(handover.on_books(rows, n2, n2), [])
+
+    def test_booked_parts_use_the_rows_own_board_and_guests(self):
+        n = D(2024, 3, 1)
+        rows = [_b(booking_id="A", arrival=n, nights=2, meal="HB", guests=2),
+                _b(booking_id="B", arrival=n, nights=1, meal="BB", guests=3),
+                _b(booking_id="C", arrival=n, nights=1, meal="SC", guests=1)]
+        nonrev = [_b(booking_id="N", arrival=n, nights=2, meal="BB", guests=2, target="NONREV", rate=0.0)]
+        parts = handover.booked_parts(rows, nonrev, n, n - dt.timedelta(days=3))
+        self.assertEqual(parts["rooms"], 3)
+        self.assertEqual(parts["breakfast"], 5)
+        self.assertEqual(parts["dinner"], 2)
+        self.assertEqual(parts["stayovers"], 1)
+        self.assertEqual(parts["nonrev_stayovers"], 1)
+        self.assertEqual(parts["nonrev_rooms"], 1)
