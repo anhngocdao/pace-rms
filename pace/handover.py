@@ -15,6 +15,7 @@ the page re-labels by service day.
 This module reads and never prices.
 """
 import datetime as dt
+from collections import defaultdict
 from statistics import fmean
 from typing import Dict, List, Optional, Tuple
 
@@ -72,8 +73,79 @@ def _arrivals(rows: List[Booking], day: dt.date) -> int:
     return sum(b.rooms for b in rows if b.arrival == day and b.nights > 0)
 
 
+class Index:
+    """The rows filed by night, built once per log.
+
+    Every function below answers for one (night, lead) and a run asks for
+    thousands of them; scanning forty thousand rows each time is what made
+    the first draft take minutes on a synthetic year. The index changes no
+    answer, only how it is found: a test holds each indexed function to its
+    scanning twin.
+    """
+
+    def __init__(self, bookings: List[Booking], nonrev: List[Booking]):
+        self.phys_all = physical_rows(bookings, nonrev)
+        self.rev_all = pilot.ledger_rows(bookings)
+        self.comps_all = [b for b in nonrev if b.occupies and b.nights > 0]
+        self._phys: Dict[dt.date, List[Booking]] = defaultdict(list)
+        self._rev: Dict[dt.date, List[Booking]] = defaultdict(list)
+        self._comps: Dict[dt.date, List[Booking]] = defaultdict(list)
+        self._dep: Dict[dt.date, int] = defaultdict(int)
+        self._arr: Dict[dt.date, int] = defaultdict(int)
+        for b in self.phys_all:
+            for k in range(b.nights):
+                self._phys[b.arrival + dt.timedelta(days=k)].append(b)
+            self._dep[b.departure] += b.rooms
+            self._arr[b.arrival] += b.rooms
+        for b in self.rev_all:
+            for k in range(b.nights):
+                self._rev[b.arrival + dt.timedelta(days=k)].append(b)
+        for b in self.comps_all:
+            for k in range(b.nights):
+                self._comps[b.arrival + dt.timedelta(days=k)].append(b)
+        self._stats: Dict[dt.date, dict] = {}
+
+    def physical_on(self, night: dt.date) -> List[Booking]:
+        return self._phys.get(night, [])
+
+    def revenue_rows_on(self, night: dt.date) -> List[Booking]:
+        """Every revenue row covering the night, whatever its status; on_books
+        applies the booked_on, cancellation and no-show rules on top."""
+        return self._rev.get(night, [])
+
+    def comps_on(self, night: dt.date) -> List[Booking]:
+        return self._comps.get(night, [])
+
+    def departures(self, day: dt.date) -> int:
+        return self._dep.get(day, 0)
+
+    def arrivals(self, day: dt.date) -> int:
+        return self._arr.get(day, 0)
+
+    def stayovers(self, night: dt.date) -> int:
+        return _stayovers(self.physical_on(night), night)
+
+    def night_stats(self, night: dt.date) -> dict:
+        """The settled counts a ratio window reads, once per night."""
+        st = self._stats.get(night)
+        if st is None:
+            phys = self.physical_on(night)
+            rev = [b for b in phys if b.target != "NONREV"]
+            known = all(b.guests is not None for b in rev)
+            st = {
+                "rev_rooms": sum(b.rooms for b in rev),
+                "guests": sum(b.guests for b in rev) if known else None,
+                "breakfast": covers(rev, BREAKFAST_BOARDS),
+                "dinner": covers(rev, DINNER_BOARDS),
+                "phys_rooms": sum(b.rooms for b in phys),
+                "stayovers": _stayovers(phys, night),
+            }
+            self._stats[night] = st
+        return st
+
+
 def actuals(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
-            night: dt.date) -> Dict[str, Optional[float]]:
+            night: dt.date, index: Optional[Index] = None) -> Dict[str, Optional[float]]:
     """What happened on `night`, every quantity in its own unit.
 
     rooms is the settled revenue figure the pilot scores against
@@ -81,18 +153,29 @@ def actuals(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
     housekeeping counts are for the service day night + 1 and satisfy
     physical == departures + stayovers by construction.
     """
-    phys_all = physical_rows(bookings, nonrev)
-    phys = rows_on(phys_all, night)
-    rev = [b for b in phys if b.target != "NONREV"]
     nxt = night + dt.timedelta(days=1)
+    if index is None:
+        phys_all = physical_rows(bookings, nonrev)
+        phys = rows_on(phys_all, night)
+        rev = [b for b in phys if b.target != "NONREV"]
+        return {
+            "rooms": baselines.actual(ledger, night),
+            "physical": sum(b.rooms for b in phys),
+            "breakfast": covers(rev, BREAKFAST_BOARDS),
+            "dinner": covers(rev, DINNER_BOARDS),
+            "stayovers": _stayovers(phys_all, night),
+            "departures": _departures(phys_all, nxt),
+            "arrivals": _arrivals(phys_all, nxt),
+        }
+    st = index.night_stats(night)
     return {
         "rooms": baselines.actual(ledger, night),
-        "physical": sum(b.rooms for b in phys),
-        "breakfast": covers(rev, BREAKFAST_BOARDS),
-        "dinner": covers(rev, DINNER_BOARDS),
-        "stayovers": _stayovers(phys_all, night),
-        "departures": _departures(phys_all, nxt),
-        "arrivals": _arrivals(phys_all, nxt),
+        "physical": st["phys_rooms"],
+        "breakfast": st["breakfast"],
+        "dinner": st["dinner"],
+        "stayovers": st["stayovers"],
+        "departures": index.departures(nxt),
+        "arrivals": index.arrivals(nxt),
     }
 
 
@@ -123,12 +206,16 @@ def on_books(rows: List[Booking], night: dt.date, asof: dt.date) -> List[Booking
 
 
 def booked_parts(rows: List[Booking], nonrev: List[Booking], night: dt.date,
-                 asof: dt.date) -> Dict[str, Optional[float]]:
+                 asof: dt.date, index: Optional[Index] = None) -> Dict[str, Optional[float]]:
     """The booked part of each quantity for `night`, gross, counted from the
     rows' own board codes, guest counts and departure dates."""
-    rev = on_books(pilot.ledger_rows(rows), night, asof)
-    comps = [b for b in nonrev if b.occupies and b.nights > 0 and b.booked_on <= asof
-             and b.arrival <= night < b.departure]
+    if index is None:
+        rev = on_books(pilot.ledger_rows(rows), night, asof)
+        comps = [b for b in nonrev if b.occupies and b.nights > 0 and b.booked_on <= asof
+                 and b.arrival <= night < b.departure]
+    else:
+        rev = on_books(index.revenue_rows_on(night), night, asof)
+        comps = [b for b in index.comps_on(night) if b.booked_on <= asof]
     return {
         "rooms": sum(b.rooms for b in rev),
         "breakfast": covers(rev, BREAKFAST_BOARDS),
@@ -140,7 +227,7 @@ def booked_parts(rows: List[Booking], nonrev: List[Booking], night: dt.date,
 
 
 def ratios(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
-           night: dt.date, lead: int) -> Optional[Dict[str, object]]:
+           night: dt.date, lead: int, index: Optional[Index] = None) -> Optional[Dict[str, object]]:
     """The five ratios for `night` at `lead`, from the ten trailing same-weekday
     nights already settled on the forecast day (spec 6.2).
 
@@ -156,7 +243,8 @@ def ratios(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
     refs = baselines.reference_nights(ledger, night, lead, WINDOW_WEEKS)
     if len(refs) < WINDOW_WEEKS:
         return None
-    phys_all = physical_rows(bookings, nonrev)
+    if index is None:
+        index = Index(bookings, nonrev)
     stayed = otb = 0.0
     rooms = guests = bf = dn = 0
     phys_rooms = stay_rooms = 0
@@ -164,17 +252,16 @@ def ratios(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
     for n in refs:
         stayed += baselines.actual(ledger, n) or 0.0
         otb += ledger.otb_at(n, lead) or 0
-        phys = rows_on(phys_all, n)
-        rev = [b for b in phys if b.target != "NONREV"]
-        rooms += sum(b.rooms for b in rev)
-        if any(b.guests is None for b in rev):
+        st = index.night_stats(n)
+        rooms += st["rev_rooms"]
+        if st["guests"] is None:
             guests_known = False
         else:
-            guests += sum(b.guests for b in rev)
-            bf += covers(rev, BREAKFAST_BOARDS)
-            dn += covers(rev, DINNER_BOARDS)
-        phys_rooms += sum(b.rooms for b in phys)
-        stay_rooms += _stayovers(phys_all, n)
+            guests += st["guests"]
+            bf += st["breakfast"]
+            dn += st["dinner"]
+        phys_rooms += st["phys_rooms"]
+        stay_rooms += st["stayovers"]
 
     def _div(a, b):
         return None if not b else a / b
@@ -190,7 +277,7 @@ def ratios(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
 
 
 def forecast_row(rec, bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
-                 hotel) -> Optional[Dict[str, object]]:
+                 hotel, index: Optional[Index] = None) -> Optional[Dict[str, object]]:
     """Booked plus pickup for one (night, lead) (spec 6.2, decision 18).
 
     booked_stay = rooms on the books x s
@@ -206,11 +293,13 @@ def forecast_row(rec, bookings: List[Booking], nonrev: List[Booking], ledger: Le
     if rec.forecast is None or rec.otb is None:
         return None
     night, lead, asof = rec.stay_date, rec.lead, rec.asof
-    r = ratios(bookings, nonrev, ledger, night, lead)
+    if index is None:
+        index = Index(bookings, nonrev)
+    r = ratios(bookings, nonrev, ledger, night, lead, index)
     if r is None or r["survival"] is None:
         return None
     s = min(1.0, r["survival"])
-    parts = booked_parts(bookings, nonrev, night, asof)
+    parts = booked_parts(bookings, nonrev, night, asof, index)
     rooms = float(rec.forecast)
     booked_stay = parts["rooms"] * s
     pickup = max(0.0, rooms - booked_stay)
@@ -235,7 +324,7 @@ def forecast_row(rec, bookings: List[Booking], nonrev: List[Booking], ledger: Le
         "dinner": _covers(parts["dinner"], r["dinner_share"]),
         "stayovers": stayovers,
         "departures": None if stayovers is None else physical - stayovers,
-        "arrivals_booked": _arrivals(on_books(pilot.ledger_rows(bookings), nxt, asof), nxt),
+        "arrivals_booked": _arrivals(on_books(index.revenue_rows_on(nxt), nxt, asof), nxt),
         "ratios": {k: v for k, v in r.items() if k != "refs"},
     }
 
@@ -249,10 +338,11 @@ def walk_handover(res, cal, score_last: dt.date, progress: Optional[int] = None)
                       marks=LEADS, drive_from=res.first_stay, progress=progress)
 
 
-def forecast_rows(res, out, hotel) -> Dict[Tuple[dt.date, int], dict]:
+def forecast_rows(res, out, hotel, index: Optional[Index] = None) -> Dict[Tuple[dt.date, int], dict]:
+    index = Index(res.bookings, res.nonrev) if index is None else index
     rows = {}
     for key, rec in out.records.items():
-        row = forecast_row(rec, res.bookings, res.nonrev, res.ledger, hotel)
+        row = forecast_row(rec, res.bookings, res.nonrev, res.ledger, hotel, index)
         if row is not None:
             rows[key] = row
     return rows

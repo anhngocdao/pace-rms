@@ -263,3 +263,24 @@ class ForecastRow(unittest.TestCase):
         rec = out.records[early]
         if handover.ratios(res.bookings, res.nonrev, res.ledger, rec.stay_date, rec.lead) is None:
             self.assertIsNone(handover.forecast_row(rec, res.bookings, res.nonrev, res.ledger, res.hotel))
+
+
+class IndexedTwins(unittest.TestCase):
+    """The index changes how an answer is found, never the answer: each
+    indexed function equals its scanning twin on real records."""
+
+    def tearDown(self):
+        _reset_config()
+
+    def test_actuals_booked_parts_and_ratios_agree_with_and_without_the_index(self):
+        res, out = walked()
+        idx = handover.Index(res.bookings, res.nonrev)
+        keys = sorted(out.records)[::97][:40]
+        for key in keys:
+            rec = out.records[key]
+            self.assertEqual(handover.actuals(res.bookings, res.nonrev, res.ledger, key[0]),
+                             handover.actuals(res.bookings, res.nonrev, res.ledger, key[0], idx), key)
+            self.assertEqual(handover.booked_parts(res.bookings, res.nonrev, key[0], rec.asof),
+                             handover.booked_parts(res.bookings, res.nonrev, key[0], rec.asof, idx), key)
+            self.assertEqual(handover.ratios(res.bookings, res.nonrev, res.ledger, key[0], key[1]),
+                             handover.ratios(res.bookings, res.nonrev, res.ledger, key[0], key[1], idx), key)
