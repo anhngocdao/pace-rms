@@ -137,3 +137,53 @@ def booked_parts(rows: List[Booking], nonrev: List[Booking], night: dt.date,
         "nonrev_stayovers": _stayovers(comps, night),
         "nonrev_rooms": sum(b.rooms for b in comps),
     }
+
+
+def ratios(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
+           night: dt.date, lead: int) -> Optional[Dict[str, object]]:
+    """The five ratios for `night` at `lead`, from the ten trailing same-weekday
+    nights already settled on the forecast day (spec 6.2).
+
+    Every ratio is a ratio of sums over the window, not a mean of ratios, so a
+    quiet reference night does not weigh as much as a full one. survival is
+    rooms that stayed over rooms on the books at this lead. breakfast_share
+    and dinner_share are covers over guests; guests_per_room is guests over
+    revenue rooms; stayover_share is physical rooms that stayed on over
+    physical rooms. Any denominator of zero makes that ratio None; fewer than
+    WINDOW_WEEKS reference nights makes the whole thing None, the rule table 1
+    applies to a night a baseline cannot forecast.
+    """
+    refs = baselines.reference_nights(ledger, night, lead, WINDOW_WEEKS)
+    if len(refs) < WINDOW_WEEKS:
+        return None
+    phys_all = physical_rows(bookings, nonrev)
+    stayed = otb = 0.0
+    rooms = guests = bf = dn = 0
+    phys_rooms = stay_rooms = 0
+    guests_known = True
+    for n in refs:
+        stayed += baselines.actual(ledger, n) or 0.0
+        otb += ledger.otb_at(n, lead) or 0
+        phys = rows_on(phys_all, n)
+        rev = [b for b in phys if b.target != "NONREV"]
+        rooms += sum(b.rooms for b in rev)
+        if any(b.guests is None for b in rev):
+            guests_known = False
+        else:
+            guests += sum(b.guests for b in rev)
+            bf += covers(rev, BREAKFAST_BOARDS)
+            dn += covers(rev, DINNER_BOARDS)
+        phys_rooms += sum(b.rooms for b in phys)
+        stay_rooms += _stayovers(phys_all, n)
+
+    def _div(a, b):
+        return None if not b else a / b
+
+    return {
+        "refs": refs,
+        "survival": _div(stayed, otb),
+        "breakfast_share": _div(bf, guests) if guests_known else None,
+        "dinner_share": _div(dn, guests) if guests_known else None,
+        "guests_per_room": _div(guests, rooms) if guests_known else None,
+        "stayover_share": _div(stay_rooms, phys_rooms),
+    }

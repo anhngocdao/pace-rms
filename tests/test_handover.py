@@ -165,3 +165,51 @@ class OnTheBooks(unittest.TestCase):
         self.assertEqual(parts["stayovers"], 1)
         self.assertEqual(parts["nonrev_stayovers"], 1)
         self.assertEqual(parts["nonrev_rooms"], 1)
+
+
+class Ratios(unittest.TestCase):
+    def tearDown(self):
+        _reset_config()
+
+    def test_the_reference_nights_are_the_pilots_own_window(self):
+        res, out = walked()
+        night, lead = SCORE_FIRST + dt.timedelta(days=30), 7
+        r = handover.ratios(res.bookings, res.nonrev, res.ledger, night, lead)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["refs"], baselines.reference_nights(res.ledger, night, lead))
+        self.assertEqual(len(r["refs"]), handover.WINDOW_WEEKS)
+
+    def test_survival_is_rooms_that_stayed_over_rooms_on_the_books_summed_over_the_window(self):
+        res, out = walked()
+        night, lead = SCORE_FIRST + dt.timedelta(days=30), 7
+        r = handover.ratios(res.bookings, res.nonrev, res.ledger, night, lead)
+        stayed = sum(baselines.actual(res.ledger, n) for n in r["refs"])
+        otb = sum(res.ledger.otb_at(n, lead) for n in r["refs"])
+        self.assertAlmostEqual(r["survival"], stayed / otb)
+        self.assertLessEqual(r["survival"], 1.0 + 1e-9)
+
+    def test_no_ratio_leaks_a_night_at_or_after_the_forecast_day(self):
+        res, out = walked()
+        night, lead = SCORE_FIRST + dt.timedelta(days=30), 7
+        r = handover.ratios(res.bookings, res.nonrev, res.ledger, night, lead)
+        asof = night - dt.timedelta(days=lead)
+        self.assertTrue(all(n < asof for n in r["refs"]))
+
+    def test_a_short_window_gives_no_ratio_rather_than_a_default(self):
+        res, out = walked()
+        early = res.first_stay + dt.timedelta(days=20)
+        self.assertIsNone(handover.ratios(res.bookings, res.nonrev, res.ledger, early, 7))
+
+    def test_the_shares_are_over_the_reference_nights_stayed_revenue_rooms(self):
+        res, out = walked()
+        night, lead = SCORE_FIRST + dt.timedelta(days=30), 7
+        r = handover.ratios(res.bookings, res.nonrev, res.ledger, night, lead)
+        phys = handover.physical_rows(res.bookings, [])
+        rooms = covers_b = guests = 0
+        for n in r["refs"]:
+            rev = [b for b in handover.rows_on(phys, n) if b.target != "NONREV"]
+            rooms += sum(b.rooms for b in rev)
+            covers_b += handover.covers(rev, handover.BREAKFAST_BOARDS)
+            guests += sum(b.guests for b in rev)
+        self.assertAlmostEqual(r["breakfast_share"], covers_b / guests)
+        self.assertAlmostEqual(r["guests_per_room"], guests / rooms)
