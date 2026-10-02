@@ -187,3 +187,72 @@ def ratios(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
         "guests_per_room": _div(guests, rooms) if guests_known else None,
         "stayover_share": _div(stay_rooms, phys_rooms),
     }
+
+
+def forecast_row(rec, bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
+                 hotel) -> Optional[Dict[str, object]]:
+    """Booked plus pickup for one (night, lead) (spec 6.2, decision 18).
+
+    booked_stay = rooms on the books x s
+    pickup      = rooms forecast - booked_stay, floored at zero
+    booked + pickup = rooms forecast, which a test asserts on every row.
+
+    The four derived quantities count their booked part from the rows' own
+    board codes, guest counts and departure dates, times s, and multiply only
+    the pickup by a trailing-window ratio. Housekeeping's physical rooms add
+    the NONREV rooms already entered on the forecast day, which are a count
+    and never a forecast.
+    """
+    if rec.forecast is None or rec.otb is None:
+        return None
+    night, lead, asof = rec.stay_date, rec.lead, rec.asof
+    r = ratios(bookings, nonrev, ledger, night, lead)
+    if r is None or r["survival"] is None:
+        return None
+    s = min(1.0, r["survival"])
+    parts = booked_parts(bookings, nonrev, night, asof)
+    rooms = float(rec.forecast)
+    booked_stay = parts["rooms"] * s
+    pickup = max(0.0, rooms - booked_stay)
+    gpr = r["guests_per_room"]
+
+    def _covers(booked, share):
+        if booked is None or gpr is None or share is None:
+            return None
+        return booked * s + pickup * share * gpr
+
+    stay_share = r["stayover_share"]
+    stayovers = None
+    if stay_share is not None:
+        stayovers = parts["stayovers"] * s + parts["nonrev_stayovers"] + pickup * stay_share
+    physical = rooms + parts["nonrev_rooms"]
+    nxt = night + dt.timedelta(days=1)
+    return {
+        "night": night, "lead": lead, "asof": asof,
+        "rooms": rooms, "otb": rec.otb, "survival": s,
+        "booked_stay": booked_stay, "pickup": pickup, "physical": physical,
+        "breakfast": _covers(parts["breakfast"], r["breakfast_share"]),
+        "dinner": _covers(parts["dinner"], r["dinner_share"]),
+        "stayovers": stayovers,
+        "departures": None if stayovers is None else physical - stayovers,
+        "arrivals_booked": _arrivals(on_books(pilot.ledger_rows(bookings), nxt, asof), nxt),
+        "ratios": {k: v for k, v in r.items() if k != "refs"},
+    }
+
+
+def walk_handover(res, cal, score_last: dt.date, progress: Optional[int] = None):
+    """The pilot's walk, recording every lead 0 to 14 on every night from the
+    first stay night, driven from the first stay night (plan decision 1)."""
+    return pilot.walk(res.bookings, res.hotel, cal,
+                      first_stay=res.first_stay, last_stay=res.last_stay,
+                      score_first=res.first_stay, score_last=score_last,
+                      marks=LEADS, drive_from=res.first_stay, progress=progress)
+
+
+def forecast_rows(res, out, hotel) -> Dict[Tuple[dt.date, int], dict]:
+    rows = {}
+    for key, rec in out.records.items():
+        row = forecast_row(rec, res.bookings, res.nonrev, res.ledger, hotel)
+        if row is not None:
+            rows[key] = row
+    return rows

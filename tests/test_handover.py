@@ -213,3 +213,53 @@ class Ratios(unittest.TestCase):
             guests += sum(b.guests for b in rev)
         self.assertAlmostEqual(r["breakfast_share"], covers_b / guests)
         self.assertAlmostEqual(r["guests_per_room"], guests / rooms)
+
+
+class ForecastRow(unittest.TestCase):
+    def tearDown(self):
+        _reset_config()
+
+    def _rows(self):
+        res, out = walked()
+        return res, out, handover.forecast_rows(res, out, res.hotel)
+
+    def test_booked_plus_pickup_equals_the_engines_rooms_forecast_on_every_row(self):
+        res, out, rows = self._rows()
+        self.assertGreater(len(rows), 1000)
+        for key, r in rows.items():
+            self.assertAlmostEqual(r["booked_stay"] + r["pickup"], r["rooms"], places=9, msg=key)
+
+    def test_the_pickup_is_never_negative(self):
+        res, out, rows = self._rows()
+        self.assertTrue(all(r["pickup"] >= 0.0 for r in rows.values()))
+
+    def test_every_lead_from_zero_to_fourteen_is_recorded(self):
+        res, out, rows = self._rows()
+        leads = sorted({lead for _, lead in rows})
+        self.assertEqual(leads, list(handover.LEADS))
+
+    def test_departures_are_the_identity_against_the_physical_forecast(self):
+        res, out, rows = self._rows()
+        for key, r in rows.items():
+            self.assertAlmostEqual(r["departures"] + r["stayovers"], r["physical"], places=9, msg=key)
+
+    def test_covers_are_the_booked_rows_board_times_s_plus_the_pickup_times_the_share(self):
+        """The formula, checked on the row with the smallest pickup so the
+        booked term dominates and on one with a large pickup so the share
+        term does."""
+        res, out, rows = self._rows()
+        with_dinner = [(k, r) for k, r in rows.items() if r["dinner"] is not None]
+        self.assertTrue(with_dinner)
+        for key, r in (min(with_dinner, key=lambda kr: kr[1]["pickup"]),
+                       max(with_dinner, key=lambda kr: kr[1]["pickup"])):
+            parts = handover.booked_parts(res.bookings, res.nonrev, key[0], r["asof"])
+            rat = r["ratios"]
+            want = parts["dinner"] * r["survival"] + r["pickup"] * rat["dinner_share"] * rat["guests_per_room"]
+            self.assertAlmostEqual(r["dinner"], want, places=9, msg=key)
+
+    def test_a_row_whose_window_cannot_supply_a_ratio_is_absent_not_defaulted(self):
+        res, out = walked()
+        early = next(k for k in sorted(out.records) if out.records[k].forecast is not None)
+        rec = out.records[early]
+        if handover.ratios(res.bookings, res.nonrev, res.ledger, rec.stay_date, rec.lead) is None:
+            self.assertIsNone(handover.forecast_row(rec, res.bookings, res.nonrev, res.ledger, res.hotel))
