@@ -284,3 +284,49 @@ class IndexedTwins(unittest.TestCase):
                              handover.booked_parts(res.bookings, res.nonrev, key[0], rec.asof, idx), key)
             self.assertEqual(handover.ratios(res.bookings, res.nonrev, res.ledger, key[0], key[1]),
                              handover.ratios(res.bookings, res.nonrev, res.ledger, key[0], key[1], idx), key)
+
+
+class Bands(unittest.TestCase):
+    def tearDown(self):
+        _reset_config()
+
+    def test_a_band_is_the_quantitys_own_error_quantiles(self):
+        errs = {("rooms", 7): [float(x) for x in range(-20, 21)]}
+        b = handover.bands(errs)[("rooms", 7)]
+        self.assertEqual(b["n"], 41)
+        self.assertAlmostEqual(b["p50"], 0.0)
+        self.assertAlmostEqual(b["p10"], pilot.percentile(errs[("rooms", 7)], 0.10))
+        self.assertAlmostEqual(b["p90"], pilot.percentile(errs[("rooms", 7)], 0.90))
+
+    def test_below_thirty_nights_there_is_no_band(self):
+        errs = {("rooms", 7): [1.0] * 29}
+        self.assertIsNone(handover.bands(errs)[("rooms", 7)])
+        self.assertIsNotNone(handover.bands({("rooms", 7): [1.0] * 30})[("rooms", 7)])
+
+    def test_the_band_is_measured_on_nights_the_coverage_never_touches(self):
+        res, out = walked()
+        rows = handover.forecast_rows(res, out, res.hotel)
+        warm = [d for d in sorted({k[0] for k in rows}) if d < SCORE_FIRST]
+        score = [d for d in sorted({k[0] for k in rows}) if SCORE_FIRST <= d <= SCORE_LAST]
+        self.assertFalse(set(warm) & set(score))
+        table = handover.bands(handover.errors(rows, res, warm))
+        cov = handover.coverage(rows, res, table, score)
+        self.assertIn(("rooms", 7), cov)
+        self.assertEqual(cov[("rooms", 7)]["n"], sum(1 for d in score if (d, 7) in rows))
+
+    def test_coverage_is_the_share_of_scored_nights_inside_the_band(self):
+        rows = {(D(2025, 2, 1), 7): {"rooms": 10.0}, (D(2025, 2, 2), 7): {"rooms": 10.0},
+                (D(2025, 2, 3), 7): {"rooms": 10.0}, (D(2025, 2, 4), 7): {"rooms": 10.0}}
+        table = {("rooms", 7): {"n": 40, "p10": -2.0, "p50": 0.0, "p90": 2.0}}
+
+        class _Res:
+            pass
+        res = _Res()
+        acts = {D(2025, 2, 1): 9.0, D(2025, 2, 2): 12.5, D(2025, 2, 3): 8.0, D(2025, 2, 4): 11.0}
+        cov = handover.coverage(rows, res, table, sorted(acts), actual_of=lambda r, d, q: acts[d])
+        self.assertEqual(cov[("rooms", 7)], {"n": 4, "inside": 3, "share": 0.75})
+
+    def test_excluded_weeks_are_not_measured_on(self):
+        weeks = [(D(2024, 3, 25), D(2024, 3, 31))]
+        self.assertTrue(handover.excluded(D(2024, 3, 27), weeks))
+        self.assertFalse(handover.excluded(D(2024, 4, 1), weeks))

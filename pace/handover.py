@@ -346,3 +346,94 @@ def forecast_rows(res, out, hotel, index: Optional[Index] = None) -> Dict[Tuple[
         if row is not None:
             rows[key] = row
     return rows
+
+
+_INDEX: Dict[int, Index] = {}
+
+
+def index_for(res) -> Index:
+    """One index per ingest result, built on first use. run_proof and
+    run_forward clear it, so a process that runs twice never reads a stale
+    index for a new log."""
+    idx = _INDEX.get(id(res))
+    if idx is None:
+        idx = Index(res.bookings, res.nonrev)
+        _INDEX[id(res)] = idx
+    return idx
+
+
+def excluded(night: dt.date, weeks) -> bool:
+    """settings.json excluded_weeks, as (first, last) date pairs, inclusive."""
+    return any(a <= night <= b for a, b in weeks)
+
+
+def _actual_of(res, night: dt.date, quantity: str):
+    return actuals(res.bookings, res.nonrev, res.ledger, night, index_for(res)).get(quantity)
+
+
+def errors(rows: Dict[Tuple[dt.date, int], dict], res, nights,
+           actual_of=_actual_of) -> Dict[Tuple[str, int], List[float]]:
+    """forecast - actual, per (quantity, lead), over `nights`; a row or an
+    actual that is None contributes nothing, never a zero."""
+    out: Dict[Tuple[str, int], List[float]] = {}
+    wanted = set(nights)
+    for (night, lead), row in rows.items():
+        if night not in wanted:
+            continue
+        for q in QUANTITIES:
+            f = row.get(q)
+            if f is None:
+                continue
+            a = actual_of(res, night, q)
+            if a is None:
+                continue
+            out.setdefault((q, lead), []).append(float(f) - float(a))
+    return out
+
+
+def bands(errs: Dict[Tuple[str, int], List[float]]) -> Dict[Tuple[str, int], Optional[dict]]:
+    """Empirical p10 / p50 / p90 of the error, or None below the floor."""
+    out = {}
+    for key, values in errs.items():
+        if len(values) < MIN_BAND_NIGHTS:
+            out[key] = None
+            continue
+        out[key] = {"n": len(values),
+                    "p10": pilot.percentile(values, P_LO),
+                    "p50": pilot.percentile(values, P_MID),
+                    "p90": pilot.percentile(values, P_HI)}
+    return out
+
+
+def band_of(point: float, band: Optional[dict]) -> Optional[Tuple[float, float, float]]:
+    """The printed band for a point forecast: the point shifted by the error
+    quantiles. Errors are forecast minus actual, so the actual sits at the
+    forecast minus the error; the band's low end is point + p10 and its high
+    end point + p90, and the two bound the actual's own p10 to p90 range."""
+    if band is None:
+        return None
+    return (point + band["p10"], point + band["p50"], point + band["p90"])
+
+
+def coverage(rows, res, band_table, nights, actual_of=_actual_of) -> Dict[Tuple[str, int], dict]:
+    """Share of scored nights whose actual fell inside [lo, hi]."""
+    wanted = set(nights)
+    counts: Dict[Tuple[str, int], List[int]] = {}
+    for (night, lead), row in rows.items():
+        if night not in wanted:
+            continue
+        for q in QUANTITIES:
+            f = row.get(q)
+            band = band_table.get((q, lead))
+            if f is None or band is None:
+                continue
+            a = actual_of(res, night, q)
+            if a is None:
+                continue
+            lo, _, hi = band_of(float(f), band)
+            n_in = counts.setdefault((q, lead), [0, 0])
+            n_in[0] += 1
+            if lo <= float(a) <= hi:
+                n_in[1] += 1
+    return {key: {"n": n, "inside": k, "share": (k / n) if n else None}
+            for key, (n, k) in counts.items()}
