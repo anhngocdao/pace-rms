@@ -406,13 +406,17 @@ def bands(errs: Dict[Tuple[str, int], List[float]]) -> Dict[Tuple[str, int], Opt
 
 
 def band_of(point: float, band: Optional[dict]) -> Optional[Tuple[float, float, float]]:
-    """The printed band for a point forecast: the point shifted by the error
-    quantiles. Errors are forecast minus actual, so the actual sits at the
-    forecast minus the error; the band's low end is point + p10 and its high
-    end point + p90, and the two bound the actual's own p10 to p90 range."""
+    """The printed band for a point forecast.
+
+    Errors are forecast minus actual, so the actual sits at the forecast
+    minus the error: the band's low end is point - p90 (where the forecast
+    ran highest above the actual) and its high end point - p10. With a
+    symmetric error the two forms agree; with a biased one only this form
+    puts the band where the actual lands, and a test with every error at +5
+    holds it there."""
     if band is None:
         return None
-    return (point + band["p10"], point + band["p50"], point + band["p90"])
+    return (point - band["p90"], point - band["p50"], point - band["p10"])
 
 
 def coverage(rows, res, band_table, nights, actual_of=_actual_of) -> Dict[Tuple[str, int], dict]:

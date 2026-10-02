@@ -326,6 +326,18 @@ class Bands(unittest.TestCase):
         cov = handover.coverage(rows, res, table, sorted(acts), actual_of=lambda r, d, q: acts[d])
         self.assertEqual(cov[("rooms", 7)], {"n": 4, "inside": 3, "share": 0.75})
 
+    def test_a_biased_forecast_is_banded_where_the_actual_lands(self):
+        """Every error +5: the forecast always sat five above the actual, so
+        the band must sit five below the point, not five above it."""
+        band = handover.bands({("rooms", 7): [5.0] * 40})[("rooms", 7)]
+        lo, mid, hi = handover.band_of(100.0, band)
+        self.assertEqual((lo, mid, hi), (95.0, 95.0, 95.0))
+        skew = handover.bands({("rooms", 7): [0.0] * 20 + [8.0] * 20})[("rooms", 7)]
+        lo, mid, hi = handover.band_of(100.0, skew)
+        self.assertLess(lo, hi)
+        self.assertAlmostEqual(hi, 100.0 - skew["p10"])
+        self.assertAlmostEqual(lo, 100.0 - skew["p90"])
+
     def test_excluded_weeks_are_not_measured_on(self):
         weeks = [(D(2024, 3, 25), D(2024, 3, 31))]
         self.assertTrue(handover.excluded(D(2024, 3, 27), weeks))
