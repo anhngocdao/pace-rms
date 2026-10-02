@@ -81,8 +81,20 @@ sold-out nights reaches it censored, exactly as it would in production.
 The engine can now read a real booking log through the schema in
 [docs/booking-log.md](docs/booking-log.md). The first real-data pilot, on the
 public Portuguese hotel dataset, is specified in
-[docs/superpowers/specs/2026-09-17-real-data-ingest-and-pilot-design.md](docs/superpowers/specs/2026-09-17-real-data-ingest-and-pilot-design.md),
-with its results to follow.
+[docs/superpowers/specs/2026-09-17-real-data-ingest-and-pilot-design.md](docs/superpowers/specs/2026-09-17-real-data-ingest-and-pilot-design.md).
+Its results live in `out/pilot.md`, written by `run.py pilot` once per hotel and
+`run.py pilot-report` for the pair, and not committed. What they say: on H1, a
+187-room Algarve resort, the engine forecasts better than the average of
+additive pickup and last year by 2.49 rooms at lead 120 and 2.98 at lead 90,
+and worse by under a room at leads 14, 7 and 1; on H2, a 226-room Lisbon city
+hotel, it forecasts worse by 11.14 rooms at lead 90 and better by under a room
+at leads 14, 7 and 1, with 95 percent of its scored night-marks pinned on the
+top rung of a rate band frozen on the first twelve months (ADR 0009). The
+holdout that checks the unconstrainer gave its negative result at H1 only: no
+combination there reached the gate of 20 censored nights, so no estimate is
+quoted, while at H2 two combinations did and the table quotes their error
+(MAE 25.63 and 24.78 rooms). No number in the pilot is a revenue lift; the
+three things the runs showed the engine cannot yet do are ADRs 0008 to 0010.
 
 ## The five decisions
 

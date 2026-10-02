@@ -18,6 +18,8 @@ python3 run.py experiment      # randomised rate experiment (null result)
 python3 run.py network --quick # network model with LOS and room types
 python3 run.py bench           # milliseconds per decision
 python3 run.py ingest bookings.csv hotel.json   # a real booking log into the ledger
+python3 run.py pilot bookings.csv hotel.json        # score the engine on a real log
+python3 run.py pilot-report out/pilot-h1.json out/pilot-h2.json   # both hotels side by side
 ```
 
 ## Hard constraints
@@ -88,6 +90,14 @@ now true, not what was done. `git log --oneline` shows the pattern.
 
 - The randomised rate experiment shows a small negative lift. That is the
   published result (METHOD.md section 12), not a regression.
+- The engine's lead-1 forecast is biased upward. `forecast.py:91` floors every
+  forecast at rooms on the books, so it cannot forecast a decline (ADR 0008).
+- Table 2's rate gap is largest at the seasonal peak. The band was frozen on the
+  first twelve months and the ladder's top rung sits below the ceiling, so the
+  engine has nowhere left to go (ADR 0009).
+- A pilot run is one hotel per process. `hotelconfig.apply` rebinds seasonality
+  and rewrites the segment table in place, so `run.py pilot` refuses a second
+  hotel and `run.py pilot-report` joins the two JSON files afterwards.
 - The network model does not beat the single-night engine without length of
   stay and room types (METHOD.md section 14). Also on purpose.
 - `run.py test` writes nothing under `out/`; the golden tests run in a

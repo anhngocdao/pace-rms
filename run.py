@@ -10,6 +10,10 @@
   python3 run.py network     score the network bid price against the nightly one
   python3 run.py bench       where the time goes, and how it scales
   python3 run.py ingest      replay a real booking log into the ledger
+  python3 run.py pilot data/antonio/h1-bookings.csv data/antonio/h1-hotel.json
+                             score the engine on a real booking log
+  python3 run.py pilot-report out/pilot-h1.json out/pilot-h2.json
+                             both hotels side by side, from two full runs
   python3 run.py test        run the checks
 """
 
@@ -110,6 +114,70 @@ def main(argv):
         print("engine fitted:", engine.ready)
         return 0
 
+    if cmd == "pilot":
+        if len(args) < 2:
+            print("usage: python3 run.py pilot <bookings.csv> <hotel.json> "
+                  "[--out out/] [--settings data/antonio/settings.json] [--quick]")
+            return 1
+        from pace import ingest
+        from pace import pilot
+        from pace.hotelconfig import ConfigError
+        out_dir = _opt(args, "--out", os.path.join(HERE, "out"))
+        settings = _opt(args, "--settings", os.path.join(HERE, "data", "antonio", "settings.json"))
+        first, last, label = _pilot_window(args)
+        try:
+            payload = pilot.run_one(args[0], args[1], settings, out_dir,
+                                    score_first=first, score_last=last, progress=90,
+                                    label=label, with_holdout="--quick" not in args)
+        except (ingest.IngestError, ConfigError, pilot.PilotError) as exc:
+            print(exc)
+            return 1
+        h = payload["hotel"]
+        w = payload["walk"]
+        print("\n%s (%s), %d rooms%s" % (h["name"], h["code"], h["rooms"],
+                                         ", inferred" if h["rooms_inferred"] else ""))
+        print("walked %d days in %.1f s of wall clock and %.1f s of CPU, %d fits, "
+              "%d forecasts recorded"
+              % (w["days"], w["seconds"], w["cpu_seconds"], w["fits"], w["records"]))
+        gap = payload["full_night_gap"]
+        # Both counts say which population they are a share of: the invisible
+        # nights are a share of the full nights, never of the window.
+        print("nights physically full %d of %d in the window, of those %d invisible to the "
+              "ledger (%.0f%% of the full nights)"
+              % (gap["physically_full"], gap["nights"], gap["full_but_invisible"],
+                 100 * gap["share_of_full_nights"]))
+        for lead in payload["table1"]["leads"] + [payload["table1"]["late_lead"]]:
+            block = payload["table1"]["overall"][lead]
+            m = block["methods"]
+            if m["engine"]["mae"] is None:
+                print("  lead %-4s no night scored" % lead)
+                continue
+            print("  lead %-4s n=%-4d engine MAE %6.2f (clamped %4.0f%%), average %6.2f"
+                  % (lead, block["n"], m["engine"]["mae"], 100 * m["engine"]["clamp_share"],
+                     m["average"]["mae"]))
+        print("\n   wrote %s" % payload["_json_path"])
+        print("   wrote %s" % payload["_md_path"])
+        return 0
+
+    if cmd == "pilot-report":
+        if not args:
+            print("usage: python3 run.py pilot-report out/pilot-h1.json [out/pilot-h2.json]")
+            return 1
+        from pace import pilot
+        from pace import pilotreport
+        payloads = []
+        try:
+            for path in args:
+                with open(path, encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                pilotreport.check_full(payload, path)
+                payloads.append(payload)
+            print("wrote %s" % pilotreport.write_pair(os.path.join(HERE, "out"), payloads))
+        except (OSError, ValueError, pilot.PilotError) as exc:
+            print(exc)
+            return 1
+        return 0
+
     if cmd == "test":
         import unittest
         loader = unittest.TestLoader()
@@ -119,6 +187,28 @@ def main(argv):
 
     print(__doc__)
     return 1
+
+
+def _pilot_window(args):
+    """The pilot's scoring window, and the label a partial run is filed under.
+
+    --quick scores the first two months of the pre-registered window so the
+    wiring can be checked in a minute.  It moves the far end and never the
+    near one: the near end is what the warm-up and the 180 days of driven rate
+    path in front of it are cut to.  A partial run is labelled, because its
+    numbers are not the pilot's numbers and its payload must not be read, or
+    overwritten, as though they were.
+    """
+    from pace import pilot
+    first = pilot.SCORE_FIRST
+    if "--quick" in args:
+        return first, first + dt.timedelta(days=61), "quick"
+    return first, pilot.SCORE_LAST, ""
+
+
+def _opt(args, name, default):
+    """--name value, or the default.  Kept tiny on purpose: run.py is a switchboard."""
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
 
 
 def _summary(payload):

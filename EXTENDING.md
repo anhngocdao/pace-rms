@@ -190,3 +190,7 @@ for a public dataset, including how the hotel's own seasonality, contract
 ratios and sell-out threshold are derived and written to `hotel.json`
 (ADR 0007). Complimentary and house-use rooms stay outside the ledger and
 are reported beside it, because the engine has no capacity block yet.
+The pilot that scores the engine on such a log is `pace/pilot.py` for the
+walk, `pace/baselines.py`, `pace/score.py`, `pace/ratecheck.py` and
+`pace/holdout.py` for the three tables, and `pace/pilotreport.py` for the
+report.
