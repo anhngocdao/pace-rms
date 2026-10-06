@@ -194,3 +194,8 @@ The pilot that scores the engine on such a log is `pace/pilot.py` for the
 walk, `pace/baselines.py`, `pace/score.py`, `pace/ratecheck.py` and
 `pace/holdout.py` for the three tables, and `pace/pilotreport.py` for the
 report.
+
+The handover that turns the forecast into the front desk's, the kitchen's and
+housekeeping's numbers is `pace/handover.py`, its page `pace/handoverpage.py`; a
+fourth department is a new output and a new scoring rule there, and nothing in
+the module makes one cheaper.

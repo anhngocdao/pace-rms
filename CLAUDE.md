@@ -20,6 +20,8 @@ python3 run.py bench           # milliseconds per decision
 python3 run.py ingest bookings.csv hotel.json   # a real booking log into the ledger
 python3 run.py pilot bookings.csv hotel.json        # score the engine on a real log
 python3 run.py pilot-report out/pilot-h1.json out/pilot-h2.json   # both hotels side by side
+python3 run.py handover bookings.csv hotel.json    # the three departments' answers, scored
+python3 run.py handover bookings.csv hotel.json --forward   # the next fourteen days, not scored
 ```
 
 ## Hard constraints
@@ -104,3 +106,9 @@ now true, not what was done. `git log --oneline` shows the pattern.
   temporary directory so a full build's dashboard survives a test run.
 - `tests/test_golden.py::ExplicitTorontoConfig` takes about 14 s; it proves
   the configuration path reproduces the golden numbers (ADR 0007).
+- The handover's forward page scores nothing. A live warning changes the
+  outcome it predicts, so it cannot be scored from a booking log; the proof
+  page beside it was measured on nights nobody interfered with (ADR 0011).
+- Breakfast for tomorrow morning is a lead-0 quantity: it belongs to tonight.
+  The handover walk records lead 0 for that reason, and the first row of the
+  kitchen tab is the one with the narrowest band.
