@@ -701,7 +701,7 @@ def _day_rows(rows, res, band_table, nights, lead=7) -> Tuple[list, list, list]:
         band_rooms = _band(row["rooms"], band_table.get(("rooms", lead)))
         cut = sellout_cut(res, d, row["asof"])
         front.append({"night": d.isoformat(), "lead": lead, "otb": row["otb"], "rooms": row["rooms"],
-                      "band": band_rooms, "cut": cut,
+                      "band": band_rooms, "cut": cut, "survival": row["survival"],
                       "authorised": int(round(res.hotel.rooms * (1 + res.hotel.max_overbook_pct))),
                       "warned": (band_rooms is not None and band_rooms[2] >= cut),
                       "sold_out": sold_out(res, d)})
@@ -769,12 +769,12 @@ def run_proof(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: 
         "coverage": _coverage_json(cov),
         "front_desk": {"nights": front, "band_nights": [d.isoformat() for d in band_nights],
                        "alarm": alarm_scores(rows, res, table, score_nights),
-                       "reads": "revenue rooms: physical occupancy less the NONREV rows, the quantity "
+                       "reads": "physical occupancy less the NONREV rows, the quantity "
                                 "capacity_on nets against on both sides of the alarm"},
         "kitchen": {"days": kitchen, "scores": kitchen_scores(rows, res, table, score_nights),
                     "survival_assumption": SURVIVAL_ASSUMPTION, "covers_population": COVERS_POPULATION},
         "housekeeping": {"days": housekeeping, "scores": housekeeping_scores(rows, res, table, score_nights),
-                         "reads": "physical rooms, NONREV included: a comped room is still stripped and made up",
+                         "reads": "NONREV included, since a comped room is still stripped and made up",
                          "limit": ROSTER_LIMIT},
         "walk": {"days": out.days, "seconds": round(out.seconds, 1), "cpu_seconds": round(out.cpu_seconds, 1),
                  "records": len(out.records), "rows": len(rows)},
@@ -782,6 +782,83 @@ def run_proof(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: 
     }
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "handover-%s.json" % code.lower())
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True, default=str)
+    payload["_json_path"] = path
+    payload["_html_path"] = handoverpage.write(out_dir, payload)
+    return payload
+
+
+def run_forward(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: str,
+                progress: Optional[int] = None) -> dict:
+    """Forward mode: the export date is the last booked_on in the file, the
+    walk runs through it, the fourteen nights after it are answered at the
+    lead they have on the export date, and the bands come from the twelve
+    months of settled nights ending the night before the export. Nothing is
+    scored; the page says why (spec section 8)."""
+    from . import handoverpage
+    settings = pilot._read_settings(settings_path)
+    digest = pilot.settings_digest(settings_path)
+    cfg = HC.load_hotel_json(hotel_json_path)
+    code = pilot.hotel_code(cfg)
+    pilot.claim_process(hotel_json_path)
+    res = ingest.load(csv_path, hotel_json_path, seed=int(settings.get("seed", ingest.DEFAULT_SEED)))
+    cal = HC.event_calendar(res.cfg)
+    export = max(b.booked_on for b in pilot.ledger_rows(res.bookings))
+    horizon_last = min(export + dt.timedelta(days=HORIZON), res.last_stay)
+    out = walk_handover(res, cal, horizon_last, progress=progress)
+    rows = forecast_rows(res, out, res.hotel)
+    weeks = [_dates(p) for p in settings.get("excluded_weeks", [])]
+    band_last = export - dt.timedelta(days=1)
+    band_first = band_last - dt.timedelta(days=365)
+    band_nights = [d for d in sorted({k[0] for k in rows})
+                   if band_first <= d <= band_last and not excluded(d, weeks)
+                   and baselines.actual(res.ledger, d) is not None]
+    table = bands(errors(rows, res, band_nights))
+    front, kitchen, housekeeping = [], [], []
+    for k in range(1, HORIZON + 1):
+        night = export + dt.timedelta(days=k)
+        row = rows.get((night, k))
+        if row is None:
+            continue
+        f, kt, hk = _day_rows({(night, k): row}, res, table, [night], lead=k)
+        front += f
+        kitchen += kt
+        housekeeping += hk
+    for r in front:
+        r.pop("sold_out", None)
+    payload = {
+        "mode": "forward", "label": "forward",
+        "hotel": {"code": code, "name": res.cfg.name, "rooms": res.hotel.rooms,
+                  "rooms_inferred": res.inference is not None,
+                  "sellout_threshold": res.hotel.sellout_threshold,
+                  "max_overbook_pct": res.hotel.max_overbook_pct},
+        "prereg": {"settings_path": settings_path, "settings_sha256": digest,
+                   "sha256_matches_the_recorded_one": digest == pilot.PREREG_SHA256},
+        "export_date": export.isoformat(),
+        "windows": {"first_stay": res.first_stay.isoformat(), "last_stay": res.last_stay.isoformat(),
+                    "band_first": (band_nights[0].isoformat() if band_nights else None),
+                    "band_last": (band_nights[-1].isoformat() if band_nights else None),
+                    "band_nights": len(band_nights), "horizon_first": (export + dt.timedelta(days=1)).isoformat(),
+                    "horizon_last": horizon_last.isoformat(), "excluded_weeks": settings.get("excluded_weeks", [])},
+        "day_convention": DAY_CONVENTION,
+        "guests": {"column_present": any(b.guests is not None for b in res.bookings),
+                   "guests_zero": int(res.report.warnings.get("guests_zero", 0)),
+                   "children_missing_note": next((n for n in res.report.notes if "children NA" in n), None)},
+        "undefined_board_share": undefined_board_share(res.bookings),
+        "bands": _band_table_json(table),
+        "coverage": {},
+        "front_desk": {"nights": front, "reads": "physical occupancy less the NONREV rows, as in proof mode"},
+        "kitchen": {"days": kitchen, "survival_assumption": SURVIVAL_ASSUMPTION,
+                    "covers_population": COVERS_POPULATION},
+        "housekeeping": {"days": housekeeping, "reads": "NONREV included, as in proof mode", "limit": ROSTER_LIMIT},
+        "forward_note": FORWARD_NOTE,
+        "walk": {"days": out.days, "seconds": round(out.seconds, 1), "cpu_seconds": round(out.cpu_seconds, 1),
+                 "records": len(out.records), "rows": len(rows)},
+        "notes": [NO_LIFT],
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "handover-%s-forward.json" % code.lower())
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True, default=str)
     payload["_json_path"] = path

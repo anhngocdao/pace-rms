@@ -503,3 +503,50 @@ class Switchboard(unittest.TestCase):
         self.assertEqual(seen["out"], "/tmp/elsewhere")
         self.assertIn("wrote /tmp/out/handover-h1.html", buf.getvalue())
         self.assertIn("94 of 427 nights reached the sell-out cut", buf.getvalue())
+
+
+class ForwardRun(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from pace import plugins as _plugins
+        _plugins.reset()
+        pilot._release_for_tests()
+        cls.out_dir = tempfile.mkdtemp()
+        settings = os.path.join(cls.out_dir, "settings.json")
+        with open(settings, "w", encoding="utf-8") as fh:
+            fh.write('{"seed": 1, "lead_marks": [30, 14, 7], "lead_marks_h1_only": [], '
+                     '"baseline_window_weeks": 10, "sellout_threshold": 0.97, "excluded_weeks": []}')
+        # A log that stops: every row booked after the export date is dropped,
+        # and nights after it are what the page answers for.
+        rows = history_rows(FIRST_ARRIVAL, NIGHTS)
+        export = (FIRST_ARRIVAL + dt.timedelta(days=NIGHTS - 40)).isoformat()
+        kept = [r for r in rows if r[1] <= export]
+        cls.export = dt.date.fromisoformat(export)
+        cls.payload = handover.run_forward(_csv(kept), FIXTURE_HOTEL, settings, cls.out_dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        _reset_config()
+        pilot._release_for_tests()
+
+    def test_the_export_date_is_the_last_booking_day_and_the_horizon_is_fourteen_nights(self):
+        self.assertEqual(self.payload["mode"], "forward")
+        self.assertEqual(self.payload["export_date"], self.export.isoformat())
+        nights = [r["night"] for r in self.payload["front_desk"]["nights"]]
+        self.assertEqual(len(nights), 14)
+        self.assertEqual(nights[0], (self.export + dt.timedelta(days=1)).isoformat())
+        leads = [r["lead"] for r in self.payload["front_desk"]["nights"]]
+        self.assertEqual(leads, list(range(1, 15)))
+
+    def test_the_bands_come_from_settled_nights_before_the_export_only(self):
+        w = self.payload["windows"]
+        self.assertLess(w["band_last"], self.export.isoformat())
+        self.assertGreaterEqual(w["band_nights"], 30)
+
+    def test_nothing_is_scored_and_the_page_says_why(self):
+        self.assertNotIn("alarm", self.payload["front_desk"])
+        self.assertNotIn("scores", self.payload["kitchen"])
+        with open(self.payload["_html_path"], encoding="utf-8") as fh:
+            html = fh.read()
+        self.assertIn("forward warnings are not scored", html.lower())
+        self.assertTrue(self.payload["_html_path"].endswith("handover-pilot-forward.html"))

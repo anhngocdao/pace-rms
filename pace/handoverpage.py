@@ -31,38 +31,47 @@ def notice_text(notice: dict) -> str:
 
 
 def band_text(b) -> str:
-    return MISSING if not b else "%s to %s" % (num(b[0]), num(b[2]))
+    return MISSING if not b else "%s to %s" % (num(max(0.0, b[0])), num(b[2]))  # a room count has no negative bottom
+
+
+NOT_SCORED = "<p>Not scored: these nights have not happened.</p>"
 
 
 def _tab_front(p: dict) -> str:
-    a = p["front_desk"]["alarm"]
+    proof = p["mode"] == "proof"
     rows = []
     for r in p["front_desk"]["nights"]:
-        rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            r["night"], r["otb"], num(r["rooms"]), band_text(r["band"]), r["authorised"],
-            "warning" if r["warned"] else "", "sold out" if r["sold_out"] else ""))
-    per_lead = "".join(
-        "<tr><td>%d</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td></tr>" % (
-            lead, c["warned"], c["events"],
-            rate_text(c["hits"], c["warned"]), rate_text(c["hits"], c["events"]))
-        for lead, c in sorted(((int(k), v) for k, v in a["per_lead"].items())))
-    return (
+        rows.append("<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            r["night"], r["lead"], r["otb"], num(r["rooms"]), band_text(r["band"]), r["authorised"],
+            "warning" if r["warned"] else "", "sold out" if r.get("sold_out") else ""))
+    head = (
         "<section id=\"front\"><h2>Front desk, indexed by stay night</h2>"
         "<p>This tab reads <b>revenue rooms</b>: %s.</p>"
         "<p>The warning says the night is going to fill: the top of the band reaches the "
         "sell-out cut of %.2f times the rooms for sale that day. It is not a claim that anyone "
         "will be relocated; on both pilot hotels the room count is inferred from the busiest "
         "night in the log, so a night above capacity cannot occur in the data at all.</p>"
+        % (html.escape(p["front_desk"]["reads"]), p["hotel"]["sellout_threshold"]))
+    table = ("<table><tr><th>night</th><th>lead</th><th>on the books</th><th>forecast</th>"
+             "<th>band p10 to p90</th><th>authorised</th><th>warning</th><th>outcome</th></tr>%s</table>"
+             % "".join(rows))
+    if not proof:
+        return head + NOT_SCORED + table + "</section>"
+    a = p["front_desk"]["alarm"]
+    per_lead = "".join(
+        "<tr><td>%d</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td></tr>" % (
+            lead, c["warned"], c["events"],
+            rate_text(c["hits"], c["warned"]), rate_text(c["hits"], c["events"]))
+        for lead, c in sorted(((int(k), v) for k, v in a["per_lead"].items())))
+    return head + (
         "<p>%d of %d scored nights reached the cut, an upper bound because the inferred room "
         "count is biased low. %d of them were full in the house while the ledger was short: "
         "those are the nights the log cannot say whether anyone was turned away, reported here "
-        "and folded into no rate.</p>"
-        "<table><tr><th>night</th><th>on the books</th><th>forecast</th><th>band p10 to p90</th>"
-        "<th>authorised</th><th>warning</th><th>outcome</th></tr>%s</table>"
+        "and folded into no rate.</p>" % (a["events"], a["nights"], a["cannot_speak"])
+    ) + table + (
         "<h3>The alarm, scored per lead</h3><p>%s.</p>"
         "<table><tr><th>lead</th><th>warned</th><th>sell-outs</th><th>precision</th><th>recall</th></tr>%s</table>"
-        "</section>" % (html.escape(p["front_desk"]["reads"]), a["threshold"], a["events"], a["nights"],
-                        a["cannot_speak"], "".join(rows), notice_text(a["notice"]), per_lead))
+        "</section>" % (notice_text(a["notice"]), per_lead))
 
 
 def _tier_cell(c) -> str:
@@ -77,12 +86,12 @@ def _tier_cell(c) -> str:
 def _tab_kitchen(p: dict) -> str:
     k = p["kitchen"]
     rows = "".join(
-        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            r["day"], num(r["breakfast"]["point"]), band_text(r["breakfast"]["band"]),
+        "<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            r["day"], r["lead"], num(r["breakfast"]["point"]), band_text(r["breakfast"]["band"]),
             num(r["dinner"]["point"]), band_text(r["dinner"]["band"]))
         for r in k["days"])
-    scores = ""
-    for meal in ("breakfast", "dinner"):
+    scores = "" if p["mode"] == "proof" else NOT_SCORED
+    for meal in ("breakfast", "dinner") if p["mode"] == "proof" else ():
         scores += "<h3>%s, scored per lead</h3><table><tr><th>lead</th><th>n</th><th>MAE covers</th>" \
                   "<th>covering tier: short / over-prep</th><th>balanced tier: short / over-prep</th></tr>" % meal
         for lead, c in sorted(((int(a), b) for a, b in k["scores"][meal].items())):
@@ -100,7 +109,7 @@ def _tab_kitchen(p: dict) -> str:
         "<p>%s</p><p>%s</p>"
         "<p>SC and Undefined both count as no meal, the dataset's own documentation. Undefined "
         "is %s of %s stayed revenue room nights, %s.</p>"
-        "<table><tr><th>day</th><th>breakfast</th><th>band</th><th>dinner</th><th>band</th></tr>%s</table>%s"
+        "<table><tr><th>day</th><th>lead</th><th>breakfast</th><th>band</th><th>dinner</th><th>band</th></tr>%s</table>%s"
         "</section>" % (html.escape(p["day_convention"]), html.escape(k["survival_assumption"]),
                         html.escape(k["covers_population"]), und["room_nights"], und["of"],
                         (MISSING if und["share"] is None else "%.1f%%" % (100 * und["share"])), rows, scores))
@@ -109,10 +118,17 @@ def _tab_kitchen(p: dict) -> str:
 def _tab_housekeeping(p: dict) -> str:
     h = p["housekeeping"]
     rows = "".join(
-        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td></tr>" % (
-            r["day"], num(r["departures"]["point"]), band_text(r["departures"]["band"]),
+        "<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td></tr>" % (
+            r["day"], r["lead"], num(r["departures"]["point"]), band_text(r["departures"]["band"]),
             num(r["stayovers"]["point"]), band_text(r["stayovers"]["band"]), r["arrivals_booked"])
         for r in h["days"])
+    if p["mode"] != "proof":
+        return (
+            "<section id=\"housekeeping\"><h2>Housekeeping, indexed by service day</h2>"
+            "<p>This tab reads <b>physical rooms</b>: %s.</p><p>%s</p>%s"
+            "<table><tr><th>day</th><th>lead</th><th>departures</th><th>band</th><th>stayovers</th><th>band</th>"
+            "<th>arrivals on the books</th></tr>%s</table></section>"
+            % (html.escape(h["reads"]), html.escape(h["limit"]), NOT_SCORED, rows))
     scores = "<table><tr><th>lead</th><th>departures MAE (n)</th><th>stayovers MAE (n)</th>" \
              "<th>roster at p10: days short / rooms short on those days</th></tr>"
     for lead, c in sorted(((int(a), b) for a, b in h["scores"].items())):
@@ -130,7 +146,7 @@ def _tab_housekeeping(p: dict) -> str:
         "the departures and say which rooms must be finished before check-in. Roster at the "
         "bottom of the band; the top is printed beside it so the supervisor knows how many "
         "extra to call in.</p><p>%s</p>"
-        "<table><tr><th>day</th><th>departures</th><th>band</th><th>stayovers</th><th>band</th>"
+        "<table><tr><th>day</th><th>lead</th><th>departures</th><th>band</th><th>stayovers</th><th>band</th>"
         "<th>arrivals on the books</th></tr>%s</table><h3>Scored per lead</h3>%s"
         "</section>" % (html.escape(h["reads"]), html.escape(h["limit"]), rows, scores))
 
