@@ -96,6 +96,27 @@ quoted, while at H2 two combinations did and the table quotes their error
 (MAE 25.63 and 24.78 rooms). No number in the pilot is a revenue lift; the
 three things the runs showed the engine cannot yet do are ADRs 0008 to 0010.
 
+The handover turns that forecast into the three answers a hotel's departments
+actually use: the front desk's sell-out warning, the kitchen's breakfast and
+dinner covers, and housekeeping's departures and stayovers, each printed as a
+band whose coverage is measured rather than assumed, on `out/handover-h1.html`
+and `out/handover-h2.html` from `run.py handover` (proof mode, scored on the
+pilot's 427 nights) and `run.py handover --forward` (the fourteen nights after
+an export, not scored, and the page says why). On the runs of 6 October 2026:
+the warning, which fires when the top of the rooms band reaches the
+pre-registered sell-out cut, caught every one of the 94 sell-out nights at H1
+and the 132 at H2 a week out, at a precision of 0.32 and 0.50, so at H1 two
+warnings in three were false; the kitchen's breakfast count for tomorrow
+morning was off by 4.9 covers at H1 and 4.5 at H2 on average, and its covering
+tier fell short on 2.8 and 4.4 percent of days a week out; housekeeping's
+departures were off by 5.1 and 5.4 rooms a week out, and the bottom of the
+band, where the roster is drawn, left it short on 95 percent of days by about
+7 rooms at H1 and 9 at H2, with the top printed beside it for the extra to
+call in. The rooms band covered 86 and 87 percent of scoring nights a week out
+against a label of 80. The three decisions behind it, a sell-out alarm rather
+than an oversold one, bands on each quantity's own error, and booked plus
+pickup under a survival rate, are ADRs 0011 to 0013.
+
 ## The five decisions
 
 | Decision | Mechanism | Where |

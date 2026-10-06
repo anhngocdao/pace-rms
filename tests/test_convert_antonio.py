@@ -764,3 +764,24 @@ class AuditPrintsEveryBranch(unittest.TestCase):
         self.assertEqual([b for b in counts if b not in CA.ALL_BRANCHES], [])
         self.assertTrue(set(counts) < set(CA.ALL_BRANCHES),
                         "fixture should leave at least one branch empty")
+
+
+class GuestsColumn(unittest.TestCase):
+    """Spec 2026-09-21 section 4.1: guests = adults + children, babies excluded,
+    children NA read as zero and counted."""
+
+    def test_guests_is_adults_plus_children_and_never_babies(self):
+        out, _, _ = CA.branch_rows([_arow(adults="2", children="1", babies="1")], SETTINGS)
+        self.assertEqual(out[0]["guests"], "3")
+        self.assertIn("guests", CA.OUT_COLUMNS)
+        self.assertEqual(CA.OUT_COLUMNS.index("guests"), CA.OUT_COLUMNS.index("meal") + 1)
+
+    def test_children_na_reads_as_zero_and_is_counted_in_a_note(self):
+        out, _, notes = CA.branch_rows([_arow(hotel="City Hotel", adults="2", children="NA"),
+                                        _arow(hotel="City Hotel", adults="1", children="0.0")], SETTINGS)
+        self.assertEqual([o["guests"] for o in out], ["2", "1"])
+        self.assertTrue(any(n.startswith("H2: children NA on 1 rows, read as zero") for n in notes), notes)
+
+    def test_a_zero_adult_row_keeps_its_children_as_guests(self):
+        out, _, _ = CA.branch_rows([_arow(adults="0", children="2")], SETTINGS)
+        self.assertEqual(out[0]["guests"], "2")

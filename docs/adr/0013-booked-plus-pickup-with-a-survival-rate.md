@@ -1,0 +1,14 @@
+# ADR 0013: Booked plus pickup, with a survival rate on the booked part
+Status: Proposed · Date: 2026-09-21
+
+## Context
+At the leads a department plans at, most of a night is already on the books, and each booking states its own board, its own guest count and its own departure date. Multiplying a rooms forecast by last month's average board share dissolves a forty-room half-board group into the average and reports a band wide enough to have hidden it. A booking on the books may still cancel, and when it does its board and guest count go with it; measured on the scoring window, rooms on the books at lead 7 survive at 97.8 percent at H1 and 95.4 percent at H2, falling to 95.7 and 91.1 at lead 14, always downward.
+
+## Decision
+Each derived quantity is booked plus pickup. The booked part is counted from the rows on the books on the forecast day, times the survival rate s(L, weekday), the share of rooms on the books at lead L that went on to stay over the ten trailing same-weekday nights. The pickup is `rooms forecast - (rooms on the books x s)`, so booked plus pickup equals the engine's rooms forecast on every row, and a test asserts it; only the pickup is multiplied by a trailing-window ratio. One s serves every board, an assumption named on the kitchen tab. The ratios sit behind the same leak guard as the baselines: a night whose trailing window cannot supply one has no forecast for that quantity, never a default.
+
+## Consequences
+The booked part no longer overstates the finished number by the cancellation rate, which narrows the band without touching its honesty: coverage is measured end to end either way. A per-segment s was considered and rejected on the measurement (spread under one point at H1 and two at H2 at lead 7). Survival by board code has not been measured and is the first thing to measure if the kitchen band proves wide. The rate has to be a share of the rows it is applied to: a first implementation divided the night's final room count by the rooms on the books at the lead, and the final count also holds everything booked after the forecast day, so the rate came out at one on every night of both hotels and the booked part was counted gross after all. The numerator is now the rooms on the books at the lead that went on to stay, counted from the same rows as the denominator, and a test holds the rate below one wherever a row cancelled inside the lead.
+
+## Evidence
+`handover.ratios`, `handover.forecast_row`, the `ForecastRow` tests (booked plus pickup equals the forecast on more than a thousand rows; the pickup is never negative). Survival at lead 7 from the runs of 6 October 2026: 0.9775 at H1 (0.9525 to 0.9921 across the 427 scoring nights), 0.9483 at H2 (0.8913 to 0.9802), the mean of the per-night s over the scoring window; the spec's direct measurement of the same share on the converted CSV read 97.8 and 95.4. Spec section 6.2.

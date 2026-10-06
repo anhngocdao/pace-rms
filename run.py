@@ -14,6 +14,11 @@
                              score the engine on a real booking log
   python3 run.py pilot-report out/pilot-h1.json out/pilot-h2.json
                              both hotels side by side, from two full runs
+  python3 run.py handover data/antonio/h1-bookings.csv data/antonio/h1-hotel.json
+                             what the front desk, the kitchen and housekeeping
+                             would have been told, and whether it held
+  python3 run.py handover <csv> <hotel.json> --forward
+                             the next fourteen days from an export, not scored
   python3 run.py test        run the checks
 """
 
@@ -176,6 +181,37 @@ def main(argv):
         except (OSError, ValueError, pilot.PilotError) as exc:
             print(exc)
             return 1
+        return 0
+
+    if cmd == "handover":
+        if len(args) < 2:
+            print("usage: python3 run.py handover <bookings.csv> <hotel.json> "
+                  "[--out out/] [--settings data/antonio/settings.json] [--forward]")
+            return 1
+        from pace import handover
+        from pace import ingest
+        from pace import pilot
+        from pace.hotelconfig import ConfigError
+        out_dir = _opt(args, "--out", os.path.join(HERE, "out"))
+        settings = _opt(args, "--settings", os.path.join(HERE, "data", "antonio", "settings.json"))
+        try:
+            if "--forward" in args:
+                payload = handover.run_forward(args[0], args[1], settings, out_dir, progress=90)
+            else:
+                payload = handover.run_proof(args[0], args[1], settings, out_dir, progress=90)
+        except (ingest.IngestError, ConfigError, pilot.PilotError) as exc:
+            print(exc)
+            return 1
+        h = payload["hotel"]
+        w = payload["walk"]
+        print("\n%s (%s), %d rooms" % (h["name"], h["code"], h["rooms"]))
+        print("walked %d days in %.1f s of wall clock and %.1f s of CPU"
+              % (w["days"], w["seconds"], w["cpu_seconds"]))
+        if payload.get("mode", "proof") == "proof":
+            a = payload["front_desk"]["alarm"]
+            print("%d of %d nights reached the sell-out cut" % (a["events"], a["nights"]))
+        print("\n   wrote %s" % payload["_json_path"])
+        print("   wrote %s" % payload["_html_path"])
         return 0
 
     if cmd == "test":

@@ -46,6 +46,9 @@ class Booking:
     updated_on: Optional[dt.date]
     row: int
     meal: str = ""
+    # adults plus children, babies excluded; None when the file has no guests
+    # column, so a kitchen tab can refuse to count covers rather than guess.
+    guests: Optional[int] = None
     target: Optional[str] = None
     imputed_cancel: bool = False
 
@@ -139,7 +142,12 @@ def read_bookings(path: str, cfg: HotelConfig) -> Tuple[List[Booking], Report]:
                           "expanded id %r collides with an existing booking_id" % new_id)
                 continue
             seen_ids.add(new_id)
-            out.append(Booking(**{**b.__dict__, "booking_id": new_id, "rooms": 1}))
+            # The booking's guests are split across its rooms so the k rows sum
+            # back to the whole; the first rows take the remainder.
+            split = None
+            if b.guests is not None:
+                split = b.guests // b.rooms + (1 if k <= b.guests % b.rooms else 0)
+            out.append(Booking(**{**b.__dict__, "booking_id": new_id, "rooms": 1, "guests": split}))
     return out, rep
 
 
@@ -262,6 +270,24 @@ def _parse_row(i: int, r: dict, cfg: HotelConfig, rep: Report) -> Optional[Booki
         elif not (cfg.rate_floor <= rate <= cfg.rate_ceiling):
             rep.warnings["rate_out_of_range"] += 1
 
+    guests = None
+    if r.get("guests") is not None:
+        raw = r["guests"].strip()
+        if raw != "":
+            try:
+                guests = int(raw)
+            except ValueError:
+                bad("guests", "not an integer: %r" % raw)
+                return None
+            if guests < 0:
+                bad("guests", "negative: %d" % guests)
+                return None
+            if guests == 0 and rate is not None and rate > 0:
+                # 31 revenue rows across both pilot hotels have nobody in them.
+                # They are kept: a room nobody slept in still carries revenue
+                # and still has to be cleaned; it just contributes no covers.
+                rep.warnings["guests_zero"] += 1
+
     return Booking(
         booking_id=(r.get("booking_id") or "").strip(), booked_on=dates["booked_on"], arrival=dates["arrival"],
         nights=nights, rooms=rooms, rate=float(rate), currency=cfg.currency.upper(),
@@ -269,6 +295,7 @@ def _parse_row(i: int, r: dict, cfg: HotelConfig, rep: Report) -> Optional[Booki
         source=(r.get("source") or "").strip(), room_type=(r.get("room_type") or "").strip(),
         company=(r.get("company") or "").strip(), status=status, status_date=status_date,
         updated_on=dates["updated_on"], row=i, meal=(r.get("meal") or "").strip(),
+        guests=guests,
     )
 
 
