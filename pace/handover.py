@@ -107,6 +107,20 @@ class Index:
             for k in range(b.nights):
                 self._comps[b.arrival + dt.timedelta(days=k)].append(b)
         self._stats: Dict[dt.date, dict] = {}
+        self._surv: Dict[Tuple[dt.date, int], Tuple[int, int]] = {}
+
+    def survival_parts(self, night: dt.date, lead: int) -> Tuple[int, int]:
+        """(rooms on the books at this lead that went on to stay, rooms on the
+        books at this lead), both counted from the same rows, so the rate is
+        a share of those rooms and nothing booked after the forecast day can
+        push it above one."""
+        key = (night, lead)
+        parts = self._surv.get(key)
+        if parts is None:
+            rows = on_books(self.revenue_rows_on(night), night, night - dt.timedelta(days=lead))
+            parts = (sum(b.rooms for b in rows if b.occupies), sum(b.rooms for b in rows))
+            self._surv[key] = parts
+        return parts
 
     def physical_on(self, night: dt.date) -> List[Booking]:
         return self._phys.get(night, [])
@@ -236,7 +250,10 @@ def ratios(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
 
     Every ratio is a ratio of sums over the window, not a mean of ratios, so a
     quiet reference night does not weigh as much as a full one. survival is
-    rooms that stayed over rooms on the books at this lead. breakfast_share
+    the rooms on the books at this lead that went on to stay, over the rooms
+    on the books at this lead: a share of those rooms, which the night's final
+    count is not, since it also holds everything booked after the forecast
+    day. breakfast_share
     and dinner_share are covers over guests; guests_per_room is guests over
     revenue rooms; stayover_share is physical rooms that stayed on over
     physical rooms. Any denominator of zero makes that ratio None; fewer than
@@ -253,8 +270,9 @@ def ratios(bookings: List[Booking], nonrev: List[Booking], ledger: Ledger,
     phys_rooms = stay_rooms = 0
     guests_known = True
     for n in refs:
-        stayed += baselines.actual(ledger, n) or 0.0
-        otb += ledger.otb_at(n, lead) or 0
+        st_rooms, otb_rooms = index.survival_parts(n, lead)
+        stayed += st_rooms
+        otb += otb_rooms
         st = index.night_stats(n)
         rooms += st["rev_rooms"]
         if st["guests"] is None:
@@ -301,7 +319,7 @@ def forecast_row(rec, bookings: List[Booking], nonrev: List[Booking], ledger: Le
     r = ratios(bookings, nonrev, ledger, night, lead, index)
     if r is None or r["survival"] is None:
         return None
-    s = min(1.0, r["survival"])
+    s = r["survival"]
     parts = booked_parts(bookings, nonrev, night, asof, index)
     rooms = float(rec.forecast)
     booked_stay = parts["rooms"] * s

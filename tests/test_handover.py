@@ -183,10 +183,19 @@ class Ratios(unittest.TestCase):
         res, out = walked()
         night, lead = SCORE_FIRST + dt.timedelta(days=30), 7
         r = handover.ratios(res.bookings, res.nonrev, res.ledger, night, lead)
-        stayed = sum(baselines.actual(res.ledger, n) for n in r["refs"])
-        otb = sum(res.ledger.otb_at(n, lead) for n in r["refs"])
+        rev = pilot.ledger_rows(res.bookings)
+        stayed = otb = 0
+        for n in r["refs"]:
+            rows = handover.on_books(handover.rows_on(rev, n), n, n - dt.timedelta(days=lead))
+            otb += sum(b.rooms for b in rows)
+            stayed += sum(b.rooms for b in rows if b.occupies)
         self.assertAlmostEqual(r["survival"], stayed / otb)
-        self.assertLessEqual(r["survival"], 1.0 + 1e-9)
+        # The night's final count is not the numerator: it holds the pickup
+        # after the forecast day, which once pushed the rate to one on every
+        # night of both pilot hotels. A share of the rows on the books stays
+        # below one wherever any of them cancelled inside the lead.
+        self.assertLess(r["survival"], 1.0)
+        self.assertGreater(sum(baselines.actual(res.ledger, n) for n in r["refs"]), stayed)
 
     def test_no_ratio_leaks_a_night_at_or_after_the_forecast_day(self):
         res, out = walked()
