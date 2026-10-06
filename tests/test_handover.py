@@ -407,3 +407,99 @@ class Scores(unittest.TestCase):
                 self.assertGreaterEqual(k["breakfast"][lead]["mae"], 0.0)
             self.assertIn("departures", h[lead])
             self.assertIn("stayovers", h[lead])
+
+
+class ProofRun(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from pace import plugins as _plugins
+        _plugins.reset()
+        pilot._release_for_tests()
+        cls.out_dir = tempfile.mkdtemp()
+        settings = os.path.join(cls.out_dir, "settings.json")
+        with open(settings, "w", encoding="utf-8") as fh:
+            fh.write('{"seed": 1, "lead_marks": [30, 14, 7], "lead_marks_h1_only": [], '
+                     '"baseline_window_weeks": 10, "sellout_threshold": 0.97, '
+                     '"excluded_weeks": [["2024-03-25", "2024-03-31"]], '
+                     '"warmup_window": ["2024-01-01", "2025-01-31"], '
+                     '"scoring_window": ["2025-02-01", "2025-04-30"]}')
+        cls.payload = handover.run_proof(_csv(history_rows(FIRST_ARRIVAL, NIGHTS)), FIXTURE_HOTEL,
+                                         settings, cls.out_dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        _reset_config()
+        pilot._release_for_tests()
+
+    def test_the_payload_and_the_page_are_written_beside_each_other(self):
+        self.assertTrue(self.payload["_json_path"].endswith("handover-pilot.json"))
+        self.assertTrue(self.payload["_html_path"].endswith("handover-pilot.html"))
+        self.assertTrue(os.path.exists(self.payload["_html_path"]))
+
+    def test_the_bands_come_from_the_warm_up_window_and_the_coverage_from_the_scoring_window(self):
+        w = self.payload["windows"]
+        self.assertLess(w["band_last"], w["score_first"])
+        self.assertEqual(w["score_first"], "2025-02-01")
+        self.assertNotIn("2024-03-27", self.payload["front_desk"]["band_nights"])
+
+    def test_every_lead_has_a_band_or_a_reason(self):
+        for q in handover.QUANTITIES:
+            for lead in handover.LEADS:
+                cell = self.payload["bands"][q][str(lead)]
+                self.assertTrue(cell is None or cell["n"] >= handover.MIN_BAND_NIGHTS, (q, lead))
+
+    def test_the_page_names_which_rooms_each_tab_reads(self):
+        with open(self.payload["_html_path"], encoding="utf-8") as fh:
+            html = fh.read()
+        self.assertIn("revenue rooms", html)
+        self.assertIn("physical rooms", html)
+        self.assertIn("Breakfast on morning D is served to the guests who stayed night D - 1", html)
+
+    def test_a_rate_below_the_floor_prints_its_count_and_no_percentage(self):
+        from pace import handoverpage
+        text = handoverpage.rate_text(3, 4)
+        self.assertEqual(text, "3 of 4 (below the 30-night floor, no rate printed)")
+        self.assertEqual(handoverpage.rate_text(24, 30), "80.0% (24 of 30)")
+
+    def test_notice_fourteen_is_printed_as_fourteen_or_more(self):
+        from pace import handoverpage
+        self.assertIn("14 or more", handoverpage.notice_text({"median": 14.0, "censored": 5, "scored": 9}))
+        self.assertIn("5 of 9 censored", handoverpage.notice_text({"median": 14.0, "censored": 5, "scored": 9}))
+        self.assertNotIn("or more", handoverpage.notice_text({"median": 6.0, "censored": 0, "scored": 9}))
+
+    def test_the_no_lift_and_no_pricing_sentences_are_on_the_page(self):
+        with open(self.payload["_html_path"], encoding="utf-8") as fh:
+            html = fh.read()
+        self.assertIn("never prices", html)
+        self.assertIn("No number on this page is a revenue lift", html)
+
+    def test_the_kitchen_tab_names_the_survival_assumption_and_the_undefined_share(self):
+        k = self.payload["kitchen"]
+        self.assertIn("same board mix", k["survival_assumption"])
+        self.assertIn("revenue rows", k["covers_population"])
+        self.assertIn("share", self.payload["undefined_board_share"])
+
+
+class Switchboard(unittest.TestCase):
+    """run.py handover hands the arguments through and prints the two paths."""
+
+    def test_handover_is_dispatched_with_the_paths_in_order(self):
+        import io, contextlib, importlib
+        from unittest import mock
+        run = importlib.import_module("run")
+        seen = {}
+
+        def fake(csv_path, hotel_json_path, settings_path, out_dir, progress=None):
+            seen.update(csv=csv_path, hotel=hotel_json_path, settings=settings_path, out=out_dir)
+            return {"hotel": {"name": "H1 Resort Hotel", "code": "H1", "rooms": 187},
+                    "front_desk": {"alarm": {"events": 94, "nights": 427}},
+                    "walk": {"days": 1, "seconds": 1.0, "cpu_seconds": 1.0},
+                    "_json_path": "/tmp/out/handover-h1.json", "_html_path": "/tmp/out/handover-h1.html"}
+        buf = io.StringIO()
+        with mock.patch("pace.handover.run_proof", fake), contextlib.redirect_stdout(buf):
+            code = run.main(["run.py", "handover", "b.csv", "h.json", "--out", "/tmp/elsewhere"])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["csv"], "b.csv")
+        self.assertEqual(seen["out"], "/tmp/elsewhere")
+        self.assertIn("wrote /tmp/out/handover-h1.html", buf.getvalue())
+        self.assertIn("94 of 427 nights reached the sell-out cut", buf.getvalue())

@@ -15,11 +15,14 @@ the page re-labels by service day.
 This module reads and never prices.
 """
 import datetime as dt
+import json
+import os
 from collections import defaultdict
 from statistics import fmean
 from typing import Dict, List, Optional, Tuple
 
 from . import baselines
+from . import hotelconfig as HC
 from . import ingest
 from . import pilot
 from .ingest import Booking
@@ -620,3 +623,167 @@ def housekeeping_scores(rows, res, band_table, nights) -> dict:
                                   "short_rooms_mean": (fmean(gaps) if gaps else None)}
         out[lead] = cell
     return out
+
+
+DAY_CONVENTION = (
+    "A stay night N is the night beginning on calendar day N. Breakfast on morning D is "
+    "served to the guests who stayed night D - 1. Dinner on evening D is served to the "
+    "half-board and full-board guests staying night D. Departures on day D are rooms whose "
+    "last stay night was D - 1; stayovers on day D are rooms covering both night D - 1 and "
+    "night D; arrivals on day D have first stay night D. Rooms occupied on night D - 1 equal "
+    "departures on day D plus stayovers on day D, and a test asserts it on every day.")
+NO_LIFT = ("No number on this page is a revenue lift. The handover reads a forecast and "
+           "translates it into operational language; it never prices, never authorises and "
+           "never sends.")
+SURVIVAL_ASSUMPTION = (
+    "One survival rate serves every board: a booking cancels whole, so the rate is exact for "
+    "rooms and assumes that cancelling bookings carry the same board mix and the same guests "
+    "per room as the ones that stay. Survival by board code has not been measured; survival by "
+    "segment has, and its spread at lead 7 is under one point at H1 and under two at H2.")
+COVERS_POPULATION = (
+    "Covers are counted on revenue rows: the engine forecasts revenue rooms, so a comped room's "
+    "guests are not in the forecast and are not in the actual either. The physical room count on "
+    "the housekeeping tab does include them.")
+ROSTER_LIMIT = ("Pace does not know how many minutes a room takes. It reports rooms by kind; "
+                "converting to people needs the hotel's own minutes per room.")
+FORWARD_NOTE = (
+    "Nothing on this page is checkable yet: these nights have not happened. Run live, a "
+    "front-desk warning changes the outcome it predicts, and a warning that worked scores as a "
+    "false alarm, so forward warnings are not scored at all. The proof run beside this page "
+    "was measured on nights nobody interfered with.")
+
+
+def _dates(pair):
+    return dt.date.fromisoformat(pair[0]), dt.date.fromisoformat(pair[1])
+
+
+def _band(point, band):
+    """band_of, or None when either the point or the band is missing."""
+    if point is None or band is None:
+        return None
+    return band_of(point, band)
+
+
+def undefined_board_share(bookings: List[Booking]) -> dict:
+    """spec 4.2: Undefined as a share of stayed revenue room nights."""
+    rows = [b for b in pilot.ledger_rows(bookings) if b.occupies]
+    total = sum(b.rooms * b.nights for b in rows)
+    und = sum(b.rooms * b.nights for b in rows if (b.meal or "").strip() == "Undefined")
+    return {"room_nights": und, "of": total, "share": (und / total) if total else None}
+
+
+def _band_table_json(table) -> dict:
+    out = {q: {} for q in QUANTITIES}
+    for (q, lead), cell in table.items():
+        out[q][str(lead)] = cell
+    for q in QUANTITIES:
+        for lead in LEADS:
+            out[q].setdefault(str(lead), None)
+    return out
+
+
+def _coverage_json(cov) -> dict:
+    out = {q: {} for q in QUANTITIES}
+    for (q, lead), cell in cov.items():
+        out[q][str(lead)] = cell
+    return out
+
+
+def _day_rows(rows, res, band_table, nights, lead=7) -> Tuple[list, list, list]:
+    """The scoring-window rows at one lead, the lead a department plans a week
+    at, shaped for the three tabs. Every other lead's bands and scores are in
+    the payload's own blocks."""
+    front, kitchen, housekeeping = [], [], []
+    for d in sorted(nights):
+        row = rows.get((d, lead))
+        if row is None:
+            continue
+        band_rooms = _band(row["rooms"], band_table.get(("rooms", lead)))
+        cut = sellout_cut(res, d, row["asof"])
+        front.append({"night": d.isoformat(), "lead": lead, "otb": row["otb"], "rooms": row["rooms"],
+                      "band": band_rooms, "cut": cut,
+                      "authorised": int(round(res.hotel.rooms * (1 + res.hotel.max_overbook_pct))),
+                      "warned": (band_rooms is not None and band_rooms[2] >= cut),
+                      "sold_out": sold_out(res, d)})
+        day = (d + dt.timedelta(days=1)).isoformat()
+        kitchen.append({"day": day, "night": d.isoformat(), "lead": lead,
+                        "breakfast": {"point": row["breakfast"],
+                                      "band": _band(row["breakfast"], band_table.get(("breakfast", lead)))},
+                        "dinner": {"evening": d.isoformat(), "point": row["dinner"],
+                                   "band": _band(row["dinner"], band_table.get(("dinner", lead)))}})
+        housekeeping.append({"day": day, "night": d.isoformat(), "lead": lead,
+                             "departures": {"point": row["departures"],
+                                            "band": _band(row["departures"], band_table.get(("departures", lead)))},
+                             "stayovers": {"point": row["stayovers"],
+                                           "band": _band(row["stayovers"], band_table.get(("stayovers", lead)))},
+                             "arrivals_booked": row["arrivals_booked"]})
+    return front, kitchen, housekeeping
+
+
+def run_proof(csv_path: str, hotel_json_path: str, settings_path: str, out_dir: str,
+              progress: Optional[int] = None) -> dict:
+    """Proof mode: replay the history, measure the bands on the warm-up window,
+    answer and score on the scoring window, write the payload and the page."""
+    from . import handoverpage
+    settings = pilot._read_settings(settings_path)
+    digest = pilot.settings_digest(settings_path)
+    cfg = HC.load_hotel_json(hotel_json_path)
+    code = pilot.hotel_code(cfg)
+    pilot.claim_process(hotel_json_path)
+    res = ingest.load(csv_path, hotel_json_path, seed=int(settings.get("seed", ingest.DEFAULT_SEED)))
+    cal = HC.event_calendar(res.cfg)
+    warm_first, warm_last = _dates(settings["warmup_window"])
+    score_first, score_last = _dates(settings["scoring_window"])
+    weeks = [_dates(p) for p in settings.get("excluded_weeks", [])]
+    score_last = min(score_last, res.last_stay)
+    out = walk_handover(res, cal, score_last, progress=progress)
+    rows = forecast_rows(res, out, res.hotel)
+    all_nights = sorted({k[0] for k in rows})
+    band_nights = [d for d in all_nights if warm_first <= d <= warm_last and d < score_first
+                   and not excluded(d, weeks)]
+    score_nights = [d for d in all_nights if score_first <= d <= score_last]
+    table = bands(errors(rows, res, band_nights))
+    cov = coverage(rows, res, table, score_nights)
+    front, kitchen, housekeeping = _day_rows(rows, res, table, score_nights)
+    rep = res.report
+    payload = {
+        "mode": "proof", "label": "full",
+        "hotel": {"code": code, "name": res.cfg.name, "rooms": res.hotel.rooms,
+                  "rooms_inferred": res.inference is not None,
+                  "sellout_threshold": res.hotel.sellout_threshold,
+                  "max_overbook_pct": res.hotel.max_overbook_pct},
+        "prereg": {"settings_path": settings_path, "settings_sha256": digest,
+                   "sha256_matches_the_recorded_one": digest == pilot.PREREG_SHA256},
+        "windows": {"first_stay": res.first_stay.isoformat(), "last_stay": res.last_stay.isoformat(),
+                    "band_first": (band_nights[0].isoformat() if band_nights else None),
+                    "band_last": (band_nights[-1].isoformat() if band_nights else None),
+                    "band_nights": len(band_nights),
+                    "score_first": score_first.isoformat(), "score_last": score_last.isoformat(),
+                    "excluded_weeks": settings.get("excluded_weeks", [])},
+        "day_convention": DAY_CONVENTION,
+        "guests": {"column_present": any(b.guests is not None for b in res.bookings),
+                   "guests_zero": int(rep.warnings.get("guests_zero", 0)),
+                   "children_missing_note": next((n for n in rep.notes if "children NA" in n), None)},
+        "undefined_board_share": undefined_board_share(res.bookings),
+        "bands": _band_table_json(table),
+        "coverage": _coverage_json(cov),
+        "front_desk": {"nights": front, "band_nights": [d.isoformat() for d in band_nights],
+                       "alarm": alarm_scores(rows, res, table, score_nights),
+                       "reads": "revenue rooms: physical occupancy less the NONREV rows, the quantity "
+                                "capacity_on nets against on both sides of the alarm"},
+        "kitchen": {"days": kitchen, "scores": kitchen_scores(rows, res, table, score_nights),
+                    "survival_assumption": SURVIVAL_ASSUMPTION, "covers_population": COVERS_POPULATION},
+        "housekeeping": {"days": housekeeping, "scores": housekeeping_scores(rows, res, table, score_nights),
+                         "reads": "physical rooms, NONREV included: a comped room is still stripped and made up",
+                         "limit": ROSTER_LIMIT},
+        "walk": {"days": out.days, "seconds": round(out.seconds, 1), "cpu_seconds": round(out.cpu_seconds, 1),
+                 "records": len(out.records), "rows": len(rows)},
+        "notes": [NO_LIFT],
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "handover-%s.json" % code.lower())
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True, default=str)
+    payload["_json_path"] = path
+    payload["_html_path"] = handoverpage.write(out_dir, payload)
+    return payload
